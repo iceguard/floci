@@ -20,6 +20,27 @@ class AmiImageToolTest {
     Path tempDir;
 
     @Test
+    void productionMetadataPinsCanonicalReleaseSerial() {
+        AmiImageTool.Metadata metadata = AmiImageTool.loadMetadata(AmiImageTool.DEFAULT_METADATA);
+        AmiImageTool.ImageSpec image = metadata.images.stream()
+                .filter(candidate -> candidate.id.equals("ubuntu-24.04-arm64"))
+                .findFirst()
+                .orElseThrow();
+
+        assertEquals("https://cloud-images.ubuntu.com/releases/noble/release-20260615", image.canonical.baseUrl);
+        assertEquals(
+                "https://cloud-images.ubuntu.com/releases/noble/release-20260615/ubuntu-24.04-server-cloudimg-arm64-root.tar.xz",
+                image.canonical.rootfsUrl());
+        assertEquals("20260615", image.canonical.releaseSerial);
+        assertEquals("15188696da114a3ffd3d3554f5858a0c3ac257933656e85feb4e0e83ad542b4a", image.canonical.rootfsSha256);
+        assertEquals("04d1dec4a9066c7f91d25b736f602c30286de9e61969011615373b22ffc29ac4",
+                image.canonical.manifestSha256);
+        assertEquals("floci/ami-ubuntu:24.04-arm64-sha256-15188696da114a3ffd3d3554f5858a0c3ac257933656e85feb4e0e83ad542b4a",
+                image.docker.image);
+        assertEquals(List.of("systemd", "cloud-init", "netcat-openbsd"), image.guest.smokePackages);
+    }
+
+    @Test
     void metadataDrivesGenerationAndCatalogUpdate() throws Exception {
         Path release = Files.createDirectories(tempDir.resolve("release-20260615"));
         Path rootfs = release.resolve("ubuntu-root.tar.xz");

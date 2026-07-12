@@ -495,6 +495,15 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void nativeCloudInitTimeoutKillsTheWholeFinalUnitBeforeStoppingIt() {
+        String command = Ec2ContainerManager.stopNativeCloudInitCommand()[2];
+
+        assertTrue(command.contains(
+                "systemctl kill --kill-whom=all --signal=SIGKILL cloud-final.service"));
+        assertTrue(command.indexOf("systemctl kill") < command.indexOf("systemctl stop"));
+    }
+
+    @Test
     void nativeCloudInitMetadataUnitRejectsUnsafeDockerHost() {
         assertThrows(IllegalArgumentException.class,
                 () -> Ec2ContainerManager.metadataProxyServiceUnit("floci host", 9169));
