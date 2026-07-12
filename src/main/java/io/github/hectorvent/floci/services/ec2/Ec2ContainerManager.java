@@ -56,6 +56,7 @@ public class Ec2ContainerManager {
     private static final Pattern MIME_BOUNDARY = Pattern.compile("(?im)^content-type:\\s*multipart/[^;]+;\\s*boundary=\"?([^\";\\n\\r]+)\"?.*$");
     static int containerBridgeIpAttempts = 30;
     static long containerBridgeIpPollMillis = 500;
+    static int metadataProxyInstallTimeoutSeconds = 180;
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -203,7 +204,10 @@ public class Ec2ContainerManager {
                     return;
                 }
 
-                configureLinkLocalMetadataEndpoint(containerId, instanceId, flociHost, imdsPort);
+                if (!configureLinkLocalMetadataEndpoint(containerId, instanceId, flociHost, imdsPort)) {
+                    cleanupFailedLaunch(instance, containerId, containerIp, sshHostPort);
+                    return;
+                }
 
                 // Set public-facing addresses
                 instance.setPublicIpAddress("127.0.0.1");
@@ -685,26 +689,39 @@ public class Ec2ContainerManager {
         return text.substring(start);
     }
 
-    private void configureLinkLocalMetadataEndpoint(String containerId, String instanceId, String flociHost, int imdsPort) {
+    private boolean configureLinkLocalMetadataEndpoint(String containerId, String instanceId, String flociHost, int imdsPort) {
         try {
-            ContainerExecResult install = execInContainerForResult(containerId, metadataProxyInstallCommand(), 180);
+            ContainerExecResult install = execInContainerForResult(containerId, metadataProxyInstallCommand(), metadataProxyInstallTimeoutSeconds);
             if (install.exitCode() != 0) {
                 LOG.warnv("Could not install IMDS proxy dependencies for EC2 instance {0}: {1}",
                         instanceId, install.summary());
-                return;
+                return false;
             }
 
             ContainerExecResult start = execInContainerForResult(containerId, metadataProxyStartCommand(flociHost, imdsPort), 30);
             if (start.exitCode() != 0) {
                 LOG.warnv("Could not start link-local IMDS proxy for EC2 instance {0}: {1}",
                         instanceId, start.summary());
-                return;
+                return false;
             }
 
             LOG.infov("Configured link-local IMDS endpoint for EC2 instance {0}", instanceId);
+            return true;
         } catch (Exception e) {
             LOG.warnv("Could not configure link-local IMDS endpoint for EC2 instance {0}: {1}", instanceId, e.getMessage());
+            return false;
         }
+    }
+
+    private void cleanupFailedLaunch(Instance instance, String containerId, String containerIp, int sshHostPort) {
+        portForwardManager.unpublishAll(instance);
+        lifecycleManager.stopAndRemove(containerId, null);
+        if (sshHostPort > 0) {
+            portAllocator.release(sshHostPort);
+        }
+        metadataServer.unregisterContainer(containerIp, instance);
+        instance.setState(InstanceState.terminated());
+        instance.setTerminatedAt(System.currentTimeMillis());
     }
 
     private void execInContainer(String containerId, String[] cmd, int timeoutSeconds) throws Exception {
@@ -721,7 +738,7 @@ public class Ec2ContainerManager {
 
         CountDownLatch latch = new CountDownLatch(1);
         ByteArrayOutputStream output = new ByteArrayOutputStream();
-        dockerClient.execStartCmd(execId).exec(new ResultCallback.Adapter<Frame>() {
+        ResultCallback.Adapter<Frame> callback = new ResultCallback.Adapter<Frame>() {
             @Override
             public void onNext(Frame frame) {
                 if (frame.getPayload() != null) {
@@ -732,10 +749,13 @@ public class Ec2ContainerManager {
             public void onComplete() { latch.countDown(); }
             @Override
             public void onError(Throwable t) { latch.countDown(); }
-        });
-        boolean completed = latch.await(timeoutSeconds, TimeUnit.SECONDS);
-        if (!completed) {
-            return new ContainerExecResult(-1, "Timed out after " + timeoutSeconds + "s");
+        };
+        try (callback) {
+            dockerClient.execStartCmd(execId).exec(callback);
+            boolean completed = latch.await(timeoutSeconds, TimeUnit.SECONDS);
+            if (!completed) {
+                return new ContainerExecResult(-1, "Timed out after " + timeoutSeconds + "s");
+            }
         }
         Long exitCode = dockerClient.inspectExecCmd(execId).exec().getExitCodeLong();
         return new ContainerExecResult(exitCode != null ? exitCode : -1, summarizeUserDataOutput(output));

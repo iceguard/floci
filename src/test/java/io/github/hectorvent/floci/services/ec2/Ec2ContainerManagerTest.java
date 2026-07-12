@@ -69,6 +69,7 @@ class Ec2ContainerManagerTest {
     void resetBridgeIpPolling() {
         Ec2ContainerManager.containerBridgeIpAttempts = 30;
         Ec2ContainerManager.containerBridgeIpPollMillis = 500;
+        Ec2ContainerManager.metadataProxyInstallTimeoutSeconds = 180;
     }
 
     @Test
@@ -514,6 +515,32 @@ class Ec2ContainerManagerTest {
         awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
     }
 
+    @Test
+    void launchTerminatesContainerAndSkipsUserDataWhenMetadataInstallerTimesOut() throws Exception {
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+        Ec2ContainerManager.metadataProxyInstallTimeoutSeconds = 0;
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse withIp = inspectResponse("172.18.0.12");
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(withIp);
+        harness.stubMetadataInstallerTimeout();
+        Instance instance = instance("i-installer-timeout");
+        instance.setUserData("#!/bin/sh\necho should-not-run\n");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        verify(harness.lifecycleManager).stopAndRemove(TEST_CONTAINER_ID, null);
+        verify(harness.portAllocator).release(2201);
+        verify(harness.metadataServer).unregisterContainer("172.18.0.12", instance);
+        verify(harness.portForwardManager).unpublishAll(instance);
+        verify(harness.dockerClient, never()).copyArchiveToContainerCmd(TEST_CONTAINER_ID);
+        verify(harness.logStreamer, never()).generateLogStreamName("user-data");
+        assertTrue(instance.getTerminatedAt() > 0, "failed launch should record termination time");
+    }
+
     private static LaunchHarness launchHarness() {
         ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
         ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, withSettings().defaultAnswer(RETURNS_SELF));
@@ -541,6 +568,7 @@ class Ec2ContainerManagerTest {
         DockerClient dockerClient = mock(DockerClient.class);
         Ec2MetadataServer metadataServer = mock(Ec2MetadataServer.class);
         ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
+        Ec2PortForwardManager portForwardManager = mock(Ec2PortForwardManager.class);
         Ec2ContainerManager manager = new Ec2ContainerManager(
                 containerBuilder,
                 lifecycleManager,
@@ -551,8 +579,9 @@ class Ec2ContainerManagerTest {
                 portAllocator,
                 config,
                 metadataServer,
-                mock(Ec2PortForwardManager.class));
-        return new LaunchHarness(manager, dockerClient, metadataServer, logStreamer, builder);
+                portForwardManager);
+        return new LaunchHarness(manager, dockerClient, metadataServer, logStreamer, builder,
+                lifecycleManager, portAllocator, portForwardManager);
     }
 
     private static Instance instance(String instanceId) {
@@ -595,7 +624,22 @@ class Ec2ContainerManagerTest {
                                  DockerClient dockerClient,
                                  Ec2MetadataServer metadataServer,
                                  ContainerLogStreamer logStreamer,
-                                 ContainerBuilder.Builder builder) {
+                                 ContainerBuilder.Builder builder,
+                                 ContainerLifecycleManager lifecycleManager,
+                                 PortAllocator portAllocator,
+                                 Ec2PortForwardManager portForwardManager) {
+        void stubMetadataInstallerTimeout() throws Exception {
+            ExecCreateCmd execCreate = mock(ExecCreateCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
+            ExecCreateCmdResponse metadataExec = mock(ExecCreateCmdResponse.class);
+            when(metadataExec.getId()).thenReturn("metadata-install-exec");
+            when(dockerClient.execCreateCmd(TEST_CONTAINER_ID)).thenReturn(execCreate);
+            when(execCreate.exec()).thenReturn(metadataExec);
+
+            ExecStartCmd execStart = mock(ExecStartCmd.class);
+            when(dockerClient.execStartCmd("metadata-install-exec")).thenReturn(execStart);
+            when(execStart.exec(any())).thenAnswer(invocation -> invocation.getArgument(0));
+        }
+
         void stubSuccessfulExecs(CountDownLatch userDataStarted, CountDownLatch finishUserData) throws Exception {
             AtomicReference<String[]> currentCommand = new AtomicReference<>();
             ExecCreateCmd execCreate = mock(ExecCreateCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
