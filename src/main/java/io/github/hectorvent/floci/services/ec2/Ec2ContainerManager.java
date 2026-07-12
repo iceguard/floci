@@ -1021,12 +1021,17 @@ public class Ec2ContainerManager {
 
     private void stopNativeCloudInit(String containerId) {
         try {
-            execInContainerForResult(containerId, new String[]{"sh", "-c",
-                    "systemctl stop cloud-final.service cloud-config.service cloud-init.service >/dev/null 2>&1 || true"}, 10);
+            execInContainerForResult(containerId, stopNativeCloudInitCommand(), 10);
         }
         catch (Exception e) {
             LOG.warnv("Could not stop timed-out cloud-init in container {0}", containerId);
         }
+    }
+
+    static String[] stopNativeCloudInitCommand() {
+        return new String[]{"sh", "-c", String.join("\n",
+                "systemctl kill --kill-whom=all --signal=SIGKILL cloud-final.service >/dev/null 2>&1 || true",
+                "systemctl stop cloud-final.service cloud-config.service cloud-init.service >/dev/null 2>&1 || true")};
     }
 
     private void terminateTrackedProcess(String containerId, String pidPath) {

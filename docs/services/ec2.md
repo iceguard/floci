@@ -65,6 +65,15 @@ The recipe pins Canonical's immutable `release-20260615` directory and verifies 
   -Dexec.args="smoke --image-id ubuntu-24.04-arm64"
 ```
 
+The native lifecycle proof is intentionally opt-in because it starts privileged
+systemd guests and requires the image above. Start Floci with a short matching
+timeout, then run the named target in another terminal:
+
+```bash
+FLOCI_SERVICES_EC2_USER_DATA_TIMEOUT_SECONDS=15 ./mvnw quarkus:dev
+FLOCI_SERVICES_EC2_USER_DATA_TIMEOUT_SECONDS=15 make native-cloud-init-test
+```
+
 ## SSH Key Injection
 
 If `KeyName` is specified at launch, Floci looks up the stored key pair's public key material (set via `ImportKeyPair`) and copies it into `/root/.ssh/authorized_keys` inside the container at boot. It then attempts to start `sshd` if present. The SSH port (container port 22) is mapped to a host port from the configured range (default 2200–2299).
