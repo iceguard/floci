@@ -137,6 +137,7 @@ class Ec2ContainerManagerTest {
                 mock(PortAllocator.class),
                 mock(EmulatorConfig.class),
                 mock(AcmService.class),
+                mock(Ec2InstanceTypeCatalog.class),
                 metadataServer,
                 mock(Ec2PortForwardManager.class));
 
@@ -542,6 +543,29 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void launchAppliesModeledInstanceTypeMemoryLimit() {
+        LaunchHarness harness = launchHarness();
+        Instance instance = instance("i-modeled-memory");
+        instance.setInstanceType("m8gd.large");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        verify(harness.builder, timeout(2000)).withMemoryMb(8192);
+    }
+
+    @Test
+    void launchLeavesUnknownInstanceTypeMemoryUnlimited() {
+        LaunchHarness harness = launchHarness();
+        Instance instance = instance("i-unknown-memory");
+        instance.setInstanceType("unmodeled.large");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        verify(harness.lifecycleManager, timeout(2000)).create(any(ContainerSpec.class));
+        verify(harness.builder, never()).withMemoryMb(anyInt());
+    }
+
+    @Test
     void preferredMetadataSourceIpUsesConfiguredNetworkBeforeBridge() {
         ContainerNetwork bridge = new ContainerNetwork();
         bridge.withIpv4Address("172.17.0.8");
@@ -773,6 +797,7 @@ class Ec2ContainerManagerTest {
                 portAllocator,
                 config,
                 mock(AcmService.class),
+                new Ec2InstanceTypeCatalog(),
                 metadataServer,
                 portForwardManager);
         return new LaunchHarness(manager, dockerClient, metadataServer, builder,
