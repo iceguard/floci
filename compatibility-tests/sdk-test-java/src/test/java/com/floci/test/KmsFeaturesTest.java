@@ -5,6 +5,8 @@ import software.amazon.awssdk.services.kms.KmsClient;
 import software.amazon.awssdk.services.kms.model.CreateKeyResponse;
 import software.amazon.awssdk.services.kms.model.EncryptionAlgorithmSpec;
 import software.amazon.awssdk.services.kms.model.GetKeyPolicyResponse;
+import software.amazon.awssdk.services.kms.model.KeyManagerType;
+import software.amazon.awssdk.services.kms.model.KmsException;
 import software.amazon.awssdk.services.kms.model.ListResourceTagsResponse;
 
 import java.util.Map;
@@ -32,6 +34,29 @@ class KmsFeaturesTest {
     @AfterAll
     static void cleanup() {
         if (kms != null) kms.close();
+    }
+
+    @Test
+    @Order(1)
+    void awsManagedAcmKeyIsDiscoverableAndRejectsTagListing() {
+        var alias = kms.listAliases().aliases().stream()
+                .filter(candidate -> candidate.aliasName().equals("alias/aws/acm"))
+                .findFirst()
+                .orElseThrow();
+        var key = kms.describeKey(request -> request.keyId(alias.targetKeyId())).keyMetadata();
+
+        assertThat(key.keyManager()).isEqualTo(KeyManagerType.AWS);
+        assertThat(kms.listKeys().keys())
+                .anyMatch(candidate -> candidate.keyId().equals(key.keyId()));
+
+        assertThatThrownBy(() -> kms.listResourceTags(request -> request.keyId(key.keyId())))
+                .isInstanceOfSatisfying(KmsException.class, error -> {
+                    assertThat(error.statusCode()).isEqualTo(400);
+                    assertThat(error.awsErrorDetails().errorCode()).isEqualTo("AccessDeniedException");
+                    assertThat(error.awsErrorDetails().errorMessage()).isEqualTo(
+                            "User is not authorized to perform: kms:ListResourceTags on resource: " + key.arn()
+                                    + " because no resource-based policy allows the kms:ListResourceTags action");
+                });
     }
 
     // ── Issue #269 — CreateKey applies Tags ───────────────────────────────────

@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.kms.model.KmsAlias;
 import io.github.hectorvent.floci.services.kms.model.KmsGrant;
 import io.github.hectorvent.floci.services.kms.model.KmsKey;
+import io.github.hectorvent.floci.services.kms.model.KmsKeyManager;
 import io.github.hectorvent.floci.services.kms.model.KmsKeySpec;
 import io.github.hectorvent.floci.services.kms.model.KmsKeyUsage;
 import io.github.hectorvent.floci.services.kms.model.KmsMessageType;
@@ -27,7 +28,11 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiConsumer;
+import java.util.stream.Stream;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -83,7 +88,8 @@ class KmsServiceTest {
         kmsService.createKey("key3", "eu-west-1");
 
         List<KmsKey> keys = kmsService.listKeys(REGION);
-        assertEquals(2, keys.size());
+        assertEquals(3, keys.size());
+        assertEquals(1, keys.stream().filter(key -> key.getKeyManager() == KmsKeyManager.AWS).count());
     }
 
     @Test
@@ -482,9 +488,12 @@ class KmsServiceTest {
         kmsService.createAlias("alias/my-key", key.getKeyId(), REGION);
 
         List<KmsAlias> aliases = kmsService.listAliases(REGION);
-        assertEquals(1, aliases.size());
-        assertEquals("alias/my-key", aliases.getFirst().getAliasName());
-        assertEquals(key.getKeyId(), aliases.getFirst().getTargetKeyId());
+        KmsAlias alias = aliases.stream()
+                .filter(candidate -> "alias/my-key".equals(candidate.getAliasName()))
+                .findFirst()
+                .orElseThrow();
+        assertEquals(2, aliases.size());
+        assertEquals(key.getKeyId(), alias.getTargetKeyId());
     }
 
     @Test
@@ -506,7 +515,90 @@ class KmsServiceTest {
         kmsService.createAlias("alias/to-delete", key.getKeyId(), REGION);
         kmsService.deleteAlias("alias/to-delete", REGION);
 
-        assertTrue(kmsService.listAliases(REGION).isEmpty());
+        assertEquals(List.of("alias/aws/acm"), kmsService.listAliases(REGION).stream()
+                .map(KmsAlias::getAliasName)
+                .toList());
+    }
+
+    @Test
+    void awsManagedAcmKeyIsDiscoverableAndRejectsTagListing() {
+        KmsAlias alias = kmsService.listAliases(REGION).stream()
+                .filter(candidate -> "alias/aws/acm".equals(candidate.getAliasName()))
+                .findFirst()
+                .orElseThrow();
+
+        KmsKey key = kmsService.describeKey(alias.getAliasName(), REGION);
+
+        assertEquals(KmsKeyManager.AWS, key.getKeyManager());
+        assertEquals(alias.getTargetKeyId(), key.getKeyId());
+        assertTrue(kmsService.listKeys(REGION).stream()
+                .anyMatch(candidate -> candidate.getKeyId().equals(key.getKeyId())));
+        AwsException error = assertThrows(
+                AwsException.class,
+                () -> kmsService.listResourceTags(key.getKeyId(), REGION));
+        assertEquals("AccessDeniedException", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertEquals(
+                "User is not authorized to perform: kms:ListResourceTags on resource: " + key.getArn()
+                        + " because no resource-based policy allows the kms:ListResourceTags action",
+                error.getMessage());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("awsManagedKeyMutations")
+    void awsManagedAcmKeyRejectsCustomerMutations(
+            String action,
+            BiConsumer<KmsService, String> mutation) {
+        KmsKey key = kmsService.describeKey("alias/aws/acm", REGION);
+
+        AwsException error = assertThrows(AwsException.class, () -> mutation.accept(kmsService, key.getKeyId()));
+
+        assertEquals("AccessDeniedException", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+        assertEquals(
+                "User is not authorized to perform: kms:" + action + " on resource: " + key.getArn()
+                        + " because no resource-based policy allows the kms:" + action + " action",
+                error.getMessage());
+    }
+
+    static Stream<Arguments> awsManagedKeyMutations() {
+        return Stream.of(
+                Arguments.of(
+                        "TagResource",
+                        (BiConsumer<KmsService, String>)
+                                (service, keyId) -> service.tagResource(keyId, Map.of("team", "platform"), REGION)),
+                Arguments.of(
+                        "UntagResource",
+                        (BiConsumer<KmsService, String>)
+                                (service, keyId) -> service.untagResource(keyId, List.of("team"), REGION)),
+                Arguments.of(
+                        "DisableKey",
+                        (BiConsumer<KmsService, String>)
+                                (service, keyId) -> service.disableKey(keyId, REGION)),
+                Arguments.of(
+                        "ScheduleKeyDeletion",
+                        (BiConsumer<KmsService, String>)
+                                (service, keyId) -> service.scheduleKeyDeletion(keyId, 30, REGION)),
+                Arguments.of(
+                        "PutKeyPolicy",
+                        (BiConsumer<KmsService, String>)
+                                (service, keyId) -> service.putKeyPolicy(keyId, "{}", REGION)),
+                Arguments.of(
+                        "UpdateKeyDescription",
+                        (BiConsumer<KmsService, String>)
+                                (service, keyId) -> service.updateKeyDescription(keyId, "updated", REGION)),
+                Arguments.of(
+                        "EnableKeyRotation",
+                        (BiConsumer<KmsService, String>)
+                                (service, keyId) -> service.enableKeyRotation(keyId, REGION)),
+                Arguments.of(
+                        "DisableKeyRotation",
+                        (BiConsumer<KmsService, String>)
+                                (service, keyId) -> service.disableKeyRotation(keyId, REGION)),
+                Arguments.of(
+                        "RotateKeyOnDemand",
+                        (BiConsumer<KmsService, String>)
+                                (service, keyId) -> service.rotateKeyOnDemand(keyId, REGION)));
     }
 
     @Test
