@@ -63,6 +63,7 @@ public class Instance {
     private String userData;
     private String encodedUserData;
     private boolean nativeCloudInit;
+    private InstanceBootstrapResult bootstrapResult;
     private int sshHostPort;
     private long terminatedAt;
 
@@ -187,6 +188,9 @@ public class Instance {
 
     public boolean isNativeCloudInit() { return nativeCloudInit; }
     public void setNativeCloudInit(boolean nativeCloudInit) { this.nativeCloudInit = nativeCloudInit; }
+
+    public InstanceBootstrapResult getBootstrapResult() { return bootstrapResult; }
+    public void setBootstrapResult(InstanceBootstrapResult bootstrapResult) { this.bootstrapResult = bootstrapResult; }
 
     public int getSshHostPort() { return sshHostPort; }
     public void setSshHostPort(int sshHostPort) { this.sshHostPort = sshHostPort; }

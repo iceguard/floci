@@ -19,7 +19,6 @@ import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
-import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
@@ -50,7 +49,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Answers.RETURNS_SELF;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -64,7 +62,6 @@ class Ec2ContainerManagerTest {
 
     private static final String TEST_USER_DATA_OUTPUT = "test-output";
     private static final String TEST_CONTAINER_ID = "container-1";
-    private static final String TEST_LOG_STREAM_NAME = "yyyy/MM/dd/user-data";
 
     @org.junit.jupiter.api.AfterEach
     void resetBridgeIpPolling() {
@@ -120,7 +117,6 @@ class Ec2ContainerManagerTest {
         Ec2ContainerManager manager = new Ec2ContainerManager(
                 mock(ContainerBuilder.class),
                 lifecycleManager,
-                mock(ContainerLogStreamer.class),
                 mock(ContainerDetector.class),
                 mock(DockerHostResolver.class),
                 dockerClient,
@@ -153,8 +149,15 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
-    void userDataExecutionCommandRunsScriptDirectlySoShebangIsHonored() {
-        assertArrayEquals(new String[]{"/tmp/user-data.sh"}, Ec2ContainerManager.userDataExecutionCommand());
+    void userDataExecutionCommandUsesUniqueRuntimeFilesAndCleansThem() {
+        String[] command = Ec2ContainerManager.userDataExecutionCommand(
+                "/run/floci-ec2/user-data-123.sh", "/run/floci-ec2/user-data-123.pid");
+
+        assertEquals("sh", command[0]);
+        assertTrue(command[2].contains("setsid \"$script\""));
+        assertTrue(command[2].contains("trap cleanup EXIT"));
+        assertEquals("/run/floci-ec2/user-data-123.sh", command[4]);
+        assertEquals("/run/floci-ec2/user-data-123.pid", command[5]);
     }
 
     @Test
@@ -298,9 +301,11 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
-    void launchInstanceUserDataStreamToCloudWatch() throws Exception {
+    void launchPersistsSuccessfulRedactedUserDataResult() throws Exception {
         LaunchHarness harness = launchHarness();
         harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+        AtomicReference<Instance> persisted = new AtomicReference<>();
+        harness.manager.setInstancePersister(persisted::set);
 
         // manually set up container bridge IP
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
@@ -310,22 +315,25 @@ class Ec2ContainerManagerTest {
 
         String instanceId = "i-userdatacloudwatch";
         Instance instance = instance(instanceId);
-        instance.setUserData("""
+        instance.setEncodedUserData(Ec2UserData.fromText("""
                 #!/bin/bash
                 echo test
-                """);
+                """).encoded());
         harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
-        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        awaitUntil(() -> instance.getBootstrapResult() != null
+                && "SUCCEEDED".equals(instance.getBootstrapResult().getStatus()), Duration.ofSeconds(2));
 
-        verify(harness.logStreamer, timeout(2000)).streamToCloudWatchLogs(
-            any(String.class), any(String.class), eq("us-west-2"), eq(TEST_USER_DATA_OUTPUT)
-        );
+        assertEquals("User data completed", instance.getBootstrapResult().getMessage());
+        assertFalse(instance.getBootstrapResult().getMessage().contains(TEST_USER_DATA_OUTPUT));
+        assertEquals(instance, persisted.get());
     }
 
     @Test
     void launchInstanceExecutesGzipUserData() throws Exception {
         LaunchHarness harness = launchHarness();
         harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+        AtomicReference<Instance> persisted = new AtomicReference<>();
+        harness.manager.setInstancePersister(persisted::set);
 
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         InspectContainerResponse response = inspectResponse("192.168.215.43");
@@ -339,8 +347,11 @@ class Ec2ContainerManagerTest {
                 """)).encoded());
         harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
 
-        verify(harness.logStreamer, timeout(2000)).streamToCloudWatchLogs(
-                any(String.class), any(String.class), eq("us-west-2"), eq(TEST_USER_DATA_OUTPUT));
+        awaitUntil(() -> instance.getBootstrapResult() != null
+                && "SUCCEEDED".equals(instance.getBootstrapResult().getStatus()), Duration.ofSeconds(2));
+        assertEquals("User data completed", instance.getBootstrapResult().getMessage());
+        assertFalse(instance.getBootstrapResult().getMessage().contains(TEST_USER_DATA_OUTPUT));
+        assertEquals(instance, persisted.get());
     }
 
     @Test
@@ -373,6 +384,8 @@ class Ec2ContainerManagerTest {
         assertTrue(command[2].contains("TCP-LISTEN:80,bind=169.254.169.254"));
         assertTrue(command[2].contains("TCP:floci:9169"));
         assertTrue(command[2].contains("http://169.254.169.254/latest/meta-data/instance-id"));
+        assertTrue(command[2].contains("/run/floci-ec2/imds-proxy.pid"));
+        assertFalse(command[2].contains("/tmp/"));
     }
 
     @Test
@@ -562,6 +575,21 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void launchFailureBeforeContainerCreationReleasesAllocatedPort() throws Exception {
+        LaunchHarness harness = launchHarness();
+        when(harness.lifecycleManager.create(any(ContainerSpec.class)))
+                .thenThrow(new IllegalStateException("create failed"));
+        Instance instance = instance("i-create-failure");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        verify(harness.portAllocator).release(2201);
+        verify(harness.portForwardManager).unpublishAll(instance);
+        assertTrue(instance.getTerminatedAt() > 0);
+    }
+
+    @Test
     void launchMarksInstanceRunningBeforeUserDataCompletes() throws Exception {
         Ec2ContainerManager.containerBridgeIpAttempts = 2;
         Ec2ContainerManager.containerBridgeIpPollMillis = 1;
@@ -607,7 +635,6 @@ class Ec2ContainerManagerTest {
         verify(harness.metadataServer).unregisterContainer("172.18.0.12", instance);
         verify(harness.portForwardManager).unpublishAll(instance);
         verify(harness.dockerClient, never()).copyArchiveToContainerCmd(TEST_CONTAINER_ID);
-        verify(harness.logStreamer, never()).generateLogStreamName("user-data");
         assertTrue(instance.getTerminatedAt() > 0, "failed launch should record termination time");
     }
 
@@ -634,15 +661,14 @@ class Ec2ContainerManagerTest {
         when(ec2.sshPortRangeStart()).thenReturn(2200);
         when(ec2.sshPortRangeEnd()).thenReturn(2299);
         when(ec2.imdsPort()).thenReturn(9169);
+        when(ec2.userDataTimeoutSeconds()).thenReturn(30);
 
         DockerClient dockerClient = mock(DockerClient.class);
         Ec2MetadataServer metadataServer = mock(Ec2MetadataServer.class);
-        ContainerLogStreamer logStreamer = mock(ContainerLogStreamer.class);
         Ec2PortForwardManager portForwardManager = mock(Ec2PortForwardManager.class);
         Ec2ContainerManager manager = new Ec2ContainerManager(
                 containerBuilder,
                 lifecycleManager,
-                logStreamer,
                 mock(ContainerDetector.class),
                 dockerHostResolver,
                 dockerClient,
@@ -650,7 +676,7 @@ class Ec2ContainerManagerTest {
                 config,
                 metadataServer,
                 portForwardManager);
-        return new LaunchHarness(manager, dockerClient, metadataServer, logStreamer, builder,
+        return new LaunchHarness(manager, dockerClient, metadataServer, builder,
                 lifecycleManager, portAllocator, portForwardManager);
     }
 
@@ -693,7 +719,6 @@ class Ec2ContainerManagerTest {
     private record LaunchHarness(Ec2ContainerManager manager,
                                  DockerClient dockerClient,
                                  Ec2MetadataServer metadataServer,
-                                 ContainerLogStreamer logStreamer,
                                  ContainerBuilder.Builder builder,
                                  ContainerLifecycleManager lifecycleManager,
                                  PortAllocator portAllocator,
@@ -729,7 +754,7 @@ class Ec2ContainerManagerTest {
             });
             when(execCreate.exec()).thenAnswer(invocation -> {
                 String[] command = currentCommand.get();
-                if (command != null && command.length == 1 && "/tmp/user-data.sh".equals(command[0])) {
+                if (command != null && command.length > 3 && "floci-user-data".equals(command[3])) {
                     return userDataExec;
                 }
                 return metadataExec;
@@ -769,8 +794,6 @@ class Ec2ContainerManagerTest {
             CopyArchiveToContainerCmd copy = mock(CopyArchiveToContainerCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
             when(dockerClient.copyArchiveToContainerCmd(TEST_CONTAINER_ID)).thenReturn(copy);
             when(copy.withTarInputStream(any(InputStream.class))).thenReturn(copy);
-
-            when(logStreamer.generateLogStreamName(anyString())).thenReturn(TEST_LOG_STREAM_NAME);
         }
     }
 }

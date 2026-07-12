@@ -91,7 +91,9 @@ Notes and limitations:
 
 `UserData` must be base64-encoded in the request (matching the AWS wire format) and the decoded payload must not exceed the EC2 limit of 16 KiB. Floci preserves the exact encoded and decoded bytes for API and IMDS readback.
 
-Cloud-image AMIs pass those bytes to native `cloud-init`; Floci does not extract or execute their shell parts itself. Other AMIs retain the lightweight direct shell execution path after SSH key injection. Output from that legacy path is captured and logged.
+Cloud-image AMIs pass those bytes to native `cloud-init`; Floci does not extract or execute their shell parts itself. Other AMIs retain the lightweight direct shell execution path after SSH key injection. Floci logs execution status and output byte counts for that legacy path without retaining raw output.
+
+Guest user data is bounded by `user-data-timeout-seconds` (900 seconds by default). Floci stops a timed-out process tree or native cloud-init service and persists a redacted bootstrap result with status, timestamps, exit code when available, and a fixed diagnostic message. Raw user data and command output are not retained in that result.
 
 EC2 containers receive `AWS_EC2_METADATA_SERVICE_ENDPOINT` for IMDS and `AWS_ENDPOINT_URL` for AWS service API calls back to Floci. Floci does not inject static AWS access keys into EC2 guests, so an attached instance profile remains the standard credential-chain source.
 
@@ -354,6 +356,7 @@ Launch templates store versioned launch data. New template versions can be creat
 | Environment variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_EC2_IMDS_PORT` | `9169` | Host port for the IMDS server |
+| `FLOCI_SERVICES_EC2_USER_DATA_TIMEOUT_SECONDS` | `900` | Maximum user-data or native cloud-init runtime before termination |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_START` | `2200` | Start of SSH host port range |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_END` | `2299` | End of SSH host port range |
 | `FLOCI_SERVICES_EC2_PUBLISH_SECURITY_GROUP_PORTS` | `true` | Publish security-group TCP ingress ports on the host via socat sidecars |
