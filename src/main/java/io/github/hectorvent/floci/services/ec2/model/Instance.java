@@ -62,6 +62,7 @@ public class Instance {
     private String containerBridgeIp;
     private String userData;
     private String encodedUserData;
+    private boolean nativeCloudInit;
     private int sshHostPort;
     private long terminatedAt;
 
@@ -183,6 +184,9 @@ public class Instance {
 
     public String getEncodedUserData() { return encodedUserData; }
     public void setEncodedUserData(String encodedUserData) { this.encodedUserData = encodedUserData; }
+
+    public boolean isNativeCloudInit() { return nativeCloudInit; }
+    public void setNativeCloudInit(boolean nativeCloudInit) { this.nativeCloudInit = nativeCloudInit; }
 
     public int getSshHostPort() { return sshHostPort; }
     public void setSshHostPort(int sshHostPort) { this.sshHostPort = sshHostPort; }
