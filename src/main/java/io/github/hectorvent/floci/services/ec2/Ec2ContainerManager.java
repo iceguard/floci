@@ -53,6 +53,8 @@ public class Ec2ContainerManager {
 
     private static final Logger LOG = Logger.getLogger(Ec2ContainerManager.class);
     private static final String USER_DATA_SCRIPT_PATH = "/tmp/user-data.sh";
+    private static final String PRE_SYSTEMD_ENTRYPOINT = "/usr/local/sbin/floci-ec2-pre-systemd";
+    private static final String SYSTEMD_RELEASE_PATH = "/run/floci-ec2/start-systemd";
     private static final Pattern MIME_BOUNDARY = Pattern.compile("(?im)^content-type:\\s*multipart/[^;]+;\\s*boundary=\"?([^\";\\n\\r]+)\"?.*$");
     static int containerBridgeIpAttempts = 30;
     static long containerBridgeIpPollMillis = 500;
@@ -156,6 +158,9 @@ public class Ec2ContainerManager {
                         // container to attach that link-local address.
                         .withPrivileged(true)
                         .withCmd(image.systemd() ? List.of("/sbin/init") : List.of("tail", "-f", "/dev/null"));
+                if (image.systemd() && image.cloudInit()) {
+                    specBuilder.withEntrypoint(List.of(PRE_SYSTEMD_ENTRYPOINT));
+                }
                 if (image.systemd()) {
                     specBuilder
                             .withCgroupnsMode("host")
@@ -168,6 +173,18 @@ public class Ec2ContainerManager {
                 // Create container without starting it
                 String containerId = lifecycleManager.create(spec);
                 instance.setDockerContainerId(containerId);
+
+                if (image.systemd() && image.cloudInit()) {
+                    try {
+                        installPreSystemdEntrypoint(containerId);
+                    }
+                    catch (Exception e) {
+                        LOG.warnv("Could not install pre-systemd entrypoint for EC2 instance {0}: {1}",
+                                instanceId, e.getMessage());
+                        cleanupFailedLaunch(instance, containerId, null, sshHostPort);
+                        return;
+                    }
+                }
 
                 // Start the container
                 lifecycleManager.startCreated(containerId, spec);
@@ -191,27 +208,31 @@ public class Ec2ContainerManager {
                 // Docker can report the container as running before network
                 // settings are populated; wait here so IMDS is registered
                 // before link-local metadata validation and UserData run.
-                String containerIp = waitForContainerBridgeIp(containerId, instanceId);
+                ContainerNetworkAddress containerAddress = waitForContainerNetworkAddress(containerId, instanceId);
+                String containerIp = containerAddress != null ? containerAddress.ipAddress() : null;
                 if (containerIp != null && !containerIp.isBlank()) {
                     instance.setContainerBridgeIp(containerIp);
-                    exposeReachablePrivateAddress(instance, containerIp);
+                    exposeReachableNetworkAddress(instance, containerAddress);
                     metadataServer.registerContainer(containerIp, instanceId, instance);
                 }
                 else {
                     LOG.warnv("EC2 instance {0} container {1} did not receive a usable bridge IP for IMDS",
                             instanceId, containerId);
-                    instance.setState(InstanceState.terminated());
+                    cleanupFailedLaunch(instance, containerId, null, sshHostPort);
                     return;
                 }
 
-                if (!configureLinkLocalMetadataEndpoint(containerId, instanceId, flociHost, imdsPort)) {
+                // Populate every advertised metadata leaf before native cloud-init is released.
+                instance.setPublicIpAddress("127.0.0.1");
+                instance.setPublicDnsName("localhost");
+
+                boolean metadataReady = image.systemd() && image.cloudInit()
+                        ? configureNativeCloudInitMetadata(containerId, instanceId, flociHost, imdsPort)
+                        : configureLinkLocalMetadataEndpoint(containerId, instanceId, flociHost, imdsPort);
+                if (!metadataReady) {
                     cleanupFailedLaunch(instance, containerId, containerIp, sshHostPort);
                     return;
                 }
-
-                // Set public-facing addresses
-                instance.setPublicIpAddress("127.0.0.1");
-                instance.setPublicDnsName("localhost");
 
                 instance.setState(InstanceState.running());
                 LOG.infov("EC2 instance {0} running in container {1} (SSH host port {2})",
@@ -232,7 +253,7 @@ public class Ec2ContainerManager {
                 Ec2UserData userData = instance.getEncodedUserData() != null
                         ? Ec2UserData.fromEncoded(instance.getEncodedUserData())
                         : Ec2UserData.fromText(instance.getUserData());
-                if (userData != null && userData.bytes().length > 0) {
+                if (!image.cloudInit() && userData != null && userData.bytes().length > 0) {
                     executeUserData(containerId, instanceId, userDataExecutionText(userData), region);
                 }
 
@@ -283,6 +304,10 @@ public class Ec2ContainerManager {
             // next start; tear them down so no forward is left pointing at a stale address.
             portForwardManager.unpublishAll(instance);
             try {
+                if (instance.isNativeCloudInit()) {
+                    execInContainerForResult(containerId,
+                            new String[]{"rm", "-f", SYSTEMD_RELEASE_PATH}, 5);
+                }
                 dockerClient.stopContainerCmd(containerId).withTimeout(30).exec();
             } catch (NotFoundException e) {
                 // already gone
@@ -315,11 +340,25 @@ public class Ec2ContainerManager {
                     }
                 }
                 String instanceId = instance.getInstanceId();
-                String containerIp = waitForContainerBridgeIp(containerId, instanceId);
+                ContainerNetworkAddress containerAddress = waitForContainerNetworkAddress(containerId, instanceId);
+                String containerIp = containerAddress != null ? containerAddress.ipAddress() : null;
                 if (containerIp != null && !containerIp.isBlank()) {
                     instance.setContainerBridgeIp(containerIp);
-                    exposeReachablePrivateAddress(instance, containerIp);
+                    exposeReachableNetworkAddress(instance, containerAddress);
                     metadataServer.registerContainer(containerIp, instanceId, instance);
+                }
+                else {
+                    cleanupFailedLaunch(instance, containerId, instance.getContainerBridgeIp(), instance.getSshHostPort());
+                    return;
+                }
+                String flociHost = dockerHostResolver.resolve();
+                int imdsPort = config.services().ec2().imdsPort();
+                boolean metadataReady = instance.isNativeCloudInit()
+                        ? configureNativeCloudInitMetadata(containerId, instanceId, flociHost, imdsPort)
+                        : configureLinkLocalMetadataEndpoint(containerId, instanceId, flociHost, imdsPort);
+                if (!metadataReady) {
+                    cleanupFailedLaunch(instance, containerId, containerIp, instance.getSshHostPort());
+                    return;
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -343,9 +382,11 @@ public class Ec2ContainerManager {
             return false;
         }
 
-        String containerIp = getContainerBridgeIp(containerId);
+        ContainerNetworkAddress containerAddress = getContainerNetworkAddress(containerId);
+        String containerIp = containerAddress != null ? containerAddress.ipAddress() : null;
         if (containerIp == null || containerIp.isBlank()) {
             containerIp = instance.getContainerBridgeIp();
+            containerAddress = new ContainerNetworkAddress(containerIp, null);
         }
         if (containerIp == null || containerIp.isBlank()) {
             LOG.warnv("Could not restore IMDS registration for EC2 instance {0}: no container IP",
@@ -358,12 +399,17 @@ public class Ec2ContainerManager {
             metadataServer.unregisterContainer(previousContainerIp, instance);
         }
         instance.setContainerBridgeIp(containerIp);
-        exposeReachablePrivateAddress(instance, containerIp);
+        exposeReachableNetworkAddress(instance, containerAddress);
         metadataServer.registerContainer(containerIp, instance.getInstanceId(), instance);
         return true;
     }
 
     static void exposeReachablePrivateAddress(Instance instance, String privateIp) {
+        exposeReachableNetworkAddress(instance, new ContainerNetworkAddress(privateIp, null));
+    }
+
+    static void exposeReachableNetworkAddress(Instance instance, ContainerNetworkAddress address) {
+        String privateIp = address != null ? address.ipAddress() : null;
         if (instance == null || privateIp == null || privateIp.isBlank()) {
             return;
         }
@@ -375,6 +421,9 @@ public class Ec2ContainerManager {
             instance.getNetworkInterfaces().forEach(networkInterface -> {
                 networkInterface.setPrivateIpAddress(privateIp);
                 networkInterface.setPrivateDnsName(privateDnsName);
+                if (address.macAddress() != null && !address.macAddress().isBlank()) {
+                    networkInterface.setMacAddress(address.macAddress());
+                }
             });
         }
     }
@@ -426,8 +475,33 @@ public class Ec2ContainerManager {
         }
         executor.submit(() -> {
             try {
+                if (instance.isNativeCloudInit()) {
+                    execInContainerForResult(containerId,
+                            new String[]{"rm", "-f", SYSTEMD_RELEASE_PATH}, 5);
+                }
                 dockerClient.restartContainerCmd(containerId).exec();
+                String instanceId = instance.getInstanceId();
+                ContainerNetworkAddress containerAddress = waitForContainerNetworkAddress(containerId, instanceId);
+                String containerIp = containerAddress != null ? containerAddress.ipAddress() : null;
+                if (containerIp == null || containerIp.isBlank()) {
+                    cleanupFailedLaunch(instance, containerId, instance.getContainerBridgeIp(), instance.getSshHostPort());
+                    return;
+                }
+                instance.setContainerBridgeIp(containerIp);
+                exposeReachableNetworkAddress(instance, containerAddress);
+                metadataServer.registerContainer(containerIp, instanceId, instance);
+                String flociHost = dockerHostResolver.resolve();
+                int imdsPort = config.services().ec2().imdsPort();
+                boolean metadataReady = instance.isNativeCloudInit()
+                        ? configureNativeCloudInitMetadata(containerId, instanceId, flociHost, imdsPort)
+                        : configureLinkLocalMetadataEndpoint(containerId, instanceId, flociHost, imdsPort);
+                if (!metadataReady) {
+                    cleanupFailedLaunch(instance, containerId, containerIp, instance.getSshHostPort());
+                    return;
+                }
                 LOG.infov("Rebooted EC2 container {0}", containerId);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             } catch (Exception e) {
                 LOG.warnv("Error rebooting EC2 container {0}: {1}", containerId, e.getMessage());
             }
@@ -648,6 +722,23 @@ public class Ec2ContainerManager {
                 "fi")};
     }
 
+    static String[] nativeMetadataProxyInstallCommand() {
+        return new String[]{"sh", "-c", String.join("\n",
+                "set -eu",
+                "if command -v ip >/dev/null 2>&1 && command -v nc >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then exit 0; fi",
+                "if command -v apt-get >/dev/null 2>&1; then",
+                "  apt-get update -qq >/dev/null",
+                "  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2 netcat-openbsd curl ca-certificates >/dev/null",
+                "elif command -v dnf >/dev/null 2>&1; then",
+                "  dnf install -y iproute nmap-ncat curl ca-certificates >/dev/null",
+                "elif command -v apk >/dev/null 2>&1; then",
+                "  apk add --no-cache iproute2 netcat-openbsd curl ca-certificates >/dev/null",
+                "else",
+                "  echo 'No supported package manager found for native IMDS proxy dependencies' >&2",
+                "  exit 1",
+                "fi")};
+    }
+
     static String[] metadataProxyStartCommand(String flociHost, int imdsPort) {
         return new String[]{"sh", "-c", String.join("\n",
                 "set -eu",
@@ -687,6 +778,159 @@ public class Ec2ContainerManager {
         }
         int start = Math.max(0, text.length() - 2048);
         return text.substring(start);
+    }
+
+    private void installPreSystemdEntrypoint(String containerId) throws IOException {
+        copyFileToContainer(containerId, "/usr/local/sbin", "floci-ec2-pre-systemd",
+                preSystemdEntrypoint().getBytes(StandardCharsets.UTF_8), 0755);
+    }
+
+    private boolean configureNativeCloudInitMetadata(
+            String containerId, String instanceId, String flociHost, int imdsPort) {
+        try {
+            ContainerExecResult install = execInContainerForResult(
+                    containerId, nativeMetadataProxyInstallCommand(), metadataProxyInstallTimeoutSeconds);
+            if (install.exitCode() != 0) {
+                LOG.warnv("Could not install native cloud-init IMDS dependencies for EC2 instance {0}: {1}",
+                        instanceId, install.summary());
+                return false;
+            }
+
+            copyFileToContainer(containerId, "/etc/systemd/system", "floci-imds-address.service",
+                    metadataAddressUnit().getBytes(StandardCharsets.UTF_8), 0644);
+            copyFileToContainer(containerId, "/etc/systemd/system", "floci-imds-proxy.socket",
+                    metadataProxySocketUnit().getBytes(StandardCharsets.UTF_8), 0644);
+            copyFileToContainer(containerId, "/etc/systemd/system", "floci-imds-proxy@.service",
+                    metadataProxyServiceUnit(flociHost, imdsPort).getBytes(StandardCharsets.UTF_8), 0644);
+            copyFileToContainer(containerId, "/etc/cloud", "ds-identify.cfg",
+                    cloudInitDatasourceIdentification().getBytes(StandardCharsets.UTF_8), 0644);
+            copyFileToContainer(containerId, "/etc/cloud/cloud.cfg.d", "99-floci-ec2.cfg",
+                    cloudInitDatasourceConfiguration().getBytes(StandardCharsets.UTF_8), 0644);
+
+            ContainerExecResult enable = execInContainerForResult(containerId,
+                    new String[]{"systemctl", "enable", "floci-imds-address.service", "floci-imds-proxy.socket"}, 15);
+            if (enable.exitCode() != 0) {
+                LOG.warnv("Could not enable native cloud-init IMDS units for EC2 instance {0}: {1}",
+                        instanceId, enable.summary());
+                return false;
+            }
+
+            ContainerExecResult metadata = execInContainerForResult(containerId,
+                    new String[]{"curl", "-fsS", "--max-time", "2",
+                            "http://" + flociHost + ":" + imdsPort + "/latest/meta-data/instance-id"}, 5);
+            if (metadata.exitCode() != 0 || !instanceId.equals(metadata.output().strip())) {
+                LOG.warnv("Native cloud-init IMDS preflight failed for EC2 instance {0}: {1}",
+                        instanceId, metadata.summary());
+                return false;
+            }
+
+            ContainerExecResult release = execInContainerForResult(containerId,
+                    new String[]{"sh", "-c", "mkdir -p /run/floci-ec2 && touch " + SYSTEMD_RELEASE_PATH}, 5);
+            if (release.exitCode() != 0) {
+                LOG.warnv("Could not release systemd boot for EC2 instance {0}: {1}",
+                        instanceId, release.summary());
+                return false;
+            }
+
+            LOG.infov("Released native cloud-init boot for EC2 instance {0} after IMDS preflight", instanceId);
+            return true;
+        }
+        catch (Exception e) {
+            LOG.warnv("Could not configure native cloud-init IMDS for EC2 instance {0}: {1}",
+                    instanceId, e.getMessage());
+            return false;
+        }
+    }
+
+    static String preSystemdEntrypoint() {
+        return String.join("\n",
+                "#!/bin/sh",
+                "set -eu",
+                "mkdir -p /run/floci-ec2",
+                "while [ ! -e " + SYSTEMD_RELEASE_PATH + " ]; do sleep 0.05; done",
+                "rm -f " + SYSTEMD_RELEASE_PATH,
+                "exec \"$@\"",
+                "");
+    }
+
+    static String metadataAddressUnit() {
+        return """
+                [Unit]
+                Description=Configure the EC2 instance metadata address
+                DefaultDependencies=no
+                Before=floci-imds-proxy.socket cloud-init-local.service
+
+                [Service]
+                Type=oneshot
+                ExecStart=-/usr/sbin/ip address add 169.254.169.254/32 dev lo
+                RemainAfterExit=yes
+
+                [Install]
+                WantedBy=cloud-init-local.service
+                """;
+    }
+
+    static String metadataProxySocketUnit() {
+        return """
+                [Unit]
+                Description=EC2 instance metadata proxy socket
+                DefaultDependencies=no
+                Requires=floci-imds-address.service
+                After=floci-imds-address.service
+                Before=cloud-init-local.service
+
+                [Socket]
+                ListenStream=169.254.169.254:80
+                FreeBind=true
+                Accept=yes
+
+                [Install]
+                WantedBy=cloud-init-local.service
+                """;
+    }
+
+    static String metadataProxyServiceUnit(String flociHost, int imdsPort) {
+        if (flociHost == null || !flociHost.matches("[A-Za-z0-9._:-]+")) {
+            throw new IllegalArgumentException("Invalid Docker host for EC2 metadata proxy");
+        }
+        return """
+                [Unit]
+                Description=EC2 instance metadata proxy connection
+                DefaultDependencies=no
+                After=floci-imds-address.service
+
+                [Service]
+                ExecStart=/usr/bin/nc %s %d
+                StandardInput=socket
+                StandardOutput=socket
+                """.formatted(flociHost, imdsPort);
+    }
+
+    static String cloudInitDatasourceIdentification() {
+        return """
+                datasource: Ec2
+                policy: enabled
+                """;
+    }
+
+    static String cloudInitDatasourceConfiguration() {
+        return """
+                datasource_list: [ Ec2 ]
+                datasource:
+                  Ec2:
+                    metadata_urls: [ "http://169.254.169.254" ]
+                    max_wait: 60
+                    timeout: 5
+                    strict_id: false
+                """;
+    }
+
+    private void copyFileToContainer(
+            String containerId, String directory, String filename, byte[] content, int mode) throws IOException {
+        dockerClient.copyArchiveToContainerCmd(containerId)
+                .withRemotePath(directory)
+                .withTarInputStream(new ByteArrayInputStream(buildSingleFileTar(filename, content, mode)))
+                .exec();
     }
 
     private boolean configureLinkLocalMetadataEndpoint(String containerId, String instanceId, String flociHost, int imdsPort) {
@@ -767,20 +1011,20 @@ public class Ec2ContainerManager {
         }
     }
 
-    private String getContainerBridgeIp(String containerId) {
+    private ContainerNetworkAddress getContainerNetworkAddress(String containerId) {
         try {
             var inspect = dockerClient.inspectContainerCmd(containerId).exec();
             if (inspect.getNetworkSettings() != null) {
                 var networks = inspect.getNetworkSettings().getNetworks();
                 if (networks != null) {
-                    Optional<String> preferredIp = preferredMetadataSourceIp(networks);
-                    if (preferredIp.isPresent()) {
-                        return preferredIp.get();
+                    Optional<ContainerNetworkAddress> preferredAddress = preferredMetadataSourceAddress(networks);
+                    if (preferredAddress.isPresent()) {
+                        return preferredAddress.get();
                     }
                 }
                 String ip = inspect.getNetworkSettings().getIpAddress();
                 if (ip != null && !ip.isBlank()) {
-                    return ip;
+                    return new ContainerNetworkAddress(ip, inspect.getNetworkSettings().getMacAddress());
                 }
             }
         } catch (Exception e) {
@@ -789,11 +1033,12 @@ public class Ec2ContainerManager {
         return null;
     }
 
-    private String waitForContainerBridgeIp(String containerId, String instanceId) throws InterruptedException {
+    private ContainerNetworkAddress waitForContainerNetworkAddress(String containerId, String instanceId)
+            throws InterruptedException {
         for (int i = 0; i < containerBridgeIpAttempts; i++) {
-            String containerIp = getContainerBridgeIp(containerId);
-            if (containerIp != null && !containerIp.isBlank()) {
-                return containerIp;
+            ContainerNetworkAddress address = getContainerNetworkAddress(containerId);
+            if (address != null && address.ipAddress() != null && !address.ipAddress().isBlank()) {
+                return address;
             }
             Thread.sleep(containerBridgeIpPollMillis);
         }
@@ -802,27 +1047,33 @@ public class Ec2ContainerManager {
     }
 
     static Optional<String> preferredMetadataSourceIp(Map<String, ContainerNetwork> networks) {
+        return preferredMetadataSourceAddress(networks).map(ContainerNetworkAddress::ipAddress);
+    }
+
+    static Optional<ContainerNetworkAddress> preferredMetadataSourceAddress(Map<String, ContainerNetwork> networks) {
         if (networks == null || networks.isEmpty()) {
             return Optional.empty();
         }
-        Optional<String> configuredNetworkIp = networks.entrySet().stream()
+        Optional<ContainerNetworkAddress> configuredNetworkAddress = networks.entrySet().stream()
                 .filter(entry -> !"bridge".equals(entry.getKey()))
                 .map(Map.Entry::getValue)
-                .map(ContainerNetwork::getIpAddress)
-                .filter(ip -> ip != null && !ip.isBlank())
+                .filter(network -> network.getIpAddress() != null && !network.getIpAddress().isBlank())
+                .map(network -> new ContainerNetworkAddress(network.getIpAddress(), network.getMacAddress()))
                 .findFirst();
-        if (configuredNetworkIp.isPresent()) {
-            return configuredNetworkIp;
+        if (configuredNetworkAddress.isPresent()) {
+            return configuredNetworkAddress;
         }
         ContainerNetwork bridge = networks.get("bridge");
         if (bridge != null && bridge.getIpAddress() != null && !bridge.getIpAddress().isBlank()) {
-            return Optional.of(bridge.getIpAddress());
+            return Optional.of(new ContainerNetworkAddress(bridge.getIpAddress(), bridge.getMacAddress()));
         }
         return networks.values().stream()
-                .map(ContainerNetwork::getIpAddress)
-                .filter(ip -> ip != null && !ip.isBlank())
+                .filter(network -> network.getIpAddress() != null && !network.getIpAddress().isBlank())
+                .map(network -> new ContainerNetworkAddress(network.getIpAddress(), network.getMacAddress()))
                 .findFirst();
     }
+
+    record ContainerNetworkAddress(String ipAddress, String macAddress) {}
 
     private byte[] buildSingleFileTar(String filename, byte[] content, int mode) throws IOException {
         ByteArrayOutputStream bos = new ByteArrayOutputStream();

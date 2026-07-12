@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.vertx.core.Vertx;
@@ -49,6 +50,7 @@ public class Ec2MetadataServer {
     private static final Duration CREDENTIAL_LIFETIME = Duration.ofHours(1);
     private static final Duration CREDENTIAL_ROTATION_WINDOW = Duration.ofMinutes(5);
     private static final SecureRandom RANDOM = new SecureRandom();
+    private static final String METADATA_VERSION_PATTERN = "/[0-9]{4}-[0-9]{2}-[0-9]{2}/.*";
 
     private final Vertx vertx;
     private final EmulatorConfig config;
@@ -109,6 +111,36 @@ public class Ec2MetadataServer {
 
         Router router = Router.router(vertx);
         router.route().handler(BodyHandler.create());
+
+        router.routeWithRegex(METADATA_VERSION_PATTERN).handler(ctx ->
+                ctx.reroute(versionedPath(ctx.request().path())));
+
+        router.get("/").handler(ctx -> handleDirectory(ctx,
+                "1.0\n2009-04-04\n2014-11-05\n2021-03-23\nlatest"));
+        router.get("/latest").handler(ctx -> handleDirectory(ctx, "dynamic/\nmeta-data/\nuser-data"));
+        router.get("/latest/").handler(ctx -> handleDirectory(ctx, "dynamic/\nmeta-data/\nuser-data"));
+        router.get("/latest/meta-data").handler(this::handleMetadataRoot);
+        router.get("/latest/meta-data/").handler(this::handleMetadataRoot);
+        router.get("/latest/meta-data/iam").handler(ctx -> handleDirectory(ctx, "info\nsecurity-credentials/"));
+        router.get("/latest/meta-data/iam/").handler(ctx -> handleDirectory(ctx, "info\nsecurity-credentials/"));
+        router.get("/latest/meta-data/placement").handler(ctx -> handleDirectory(ctx, "availability-zone\nregion"));
+        router.get("/latest/meta-data/placement/").handler(ctx -> handleDirectory(ctx, "availability-zone\nregion"));
+        router.get("/latest/meta-data/network").handler(ctx -> handleDirectory(ctx, "interfaces/"));
+        router.get("/latest/meta-data/network/").handler(ctx -> handleDirectory(ctx, "interfaces/"));
+        router.get("/latest/meta-data/network/interfaces").handler(ctx -> handleDirectory(ctx, "macs/"));
+        router.get("/latest/meta-data/network/interfaces/").handler(ctx -> handleDirectory(ctx, "macs/"));
+        router.get("/latest/meta-data/network/interfaces/macs").handler(this::handleNetworkMacs);
+        router.get("/latest/meta-data/network/interfaces/macs/").handler(this::handleNetworkMacs);
+        router.getWithRegex("/latest/meta-data/network/interfaces/macs/[^/]+/?")
+                .handler(this::handleNetworkInterfaceDirectory);
+        router.getWithRegex("/latest/meta-data/network/interfaces/macs/[^/]+/[^/]+")
+                .handler(this::handleNetworkInterfaceValue);
+        router.get("/latest/meta-data/tags").handler(ctx -> handleDirectory(ctx, "instance/"));
+        router.get("/latest/meta-data/tags/").handler(ctx -> handleDirectory(ctx, "instance/"));
+        router.get("/latest/dynamic").handler(ctx -> handleDirectory(ctx, "instance-identity/"));
+        router.get("/latest/dynamic/").handler(ctx -> handleDirectory(ctx, "instance-identity/"));
+        router.get("/latest/dynamic/instance-identity").handler(ctx -> handleDirectory(ctx, "document"));
+        router.get("/latest/dynamic/instance-identity/").handler(ctx -> handleDirectory(ctx, "document"));
 
         // IMDSv2 token endpoint
         router.put("/latest/api/token").handler(this::handleToken);
@@ -201,6 +233,25 @@ public class Ec2MetadataServer {
                 .end(value);
     }
 
+    private void handleDirectory(RoutingContext ctx, String contents) {
+        if (resolveInstance(ctx) == null) {
+            return;
+        }
+        ctx.response().setStatusCode(200)
+                .putHeader("content-type", "text/plain")
+                .end(contents);
+    }
+
+    private void handleMetadataRoot(RoutingContext ctx) {
+        Instance instance = resolveInstance(ctx);
+        if (instance == null) {
+            return;
+        }
+        ctx.response().setStatusCode(200)
+                .putHeader("content-type", "text/plain")
+                .end(metadataRootDirectory(instance));
+    }
+
     private void handleMac(RoutingContext ctx) {
         Instance inst = resolveInstance(ctx);
         if (inst == null) {
@@ -229,6 +280,56 @@ public class Ec2MetadataServer {
         ctx.response().setStatusCode(200)
                 .putHeader("content-type", "text/plain")
                 .end(sb.toString());
+    }
+
+    private void handleNetworkMacs(RoutingContext ctx) {
+        Instance instance = resolveInstance(ctx);
+        if (instance == null) {
+            return;
+        }
+        ctx.response().setStatusCode(200)
+                .putHeader("content-type", "text/plain")
+                .end(networkMacDirectory(instance));
+    }
+
+    private void handleNetworkInterfaceDirectory(RoutingContext ctx) {
+        Instance instance = resolveInstance(ctx);
+        if (instance == null) {
+            return;
+        }
+        Optional<InstanceNetworkInterface> networkInterface = networkInterface(instance, networkMac(ctx));
+        if (networkInterface.isEmpty()) {
+            ctx.response().setStatusCode(404).end("not-found");
+            return;
+        }
+        ctx.response().setStatusCode(200)
+                .putHeader("content-type", "text/plain")
+                .end(networkInterfaceDirectory(networkInterface.get()));
+    }
+
+    private void handleNetworkInterfaceValue(RoutingContext ctx) {
+        Instance instance = resolveInstance(ctx);
+        if (instance == null) {
+            return;
+        }
+        Optional<InstanceNetworkInterface> networkInterface = networkInterface(instance, networkMac(ctx));
+        Optional<String> value = networkInterface.flatMap(attachedInterface -> networkInterfaceValue(
+                attachedInterface,
+                ctx.request().path().substring(ctx.request().path().lastIndexOf('/') + 1)));
+        if (value.isEmpty()) {
+            ctx.response().setStatusCode(404).end("not-available");
+            return;
+        }
+        ctx.response().setStatusCode(200)
+                .putHeader("content-type", "text/plain")
+                .end(value.get());
+    }
+
+    private static String networkMac(RoutingContext ctx) {
+        String prefix = "/latest/meta-data/network/interfaces/macs/";
+        String suffix = ctx.request().path().substring(prefix.length());
+        int slash = suffix.indexOf('/');
+        return slash >= 0 ? suffix.substring(0, slash) : suffix;
     }
 
     private void handleIamInfo(RoutingContext ctx) {
@@ -577,4 +678,104 @@ public class Ec2MetadataServer {
         }
         return Optional.empty();
     }
+
+    static String versionedPath(String path) {
+        if (path == null || path.length() < 12 || path.charAt(0) != '/') {
+            return path;
+        }
+        int nextSlash = path.indexOf('/', 1);
+        if (nextSlash < 0) {
+            return "/latest";
+        }
+        return "/latest" + path.substring(nextSlash);
+    }
+
+    static String metadataRootDirectory(Instance instance) {
+        java.util.List<String> entries = new java.util.ArrayList<>(java.util.List.of(
+                "ami-id",
+                "hostname",
+                "instance-id",
+                "instance-type",
+                "local-hostname",
+                "local-ipv4",
+                "mac",
+                "network/",
+                "placement/",
+                "security-groups",
+                "tags/"));
+        if (instance != null && instance.getIamInstanceProfileArn() != null) {
+            entries.add(2, "iam/");
+        }
+        if (instance != null && instance.getPublicDnsName() != null) {
+            entries.add("public-hostname");
+        }
+        if (instance != null && instance.getPublicIpAddress() != null) {
+            entries.add("public-ipv4");
+        }
+        return String.join("\n", entries);
+    }
+
+    static String networkMacDirectory(Instance instance) {
+        if (instance == null || instance.getNetworkInterfaces() == null) {
+            return "";
+        }
+        return instance.getNetworkInterfaces().stream()
+                .map(InstanceNetworkInterface::getMacAddress)
+                .filter(mac -> mac != null && !mac.isBlank())
+                .map(mac -> mac + "/")
+                .collect(java.util.stream.Collectors.joining("\n"));
+    }
+
+    static Optional<InstanceNetworkInterface> networkInterface(Instance instance, String mac) {
+        if (instance == null || instance.getNetworkInterfaces() == null || mac == null) {
+            return Optional.empty();
+        }
+        return instance.getNetworkInterfaces().stream()
+                .filter(networkInterface -> mac.equalsIgnoreCase(networkInterface.getMacAddress()))
+                .findFirst();
+    }
+
+    static String networkInterfaceDirectory(InstanceNetworkInterface networkInterface) {
+        java.util.List<String> entries = new java.util.ArrayList<>(java.util.List.of(
+                "device-number",
+                "interface-id",
+                "local-hostname",
+                "local-ipv4s",
+                "mac",
+                "owner-id",
+                "security-group-ids",
+                "security-groups",
+                "subnet-id",
+                "vpc-id"));
+        return entries.stream()
+                .filter(entry -> networkInterfaceValue(networkInterface, entry).isPresent())
+                .collect(java.util.stream.Collectors.joining("\n"));
+    }
+
+    static Optional<String> networkInterfaceValue(InstanceNetworkInterface networkInterface, String field) {
+        if (networkInterface == null || field == null) {
+            return Optional.empty();
+        }
+        String value = switch (field) {
+            case "device-number" -> Integer.toString(networkInterface.getDeviceIndex());
+            case "interface-id" -> networkInterface.getNetworkInterfaceId();
+            case "local-hostname" -> networkInterface.getPrivateDnsName();
+            case "local-ipv4s" -> networkInterface.getPrivateIpAddress();
+            case "mac" -> networkInterface.getMacAddress();
+            case "owner-id" -> networkInterface.getOwnerId();
+            case "security-group-ids" -> networkInterface.getGroups().stream()
+                    .map(group -> group.getGroupId())
+                    .filter(java.util.Objects::nonNull)
+                    .collect(java.util.stream.Collectors.joining("\n"));
+            case "security-groups" -> networkInterface.getGroups().stream()
+                    .map(group -> group.getGroupName() != null ? group.getGroupName() : group.getGroupId())
+                    .filter(java.util.Objects::nonNull)
+                    .collect(java.util.stream.Collectors.joining("\n"));
+            case "subnet-id" -> networkInterface.getSubnetId();
+            case "vpc-id" -> networkInterface.getVpcId();
+            default -> null;
+        };
+        return value == null || value.isBlank() ? Optional.empty() : Optional.of(value);
+    }
+
 }

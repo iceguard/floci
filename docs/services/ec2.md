@@ -39,7 +39,9 @@ Any unrecognized AMI ID (including real AWS AMI IDs like `ami-0abc12345678`) fal
 
 ### Cloud-image-derived AMI guests
 
-The advertised Canonical Ubuntu 24.04 ARM64 AMI is built from Canonical cloud-image artifacts, not from the Docker-library `ubuntu:24.04` image. `DescribeImages` publishes one stock Canonical record, while `ami-ubuntu2404-cloud-arm64` and `ami-ubuntu2404-cloud` remain resolver aliases for callers that used the former separate cloud record.
+The advertised Canonical Ubuntu 24.04 ARM64 AMI is built from Canonical cloud-image artifacts, not from the Docker-library `ubuntu:24.04` image. It boots with `systemd` and native `cloud-init` using the EC2 datasource. Floci registers the guest with IMDS, installs the link-local `169.254.169.254` endpoint, exposes versioned metadata traversal, and releases guest init only after metadata preflight succeeds. `DescribeImages` publishes one stock Canonical record, while `ami-ubuntu2404-cloud-arm64` and `ami-ubuntu2404-cloud` remain resolver aliases for callers that used the former separate cloud record.
+
+This mode is selected by the cloud-image AMI contract rather than a global configuration switch. Minimal-image entries keep the direct shell user-data execution path and `tail -f /dev/null` container lifecycle.
 
 The Java metadata-driven builder lives at `io.github.hectorvent.floci.tools.ami.AmiImageTool`. Its recipe is checked in at `docker/ec2/ami-images/image-build-metadata.yaml`, and generated context/provenance defaults to `target/ami-images/<image-id>/`.
 
@@ -87,9 +89,11 @@ Notes and limitations:
 
 ## UserData
 
-`UserData` must be base64-encoded in the request (matching the AWS wire format). Floci decodes it, copies the script into `/tmp/user-data.sh` inside the container, and executes the script directly after SSH key injection so the script shebang selects the interpreter. Output is captured and logged.
+`UserData` must be base64-encoded in the request (matching the AWS wire format) and the decoded payload must not exceed the EC2 limit of 16 KiB. Floci preserves the exact encoded and decoded bytes for API and IMDS readback.
 
-EC2 containers receive `AWS_EC2_METADATA_SERVICE_ENDPOINT` for IMDS and `AWS_ENDPOINT_URL` for AWS service API calls back to Floci.
+Cloud-image AMIs pass those bytes to native `cloud-init`; Floci does not extract or execute their shell parts itself. Other AMIs retain the lightweight direct shell execution path after SSH key injection. Output from that legacy path is captured and logged.
+
+EC2 containers receive `AWS_EC2_METADATA_SERVICE_ENDPOINT` for IMDS and `AWS_ENDPOINT_URL` for AWS service API calls back to Floci. Floci does not inject static AWS access keys into EC2 guests, so an attached instance profile remains the standard credential-chain source.
 
 ## Instance Metadata Service (IMDS)
 
@@ -120,6 +124,7 @@ curl -s -H "x-aws-ec2-metadata-token: $TOKEN" \
 | `GET /latest/meta-data/local-hostname` | Private DNS name |
 | `GET /latest/meta-data/hostname` | Private DNS name |
 | `GET /latest/meta-data/mac` | MAC address of first ENI |
+| `GET /latest/meta-data/network/interfaces/macs/` | Attached ENI MAC directories and interface metadata |
 | `GET /latest/meta-data/security-groups` | Security group names |
 | `GET /latest/meta-data/placement/availability-zone` | AZ |
 | `GET /latest/meta-data/placement/region` | Region |

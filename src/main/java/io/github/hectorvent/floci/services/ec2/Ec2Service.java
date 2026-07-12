@@ -661,6 +661,9 @@ public class Ec2Service implements ContainerTeardown {
         validateArchitectureCompatibility(imageId, effectiveInstanceType);
         int count = Math.min(maxCount, Math.max(minCount, 1));
         String architecture = architectureFor(imageId, effectiveInstanceType);
+        ResolvedAmiImage resolvedImage = config.services().ec2().mock()
+                ? null
+                : amiImageResolver.resolveImage(imageId);
         for (int i = 0; i < count; i++) {
             String instanceId = "i-" + randomHex(17);
             String privateIp = assignPrivateIp(region, finalSubnetId);
@@ -683,6 +686,7 @@ public class Ec2Service implements ContainerTeardown {
             inst.setClientToken(clientToken);
             inst.setRegion(region);
             inst.setEncodedUserData(userData != null ? userData.encoded() : null);
+            inst.setNativeCloudInit(resolvedImage != null && resolvedImage.systemd() && resolvedImage.cloudInit());
             inst.setIamInstanceProfileArn(iamInstanceProfileArn);
             if (instanceTags != null && !instanceTags.isEmpty()) {
                 inst.setTags(new ArrayList<>(instanceTags));
@@ -730,7 +734,6 @@ public class Ec2Service implements ContainerTeardown {
             reservation.getInstances().add(inst);
 
             if (!config.services().ec2().mock()) {
-                ResolvedAmiImage dockerImage = amiImageResolver.resolveImage(imageId);
                 String publicKey = null;
                 if (keyName != null) {
                     KeyPair kp = findKeyPair(region, keyName);
@@ -738,7 +741,7 @@ public class Ec2Service implements ContainerTeardown {
                         publicKey = kp.getPublicKey();
                     }
                 }
-                containerManager.launch(inst, dockerImage, publicKey, region, desiredPublishedPorts(region, inst));
+                containerManager.launch(inst, resolvedImage, publicKey, region, desiredPublishedPorts(region, inst));
             }
         }
 

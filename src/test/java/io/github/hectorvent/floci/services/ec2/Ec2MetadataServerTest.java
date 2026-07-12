@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.ec2;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.iam.IamService;
@@ -221,5 +222,67 @@ class Ec2MetadataServerTest {
         instance.setIamInstanceProfileArn(
                 "arn:aws:iam::111122223333:instance-profile/sample-profile");
         return instance;
+    }
+
+    @Test
+    void versionedDatasourcePathsRerouteToLatest() {
+        assertEquals("/latest/meta-data/instance-id",
+                Ec2MetadataServer.versionedPath("/2021-03-23/meta-data/instance-id"));
+        assertEquals("/latest/dynamic/instance-identity/document",
+                Ec2MetadataServer.versionedPath("/2009-04-04/dynamic/instance-identity/document"));
+    }
+
+    @Test
+    void metadataRootExposesDatasourceTraversalDirectories() {
+        Instance instance = new Instance();
+        instance.setIamInstanceProfileArn("arn:aws:iam::000000000000:instance-profile/sample-profile");
+        instance.setPublicDnsName("sample.example");
+        instance.setPublicIpAddress("127.0.0.1");
+        String root = Ec2MetadataServer.metadataRootDirectory(instance);
+
+        assertTrue(root.contains("iam/"));
+        assertTrue(root.contains("placement/"));
+        assertTrue(root.contains("network/"));
+        assertTrue(root.contains("tags/"));
+        assertTrue(root.contains("instance-id"));
+    }
+
+    @Test
+    void networkMetadataExposesAwsInterfaceTraversal() {
+        InstanceNetworkInterface networkInterface = new InstanceNetworkInterface();
+        networkInterface.setNetworkInterfaceId("eni-123");
+        networkInterface.setOwnerId("000000000000");
+        networkInterface.setMacAddress("02:42:ac:11:00:15");
+        networkInterface.setPrivateIpAddress("192.168.215.21");
+        networkInterface.setPrivateDnsName("ip-192-168-215-21.ec2.internal");
+        networkInterface.setSubnetId("subnet-123");
+        networkInterface.setVpcId("vpc-123");
+        networkInterface.setDeviceIndex(0);
+        Instance instance = new Instance();
+        instance.setNetworkInterfaces(List.of(networkInterface));
+
+        assertEquals("02:42:ac:11:00:15/", Ec2MetadataServer.networkMacDirectory(instance));
+        assertEquals(networkInterface, Ec2MetadataServer.networkInterface(instance, "02:42:AC:11:00:15").orElseThrow());
+        assertEquals("192.168.215.21", Ec2MetadataServer.networkInterfaceValue(
+                networkInterface, "local-ipv4s").orElseThrow());
+        assertTrue(Ec2MetadataServer.networkInterfaceDirectory(networkInterface).contains("interface-id"));
+    }
+
+    @Test
+    void metadataRootOmitsUnavailableOptionalLeaves() {
+        String root = Ec2MetadataServer.metadataRootDirectory(new Instance());
+
+        org.junit.jupiter.api.Assertions.assertFalse(root.contains("iam/"));
+        org.junit.jupiter.api.Assertions.assertFalse(root.contains("public-hostname"));
+        org.junit.jupiter.api.Assertions.assertFalse(root.contains("public-ipv4"));
+    }
+
+    @Test
+    void userDataReturnsExactBinaryBytes() {
+        byte[] bytes = new byte[]{0x1f, (byte) 0x8b, 0x00, (byte) 0xff};
+        Instance instance = new Instance();
+        instance.setEncodedUserData(Base64.getEncoder().encodeToString(bytes));
+
+        assertArrayEquals(bytes, Ec2MetadataServer.userDataBytes(instance));
     }
 }

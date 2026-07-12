@@ -12,9 +12,8 @@ import com.github.dockerjava.api.command.InspectExecCmd;
 import com.github.dockerjava.api.command.InspectExecResponse;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
-import com.github.dockerjava.api.model.StreamType;
-import java.nio.charset.StandardCharsets;
 import com.github.dockerjava.api.model.NetworkSettings;
+import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -30,7 +29,9 @@ import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
@@ -44,6 +45,7 @@ import java.util.zip.GZIPOutputStream;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -54,7 +56,6 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
@@ -89,6 +90,19 @@ class Ec2ContainerManagerTest {
         assertEquals("ip-192-168-215-21.ec2.internal", instance.getPrivateDnsName());
         assertEquals("192.168.215.21", networkInterface.getPrivateIpAddress());
         assertEquals("ip-192-168-215-21.ec2.internal", networkInterface.getPrivateDnsName());
+    }
+
+    @Test
+    void exposeReachableNetworkAddressUpdatesAttachedInterfaceMac() {
+        Instance instance = new Instance();
+        InstanceNetworkInterface networkInterface = new InstanceNetworkInterface();
+        instance.setNetworkInterfaces(new ArrayList<>(List.of(networkInterface)));
+
+        Ec2ContainerManager.exposeReachableNetworkAddress(
+                instance,
+                new Ec2ContainerManager.ContainerNetworkAddress("192.168.215.21", "02:42:ac:11:00:15"));
+
+        assertEquals("02:42:ac:11:00:15", networkInterface.getMacAddress());
     }
 
     @Test
@@ -340,6 +354,17 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void nativeMetadataProxyInstallCommandUsesSocketActivatedProxyDependencies() {
+        String[] command = Ec2ContainerManager.nativeMetadataProxyInstallCommand();
+
+        assertEquals("sh", command[0]);
+        assertTrue(command[2].contains("iproute2"));
+        assertTrue(command[2].contains("netcat-openbsd"));
+        assertTrue(command[2].contains("curl"));
+        assertFalse(command[2].contains("command -v socat"));
+    }
+
+    @Test
     void metadataProxyStartCommandBindsAwsLinkLocalMetadataAddress() {
         String[] command = Ec2ContainerManager.metadataProxyStartCommand("floci", 9169);
 
@@ -353,7 +378,6 @@ class Ec2ContainerManagerTest {
     @Test
     void localAwsEnvironmentProvidesCliCredentialsAndFlociEndpointWithoutInstanceProfile() {
         Instance instance = instance("i-no-profile");
-
         assertEquals(
                 java.util.List.of(
                         "AWS_EC2_METADATA_SERVICE_ENDPOINT=http://floci:9169",
@@ -413,8 +437,54 @@ class Ec2ContainerManagerTest {
                 "AWS_DEFAULT_REGION=us-west-2",
                 "AWS_REGION=us-west-2"));
         verify(harness.builder).withCmd(List.of("/sbin/init"));
+        verify(harness.builder).withEntrypoint(List.of("/usr/local/sbin/floci-ec2-pre-systemd"));
         verify(harness.builder).withCgroupnsMode("host");
         verify(harness.builder).withBind("/sys/fs/cgroup", "/sys/fs/cgroup");
+    }
+
+    @Test
+    void launchCleansUpContainerAndSshPortWhenPreSystemdInstallFails() throws Exception {
+        LaunchHarness harness = launchHarness();
+        CopyArchiveToContainerCmd copy = mock(
+                CopyArchiveToContainerCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
+        when(harness.dockerClient.copyArchiveToContainerCmd(TEST_CONTAINER_ID)).thenReturn(copy);
+        when(copy.exec()).thenThrow(new IllegalStateException("copy failed"));
+        Instance instance = instance("i-pre-systemd-failure");
+
+        harness.manager.launch(instance,
+                new ResolvedAmiImage("floci/ami-ubuntu:24.04-arm64", ResolvedAmiImage.SYSTEMD_RUNTIME, true),
+                null,
+                "us-west-2");
+
+        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        verify(harness.lifecycleManager).stopAndRemove(TEST_CONTAINER_ID, null);
+        verify(harness.portAllocator).release(2201);
+        verify(harness.portForwardManager).unpublishAll(instance);
+        verify(harness.metadataServer).unregisterContainer(null, instance);
+        verify(harness.lifecycleManager, never()).startCreated(anyString(), any(ContainerSpec.class));
+        assertTrue(instance.getTerminatedAt() > 0, "failed launch should record termination time");
+    }
+
+    @Test
+    void nativeCloudInitUnitsOrderManagedImdsBeforeDatasourceProbe() {
+        assertTrue(Ec2ContainerManager.preSystemdEntrypoint().contains("exec \"$@\""));
+        assertTrue(Ec2ContainerManager.preSystemdEntrypoint().contains("/run/floci-ec2/start-systemd"));
+        assertTrue(Ec2ContainerManager.metadataAddressUnit().contains("Before=floci-imds-proxy.socket cloud-init-local.service"));
+        assertTrue(Ec2ContainerManager.metadataProxySocketUnit().contains("Before=cloud-init-local.service"));
+        assertTrue(Ec2ContainerManager.metadataProxySocketUnit().contains("Accept=yes"));
+        assertTrue(Ec2ContainerManager.metadataProxyServiceUnit("floci", 9169)
+                .contains("ExecStart=/usr/bin/nc floci 9169"));
+        assertTrue(Ec2ContainerManager.metadataProxyServiceUnit("floci", 9169)
+                .contains("DefaultDependencies=no"));
+        assertTrue(Ec2ContainerManager.cloudInitDatasourceIdentification().contains("datasource: Ec2"));
+        assertTrue(Ec2ContainerManager.cloudInitDatasourceConfiguration().contains("datasource_list: [ Ec2 ]"));
+        assertTrue(Ec2ContainerManager.cloudInitDatasourceConfiguration().contains("strict_id: false"));
+    }
+
+    @Test
+    void nativeCloudInitMetadataUnitRejectsUnsafeDockerHost() {
+        assertThrows(IllegalArgumentException.class,
+                () -> Ec2ContainerManager.metadataProxyServiceUnit("floci host", 9169));
     }
 
     @Test
@@ -677,6 +747,12 @@ class Ec2ContainerManagerTest {
                         Frame frame = new Frame(StreamType.STDOUT, TEST_USER_DATA_OUTPUT.getBytes(StandardCharsets.UTF_8));
                         callback.onNext(frame);
                         finishUserData.await(2, TimeUnit.SECONDS);
+                    }
+                    else if (currentCommand.get() != null
+                            && currentCommand.get().length > 0
+                            && "curl".equals(currentCommand.get()[0])) {
+                        callback.onNext(new Frame(StreamType.STDOUT,
+                                "i-systemd".getBytes(StandardCharsets.UTF_8)));
                     }
                     callback.onComplete();
                     return callback;
