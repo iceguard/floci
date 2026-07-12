@@ -1379,6 +1379,10 @@ public interface EmulatorConfig {
         @WithDefault("9169")
         int imdsPort();
 
+        /** Maximum runtime for EC2 guest user data before Floci records a timeout and stops it. */
+        @WithDefault("900")
+        int userDataTimeoutSeconds();
+
         /** Lowest host port in the range published for EC2 instance SSH (port 22). */
         @WithDefault("2200")
         int sshPortRangeStart();

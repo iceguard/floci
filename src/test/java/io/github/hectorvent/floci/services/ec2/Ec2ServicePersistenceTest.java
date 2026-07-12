@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.services.ec2.model.Address;
 import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
 import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceBootstrapResult;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.NetworkAcl;
@@ -33,6 +34,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -56,6 +58,30 @@ import static org.mockito.Mockito.when;
 class Ec2ServicePersistenceTest {
 
     private static final String REGION = "us-east-1";
+
+    @Test
+    void redactedBootstrapResultSurvivesRestart(@TempDir Path dir) {
+        InstanceBootstrapResult result = new InstanceBootstrapResult();
+        result.setStatus("FAILED");
+        result.setStartedAt(Instant.parse("2026-07-12T12:00:00Z"));
+        result.setCompletedAt(Instant.parse("2026-07-12T12:00:05Z"));
+        result.setExitCode(1);
+        result.setMessage("Cloud-init failed");
+        Instance instance = new Instance();
+        instance.setInstanceId("i-bootstrap-result-persistence");
+        instance.setBootstrapResult(result);
+
+        StorageBackend<String, Instance> first = load(
+                dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {});
+        first.put(REGION + "::" + instance.getInstanceId(), instance);
+
+        Instance restored = load(dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {})
+                .get(REGION + "::" + instance.getInstanceId())
+                .orElseThrow();
+        assertEquals("FAILED", restored.getBootstrapResult().getStatus());
+        assertEquals(1, restored.getBootstrapResult().getExitCode());
+        assertEquals("Cloud-init failed", restored.getBootstrapResult().getMessage());
+    }
 
     @Test
     void emptyNetworkDiscoverySurvivesRestart(@TempDir Path dir) {

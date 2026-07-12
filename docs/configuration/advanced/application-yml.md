@@ -227,6 +227,7 @@ floci:
 
     ec2:
       enabled: true
+      user-data-timeout-seconds: 900
 
     ecs:
       enabled: true

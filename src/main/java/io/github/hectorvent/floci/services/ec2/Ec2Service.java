@@ -196,6 +196,11 @@ public class Ec2Service implements ContainerTeardown {
 
     @PostConstruct
     void restoreMetadataRegistrations() {
+        containerManager.setInstancePersister(instance -> {
+            if (instance != null && instance.getRegion() != null && instance.getInstanceId() != null) {
+                instances.put(key(instance.getRegion(), instance.getInstanceId()), instance);
+            }
+        });
         if (portForwardManager != null) {
             portForwardManager.setPersister(inst -> {
                 if (inst != null && inst.getRegion() != null && inst.getInstanceId() != null) {
