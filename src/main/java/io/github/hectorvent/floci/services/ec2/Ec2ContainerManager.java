@@ -4,12 +4,12 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
-import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceBootstrapResult;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import com.github.dockerjava.api.DockerClient;
@@ -30,6 +30,7 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -40,6 +41,8 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -52,9 +55,9 @@ import java.util.regex.Pattern;
 public class Ec2ContainerManager {
 
     private static final Logger LOG = Logger.getLogger(Ec2ContainerManager.class);
-    private static final String USER_DATA_SCRIPT_PATH = "/tmp/user-data.sh";
     private static final String PRE_SYSTEMD_ENTRYPOINT = "/usr/local/sbin/floci-ec2-pre-systemd";
     private static final String SYSTEMD_RELEASE_PATH = "/run/floci-ec2/start-systemd";
+    private static final int DEFAULT_USER_DATA_TIMEOUT_SECONDS = 900;
     private static final Pattern MIME_BOUNDARY = Pattern.compile("(?im)^content-type:\\s*multipart/[^;]+;\\s*boundary=\"?([^\";\\n\\r]+)\"?.*$");
     static int containerBridgeIpAttempts = 30;
     static long containerBridgeIpPollMillis = 500;
@@ -62,7 +65,6 @@ public class Ec2ContainerManager {
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
-    private final ContainerLogStreamer logStreamer;
     private final ContainerDetector containerDetector;
     private final DockerHostResolver dockerHostResolver;
     private final DockerClient dockerClient;
@@ -70,6 +72,7 @@ public class Ec2ContainerManager {
     private final EmulatorConfig config;
     private final Ec2MetadataServer metadataServer;
     private final Ec2PortForwardManager portForwardManager;
+    private volatile Consumer<Instance> instancePersister = ignored -> {};
 
     private final ExecutorService executor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "ec2-container-launcher");
@@ -80,7 +83,6 @@ public class Ec2ContainerManager {
     @Inject
     public Ec2ContainerManager(ContainerBuilder containerBuilder,
                                ContainerLifecycleManager lifecycleManager,
-                               ContainerLogStreamer logStreamer,
                                ContainerDetector containerDetector,
                                DockerHostResolver dockerHostResolver,
                                DockerClient dockerClient,
@@ -90,7 +92,6 @@ public class Ec2ContainerManager {
                                Ec2PortForwardManager portForwardManager) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
-        this.logStreamer = logStreamer;
         this.containerDetector = containerDetector;
         this.dockerHostResolver = dockerHostResolver;
         this.dockerClient = dockerClient;
@@ -98,6 +99,10 @@ public class Ec2ContainerManager {
         this.config = config;
         this.metadataServer = metadataServer;
         this.portForwardManager = portForwardManager;
+    }
+
+    void setInstancePersister(Consumer<Instance> instancePersister) {
+        this.instancePersister = instancePersister != null ? instancePersister : ignored -> {};
     }
 
     /**
@@ -126,12 +131,15 @@ public class Ec2ContainerManager {
         instance.setState(InstanceState.pending());
 
         executor.submit(() -> {
+            String containerId = null;
+            String containerIp = null;
+            int sshHostPort = 0;
             try {
                 String instanceId = instance.getInstanceId();
                 String containerName = ContainerStorageHelper.resourceName(config, "ec2", null, instanceId);
 
                 // Allocate SSH host port
-                int sshHostPort = portAllocator.allocate(
+                sshHostPort = portAllocator.allocate(
                         config.services().ec2().sshPortRangeStart(),
                         config.services().ec2().sshPortRangeEnd());
                 instance.setSshHostPort(sshHostPort);
@@ -171,7 +179,7 @@ public class Ec2ContainerManager {
                 ContainerSpec spec = specBuilder.build();
 
                 // Create container without starting it
-                String containerId = lifecycleManager.create(spec);
+                containerId = lifecycleManager.create(spec);
                 instance.setDockerContainerId(containerId);
 
                 if (image.systemd() && image.cloudInit()) {
@@ -209,7 +217,7 @@ public class Ec2ContainerManager {
                 // settings are populated; wait here so IMDS is registered
                 // before link-local metadata validation and UserData run.
                 ContainerNetworkAddress containerAddress = waitForContainerNetworkAddress(containerId, instanceId);
-                String containerIp = containerAddress != null ? containerAddress.ipAddress() : null;
+                containerIp = containerAddress != null ? containerAddress.ipAddress() : null;
                 if (containerIp != null && !containerIp.isBlank()) {
                     instance.setContainerBridgeIp(containerIp);
                     exposeReachableNetworkAddress(instance, containerAddress);
@@ -226,6 +234,12 @@ public class Ec2ContainerManager {
                 instance.setPublicIpAddress("127.0.0.1");
                 instance.setPublicDnsName("localhost");
 
+                byte[] userDataBytes = Ec2MetadataServer.userDataBytes(instance);
+                boolean hasUserData = userDataBytes != null && userDataBytes.length > 0;
+                if (hasUserData) {
+                    beginBootstrap(instance);
+                }
+
                 boolean metadataReady = image.systemd() && image.cloudInit()
                         ? configureNativeCloudInitMetadata(containerId, instanceId, flociHost, imdsPort)
                         : configureLinkLocalMetadataEndpoint(containerId, instanceId, flociHost, imdsPort);
@@ -235,6 +249,7 @@ public class Ec2ContainerManager {
                 }
 
                 instance.setState(InstanceState.running());
+                persist(instance);
                 LOG.infov("EC2 instance {0} running in container {1} (SSH host port {2})",
                         instanceId, containerId, String.valueOf(sshHostPort));
 
@@ -253,16 +268,26 @@ public class Ec2ContainerManager {
                 Ec2UserData userData = instance.getEncodedUserData() != null
                         ? Ec2UserData.fromEncoded(instance.getEncodedUserData())
                         : Ec2UserData.fromText(instance.getUserData());
-                if (!image.cloudInit() && userData != null && userData.bytes().length > 0) {
-                    executeUserData(containerId, instanceId, userDataExecutionText(userData), region);
+                if (hasUserData) {
+                    if (image.cloudInit()) {
+                        monitorNativeCloudInit(containerId, instance);
+                    }
+                    else if (userData != null) {
+                        completeBootstrap(instance, executeUserData(
+                                containerId, instanceId, userDataExecutionText(userData)));
+                    }
+                    else {
+                        completeBootstrap(instance, BootstrapExecution.failed(
+                                null, "User data is not supported by the selected guest image"));
+                    }
                 }
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                instance.setState(InstanceState.terminated());
+                cleanupFailedLaunch(instance, containerId, containerIp, sshHostPort);
             } catch (Exception e) {
                 LOG.warnv("Failed to launch EC2 instance {0}: {1}", instance.getInstanceId(), e.getMessage());
-                instance.setState(InstanceState.terminated());
+                cleanupFailedLaunch(instance, containerId, containerIp, sshHostPort);
             }
         });
     }
@@ -315,6 +340,7 @@ public class Ec2ContainerManager {
                 LOG.warnv("Error stopping EC2 container {0}: {1}", containerId, e.getMessage());
             }
             instance.setState(InstanceState.stopped());
+            persist(instance);
         });
     }
 
@@ -362,10 +388,15 @@ public class Ec2ContainerManager {
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+                cleanupFailedLaunch(instance, containerId, instance.getContainerBridgeIp(), instance.getSshHostPort());
+                return;
             } catch (Exception e) {
                 LOG.warnv("Error starting EC2 container {0}: {1}", containerId, e.getMessage());
+                cleanupFailedLaunch(instance, containerId, instance.getContainerBridgeIp(), instance.getSshHostPort());
+                return;
             }
             instance.setState(InstanceState.running());
+            persist(instance);
         });
     }
 
@@ -462,6 +493,7 @@ public class Ec2ContainerManager {
             metadataServer.unregisterInstance(instance);
             instance.setState(InstanceState.terminated());
             instance.setTerminatedAt(System.currentTimeMillis());
+            persist(instance);
         });
     }
 
@@ -500,10 +532,13 @@ public class Ec2ContainerManager {
                     return;
                 }
                 LOG.infov("Rebooted EC2 container {0}", containerId);
+                persist(instance);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+                cleanupFailedLaunch(instance, containerId, instance.getContainerBridgeIp(), instance.getSshHostPort());
             } catch (Exception e) {
                 LOG.warnv("Error rebooting EC2 container {0}: {1}", containerId, e.getMessage());
+                cleanupFailedLaunch(instance, containerId, instance.getContainerBridgeIp(), instance.getSshHostPort());
             }
         });
     }
@@ -554,49 +589,50 @@ public class Ec2ContainerManager {
         }
     }
 
-    private void executeUserData(String containerId, String instanceId, String userData, String region) {
+    private BootstrapExecution executeUserData(String containerId, String instanceId, String userData) {
         try {
-            String logGroup = "/aws/ec2/" + instanceId;
-            String logStream = logStreamer.generateLogStreamName("user-data");
-
             List<String> shellScripts = userDataShellScripts(userData);
             if (shellScripts.isEmpty()) {
                 LOG.infov("UserData for EC2 instance {0} did not contain executable shellscript parts", instanceId);
-                return;
+                return BootstrapExecution.success("No executable shellscript parts");
             }
 
-            // Execute the script and stream output to CloudWatch
             for (int i = 0; i < shellScripts.size(); i++) {
-                executeUserDataShellScript(
-                    containerId, instanceId, shellScripts.get(i), i + 1, shellScripts.size(),
-                    logGroup, logStream, region
-                );
+                BootstrapExecution result = executeUserDataShellScript(
+                        containerId, instanceId, shellScripts.get(i), i + 1, shellScripts.size());
+                if (!"SUCCEEDED".equals(result.status())) {
+                    return result;
+                }
             }
+            return BootstrapExecution.success("User data completed");
         } catch (Exception e) {
-            LOG.warnv("UserData execution failed for EC2 instance {0}: {1}", instanceId, e.getMessage());
+            LOG.warnv("UserData execution failed for EC2 instance {0}", instanceId);
+            return BootstrapExecution.failed(null, "User data execution failed");
         }
     }
 
-    private void executeUserDataShellScript(
-        String containerId, String instanceId, String scriptContent, int partNumber, int partCount,
-        String logGroup, String logStream, String region
-    ) throws Exception {
+    private BootstrapExecution executeUserDataShellScript(
+            String containerId, String instanceId, String scriptContent, int partNumber, int partCount)
+            throws Exception {
+        String executionId = java.util.UUID.randomUUID().toString();
+        String scriptPath = "/run/floci-ec2/user-data-" + executionId + ".sh";
+        String pidPath = "/run/floci-ec2/user-data-" + executionId + ".pid";
+        execInContainer(containerId, new String[]{"mkdir", "-p", "/run/floci-ec2"}, 5);
         byte[] script = scriptContent.getBytes(StandardCharsets.UTF_8);
-        byte[] tar = buildSingleFileTar("user-data.sh", script, 0755);
+        byte[] tar = buildSingleFileTar(scriptPath.substring(scriptPath.lastIndexOf('/') + 1), script, 0755);
         dockerClient.copyArchiveToContainerCmd(containerId)
-                .withRemotePath("/tmp")
+                .withRemotePath("/run/floci-ec2")
                 .withTarInputStream(new ByteArrayInputStream(tar))
                 .exec();
 
-        // Execute the script directly so Docker honors its shebang, matching cloud-init shellscript behavior.
         String execId = dockerClient.execCreateCmd(containerId)
-                .withCmd(userDataExecutionCommand())
+                .withCmd(userDataExecutionCommand(scriptPath, pidPath))
                 .withAttachStdout(true)
                 .withAttachStderr(true)
                 .exec()
                 .getId();
 
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        AtomicLong outputBytes = new AtomicLong();
         CountDownLatch latch = new CountDownLatch(1);
 
         dockerClient.execStartCmd(execId).exec(new ResultCallback.Adapter<Frame>() {
@@ -604,11 +640,7 @@ public class Ec2ContainerManager {
             public void onNext(Frame frame) {
                 byte[] payload = frame.getPayload();
                 if (payload == null) return;
-                try { output.write(payload); } catch (IOException ignored) {}
-                String line = new String(payload, StandardCharsets.UTF_8).stripTrailing();
-                if (!line.isEmpty()) {
-                    logStreamer.streamToCloudWatchLogs(logGroup, logStream, region, line);
-                }
+                outputBytes.addAndGet(payload.length);
             }
             @Override
             public void onComplete() { latch.countDown(); }
@@ -616,21 +648,23 @@ public class Ec2ContainerManager {
             public void onError(Throwable t) { latch.countDown(); }
         });
 
-        boolean completed = latch.await(30, TimeUnit.MINUTES);
+        boolean completed = latch.await(userDataTimeoutSeconds(), TimeUnit.SECONDS);
         if (!completed) {
+            terminateTrackedProcess(containerId, pidPath);
             LOG.warnv("UserData shellscript part {0}/{1} timed out for EC2 instance {2}", partNumber, partCount, instanceId);
-            return;
+            return BootstrapExecution.timedOut("User data timed out");
         }
 
         Long exitCode = dockerClient.inspectExecCmd(execId).exec().getExitCodeLong();
         if (exitCode != null && exitCode != 0) {
-            LOG.warnv("UserData shellscript part {0}/{1} failed for EC2 instance {2} with exit code {3}: {4}",
-                    partNumber, partCount, instanceId, exitCode, summarizeUserDataOutput(output));
-            return;
+            LOG.warnv("UserData shellscript part {0}/{1} failed for EC2 instance {2} with exit code {3}",
+                    partNumber, partCount, instanceId, exitCode);
+            return BootstrapExecution.failed(exitCode.intValue(), "User data failed");
         }
 
-        LOG.infov("UserData shellscript part {0}/{1} completed for EC2 instance {2}: {3}",
-                partNumber, partCount, instanceId, summarizeUserDataOutput(output));
+        LOG.infov("UserData shellscript part {0}/{1} completed for EC2 instance {2}; output bytes redacted: {3}",
+                partNumber, partCount, instanceId, outputBytes.get());
+        return BootstrapExecution.success("User data part completed");
     }
 
     static List<String> userDataShellScripts(String userData) {
@@ -701,8 +735,17 @@ public class Ec2ContainerManager {
         return false;
     }
 
-    static String[] userDataExecutionCommand() {
-        return new String[]{USER_DATA_SCRIPT_PATH};
+    static String[] userDataExecutionCommand(String scriptPath, String pidPath) {
+        return new String[]{"sh", "-c", String.join("\n",
+                "set -eu",
+                "script=$1",
+                "pidfile=$2",
+                "cleanup() { rm -f \"$script\" \"$pidfile\"; }",
+                "trap cleanup EXIT",
+                "if command -v setsid >/dev/null 2>&1; then setsid \"$script\" & else \"$script\" & fi",
+                "pid=$!",
+                "printf '%s\\n' \"$pid\" > \"$pidfile\"",
+                "wait \"$pid\""), "floci-user-data", scriptPath, pidPath};
     }
 
     static String[] metadataProxyInstallCommand() {
@@ -742,17 +785,19 @@ public class Ec2ContainerManager {
     static String[] metadataProxyStartCommand(String flociHost, int imdsPort) {
         return new String[]{"sh", "-c", String.join("\n",
                 "set -eu",
+                "mkdir -p /run/floci-ec2",
                 "ip addr show dev lo | grep -q '169.254.169.254/32' || ip addr add 169.254.169.254/32 dev lo",
-                "if [ -f /tmp/floci-imds-proxy.pid ] && kill -0 \"$(cat /tmp/floci-imds-proxy.pid)\" 2>/dev/null; then",
+                "if [ -f /run/floci-ec2/imds-proxy.pid ] && kill -0 \"$(cat /run/floci-ec2/imds-proxy.pid)\" 2>/dev/null; then",
                 "  exit 0",
                 "fi",
-                "nohup socat TCP-LISTEN:80,bind=169.254.169.254,fork,reuseaddr TCP:" + flociHost + ":" + imdsPort + " >/tmp/floci-imds-proxy.log 2>&1 &",
-                "echo $! > /tmp/floci-imds-proxy.pid",
+                "rm -f /run/floci-ec2/imds-proxy.pid /run/floci-ec2/imds-proxy.log",
+                "nohup socat TCP-LISTEN:80,bind=169.254.169.254,fork,reuseaddr TCP:" + flociHost + ":" + imdsPort + " >/run/floci-ec2/imds-proxy.log 2>&1 &",
+                "echo $! > /run/floci-ec2/imds-proxy.pid",
                 "for i in 1 2 3 4 5 6 7 8 9 10 11 12; do",
                 "  curl -fsS --max-time 1 http://169.254.169.254/latest/meta-data/instance-id >/dev/null && exit 0",
                 "  sleep 1",
                 "done",
-                "cat /tmp/floci-imds-proxy.log >&2 || true",
+                "tail -c 2048 /run/floci-ec2/imds-proxy.log >&2 || true",
                 "exit 1")};
     }
 
@@ -769,15 +814,6 @@ public class Ec2ContainerManager {
                 "AWS_SESSION_TOKEN=test-session-token"));
         }
         return List.copyOf(environment);
-    }
-
-    private static String summarizeUserDataOutput(ByteArrayOutputStream output) {
-        String text = output.toString(StandardCharsets.UTF_8).stripTrailing();
-        if (text.isBlank()) {
-            return "(no output)";
-        }
-        int start = Math.max(0, text.length() - 2048);
-        return text.substring(start);
     }
 
     private void installPreSystemdEntrypoint(String containerId) throws IOException {
@@ -957,15 +993,106 @@ public class Ec2ContainerManager {
         }
     }
 
+    private void monitorNativeCloudInit(String containerId, Instance instance) {
+        try {
+            ContainerExecResult result = execInContainerForResult(containerId,
+                    new String[]{"cloud-init", "status", "--wait", "--long"}, userDataTimeoutSeconds());
+            if (result.exitCode() == -1) {
+                stopNativeCloudInit(containerId);
+                completeBootstrap(instance, BootstrapExecution.timedOut("Cloud-init timed out"));
+                LOG.warnv("Native cloud-init timed out for EC2 instance {0}", instance.getInstanceId());
+                return;
+            }
+            if (result.exitCode() != 0) {
+                completeBootstrap(instance, BootstrapExecution.failed(
+                        Math.toIntExact(result.exitCode()), "Cloud-init failed"));
+                LOG.warnv("Native cloud-init failed for EC2 instance {0} with exit code {1}",
+                        instance.getInstanceId(), result.exitCode());
+                return;
+            }
+            completeBootstrap(instance, BootstrapExecution.success("Cloud-init completed"));
+            LOG.infov("Native cloud-init completed for EC2 instance {0}", instance.getInstanceId());
+        }
+        catch (Exception e) {
+            completeBootstrap(instance, BootstrapExecution.failed(null, "Cloud-init observation failed"));
+            LOG.warnv("Could not observe native cloud-init for EC2 instance {0}", instance.getInstanceId());
+        }
+    }
+
+    private void stopNativeCloudInit(String containerId) {
+        try {
+            execInContainerForResult(containerId, new String[]{"sh", "-c",
+                    "systemctl stop cloud-final.service cloud-config.service cloud-init.service >/dev/null 2>&1 || true"}, 10);
+        }
+        catch (Exception e) {
+            LOG.warnv("Could not stop timed-out cloud-init in container {0}", containerId);
+        }
+    }
+
+    private void terminateTrackedProcess(String containerId, String pidPath) {
+        try {
+            execInContainerForResult(containerId, new String[]{"sh", "-c", String.join("\n",
+                    "pidfile=$1",
+                    "[ -s \"$pidfile\" ] || exit 0",
+                    "pid=$(cat \"$pidfile\")",
+                    "kill -TERM -- \"-$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null || true",
+                    "sleep 1",
+                    "kill -KILL -- \"-$pid\" 2>/dev/null || kill -KILL \"$pid\" 2>/dev/null || true",
+                    "rm -f \"$pidfile\""), "floci-user-data-timeout", pidPath}, 5);
+        }
+        catch (Exception e) {
+            LOG.warnv("Could not terminate timed-out user data in container {0}", containerId);
+        }
+    }
+
+    private int userDataTimeoutSeconds() {
+        int configured = config.services().ec2().userDataTimeoutSeconds();
+        return configured > 0 ? configured : DEFAULT_USER_DATA_TIMEOUT_SECONDS;
+    }
+
+    private void beginBootstrap(Instance instance) {
+        InstanceBootstrapResult result = new InstanceBootstrapResult();
+        result.setStatus("RUNNING");
+        result.setStartedAt(Instant.now());
+        result.setMessage("Bootstrap in progress");
+        instance.setBootstrapResult(result);
+        persist(instance);
+    }
+
+    private void completeBootstrap(Instance instance, BootstrapExecution execution) {
+        InstanceBootstrapResult result = instance.getBootstrapResult();
+        if (result == null) {
+            result = new InstanceBootstrapResult();
+            result.setStartedAt(Instant.now());
+        }
+        result.setStatus(execution.status());
+        result.setCompletedAt(Instant.now());
+        result.setExitCode(execution.exitCode());
+        result.setMessage(execution.message());
+        instance.setBootstrapResult(result);
+        persist(instance);
+    }
+
+    private void persist(Instance instance) {
+        instancePersister.accept(instance);
+    }
+
     private void cleanupFailedLaunch(Instance instance, String containerId, String containerIp, int sshHostPort) {
         portForwardManager.unpublishAll(instance);
-        lifecycleManager.stopAndRemove(containerId, null);
+        if (containerId != null && !containerId.isBlank()) {
+            lifecycleManager.stopAndRemove(containerId, null);
+        }
         if (sshHostPort > 0) {
             portAllocator.release(sshHostPort);
         }
         metadataServer.unregisterContainer(containerIp, instance);
         instance.setState(InstanceState.terminated());
         instance.setTerminatedAt(System.currentTimeMillis());
+        if (instance.getBootstrapResult() != null
+                && "RUNNING".equals(instance.getBootstrapResult().getStatus())) {
+            completeBootstrap(instance, BootstrapExecution.failed(null, "Instance launch failed"));
+        }
+        persist(instance);
     }
 
     private void execInContainer(String containerId, String[] cmd, int timeoutSeconds) throws Exception {
@@ -986,7 +1113,7 @@ public class Ec2ContainerManager {
             @Override
             public void onNext(Frame frame) {
                 if (frame.getPayload() != null) {
-                    try { output.write(frame.getPayload()); } catch (IOException ignored) {}
+                    output.writeBytes(frame.getPayload());
                 }
             }
             @Override
@@ -1002,12 +1129,35 @@ public class Ec2ContainerManager {
             }
         }
         Long exitCode = dockerClient.inspectExecCmd(execId).exec().getExitCodeLong();
-        return new ContainerExecResult(exitCode != null ? exitCode : -1, summarizeUserDataOutput(output));
+        return new ContainerExecResult(exitCode != null ? exitCode : -1, summarizeCommandOutput(output));
+    }
+
+    private static String summarizeCommandOutput(ByteArrayOutputStream output) {
+        String text = output.toString(StandardCharsets.UTF_8).stripTrailing();
+        if (text.isBlank()) {
+            return "(no output)";
+        }
+        int start = Math.max(0, text.length() - 2048);
+        return text.substring(start);
     }
 
     record ContainerExecResult(long exitCode, String output) {
         String summary() {
             return output == null || output.isBlank() ? "(no output)" : output;
+        }
+    }
+
+    record BootstrapExecution(String status, Integer exitCode, String message) {
+        static BootstrapExecution success(String message) {
+            return new BootstrapExecution("SUCCEEDED", 0, message);
+        }
+
+        static BootstrapExecution failed(Integer exitCode, String message) {
+            return new BootstrapExecution("FAILED", exitCode, message);
+        }
+
+        static BootstrapExecution timedOut(String message) {
+            return new BootstrapExecution("TIMED_OUT", null, message);
         }
     }
 

@@ -331,6 +331,7 @@ floci:
     ec2:
       enabled: true
       imds-port: 9169
+      user-data-timeout-seconds: 900
       ssh-port-range-start: 2200
       ssh-port-range-end: 2299
       publish-security-group-ports: true
