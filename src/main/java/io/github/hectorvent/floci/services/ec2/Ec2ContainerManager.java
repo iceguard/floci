@@ -75,6 +75,7 @@ public class Ec2ContainerManager {
     private final PortAllocator portAllocator;
     private final EmulatorConfig config;
     private final AcmService acmService;
+    private final Ec2InstanceTypeCatalog instanceTypeCatalog;
     private final Ec2MetadataServer metadataServer;
     private final Ec2PortForwardManager portForwardManager;
     private volatile Consumer<Instance> instancePersister = ignored -> {};
@@ -94,6 +95,7 @@ public class Ec2ContainerManager {
                                PortAllocator portAllocator,
                                EmulatorConfig config,
                                AcmService acmService,
+                               Ec2InstanceTypeCatalog instanceTypeCatalog,
                                Ec2MetadataServer metadataServer,
                                Ec2PortForwardManager portForwardManager) {
         this.containerBuilder = containerBuilder;
@@ -104,6 +106,7 @@ public class Ec2ContainerManager {
         this.portAllocator = portAllocator;
         this.config = config;
         this.acmService = acmService;
+        this.instanceTypeCatalog = instanceTypeCatalog;
         this.metadataServer = metadataServer;
         this.portForwardManager = portForwardManager;
     }
@@ -178,6 +181,8 @@ public class Ec2ContainerManager {
                 if (image.systemd() && image.cloudInit()) {
                     specBuilder.withEntrypoint(List.of(PRE_SYSTEMD_ENTRYPOINT));
                 }
+                instanceTypeCatalog.find(instance.getInstanceType())
+                        .ifPresent(instanceType -> specBuilder.withMemoryMb(instanceType.memoryMib));
                 if (image.systemd()) {
                     specBuilder
                             .withCgroupnsMode("host")
