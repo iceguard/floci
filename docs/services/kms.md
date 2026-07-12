@@ -46,6 +46,14 @@
 | `RotateKeyOnDemand` | Rotate key material on demand (symmetric keys only) |
 <!-- floci:actions:end -->
 
+## AWS Managed Key Inventory
+
+Each region exposes the AWS managed ACM key through `alias/aws/acm`. `ListKeys`,
+`ListAliases`, and `DescribeKey` return the key with `KeyManager=AWS`.
+`ListResourceTags` for that key returns the AWS-shaped
+`AccessDeniedException`; customer-managed keys continue to return their stored
+tags.
+
 ## Grant Support Scope
 
 Grant lifecycle operations (`CreateGrant`, `ListGrants`, `ListRetirableGrants`, `RevokeGrant`, `RetireGrant`) are supported. However, grant lifecycle support **does not** imply grant-based authorization enforcement on cryptographic operations (`Encrypt`, `Decrypt`, `Sign`, `Verify`, `GenerateDataKey`, etc.). Grants are stored and queryable but are not evaluated during crypto operations.

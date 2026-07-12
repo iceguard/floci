@@ -449,10 +449,9 @@ public class KmsJsonHandler {
 
     private Response handleListResourceTags(JsonNode request, String region) {
         String keyId = request.path("KeyId").asText();
-        KmsKey key = service.describeKey(keyId, region);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode array = response.putArray("Tags");
-        key.getTags().forEach((k, v) -> {
+        service.listResourceTags(keyId, region).forEach((k, v) -> {
             ObjectNode tag = array.addObject();
             tag.put("TagKey", k);
             tag.put("TagValue", v);
@@ -554,7 +553,7 @@ public class KmsJsonHandler {
         keyMetadata.put("KeyUsage", k.getKeyUsage().name());
         keyMetadata.put("KeyState", k.getKeyState());
         keyMetadata.put("Origin", "AWS_KMS");
-        keyMetadata.put("KeyManager", "CUSTOMER");
+        keyMetadata.put("KeyManager", k.getKeyManager().name());
         keyMetadata.put("CustomerMasterKeySpec", k.getKeySpec().name());
         keyMetadata.put("KeySpec", k.getKeySpec().name());
         addAlgorithms(k, keyMetadata);

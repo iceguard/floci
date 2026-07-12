@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.kms.model.KmsAlias;
 import io.github.hectorvent.floci.services.kms.model.KmsGrant;
 import io.github.hectorvent.floci.services.kms.model.KmsKey;
+import io.github.hectorvent.floci.services.kms.model.KmsKeyManager;
 import io.github.hectorvent.floci.services.kms.model.KmsKeySpec;
 import io.github.hectorvent.floci.services.kms.model.KmsKeyUsage;
 import io.github.hectorvent.floci.services.kms.model.KmsMessageType;
@@ -61,6 +62,7 @@ import static io.github.hectorvent.floci.services.kms.model.KmsMessageType.RAW;
 public class KmsService {
 
     private static final Logger LOG = Logger.getLogger(KmsService.class);
+    private static final String AWS_MANAGED_ACM_ALIAS = "alias/aws/acm";
 
     private final StorageBackend<String, KmsKey> keyStore;
     private final StorageBackend<String, KmsAlias> aliasStore;
@@ -257,8 +259,21 @@ public class KmsService {
     }
 
     public List<KmsKey> listKeys(String region) {
+        ensureAwsManagedAcmKey(region);
         String prefix = region + "::";
         return keyStore.scan(k -> k.startsWith(prefix));
+    }
+
+    public Map<String, String> listResourceTags(String keyId, String region) {
+        KmsKey key = resolveKey(keyId, region);
+        if (key.getKeyManager() == KmsKeyManager.AWS) {
+            throw new AwsException(
+                    "AccessDeniedException",
+                    "User is not authorized to perform: kms:ListResourceTags on resource: " + key.getArn()
+                            + " because no resource-based policy allows the kms:ListResourceTags action",
+                    400);
+        }
+        return Map.copyOf(key.getTags());
     }
 
     public KmsGrant createGrant(String keyId, String granteePrincipal, List<String> operations, String region) {
@@ -462,6 +477,7 @@ public class KmsService {
 
     public void scheduleKeyDeletion(String keyId, int pendingWindowInDays, String region) {
         KmsKey key = resolveKey(keyId, region);
+        rejectAwsManagedKeyMutation(key, "ScheduleKeyDeletion");
         key.setKeyState("PendingDeletion");
         key.setDeletionDate(Instant.now().plusSeconds((long) pendingWindowInDays * 86400).getEpochSecond());
         keyStore.put(region + "::" + key.getKeyId(), key);
@@ -484,6 +500,7 @@ public class KmsService {
 
     public void putKeyPolicy(String keyId, String policy, String region) {
         KmsKey key = resolveKey(keyId, region);
+        rejectAwsManagedKeyMutation(key, "PutKeyPolicy");
         key.setPolicy(policy);
         keyStore.put(region + "::" + key.getKeyId(), key);
         LOG.infov("Updated key policy for KMS key: {0} in {1}", key.getKeyId(), region);
@@ -491,6 +508,7 @@ public class KmsService {
 
     public void updateKeyDescription(String keyId, String description, String region) {
         KmsKey key = resolveKey(keyId, region);
+        rejectAwsManagedKeyMutation(key, "UpdateKeyDescription");
         key.setDescription(description);
         keyStore.put(region + "::" + key.getKeyId(), key);
         LOG.infov("Updated description for KMS key: {0} in {1}", key.getKeyId(), region);
@@ -509,6 +527,7 @@ public class KmsService {
 
     public void enableKeyRotation(String keyId, String region) {
         KmsKey key = resolveKey(keyId, region);
+        rejectAwsManagedKeyMutation(key, "EnableKeyRotation");
         validateRotationSupported(key);
         key.setKeyRotationEnabled(true);
         keyStore.put(region + "::" + key.getKeyId(), key);
@@ -517,6 +536,7 @@ public class KmsService {
 
     public void disableKeyRotation(String keyId, String region) {
         KmsKey key = resolveKey(keyId, region);
+        rejectAwsManagedKeyMutation(key, "DisableKeyRotation");
         validateRotationSupported(key);
         key.setKeyRotationEnabled(false);
         keyStore.put(region + "::" + key.getKeyId(), key);
@@ -537,6 +557,7 @@ public class KmsService {
 
     public void disableKey(String keyId, String region) {
         KmsKey key = resolveKey(keyId, region);
+        rejectAwsManagedKeyMutation(key, "DisableKey");
         key.setEnabled(false);
         key.setKeyState("Disabled");
         keyStore.put(region + "::" + key.getKeyId(), key);
@@ -546,6 +567,7 @@ public class KmsService {
     private static final int ON_DEMAND_ROTATION_LIMIT = 25;
     public String rotateKeyOnDemand(String keyId, String region) {
         KmsKey key = resolveKey(keyId, region);
+        rejectAwsManagedKeyMutation(key, "RotateKeyOnDemand");
         if (!key.isEnabled()) {
             throw new AwsException("DisabledException",
                     "KMS key " + key.getKeyId() + " is disabled.", 400);
@@ -597,6 +619,7 @@ public class KmsService {
     }
 
     public List<KmsAlias> listAliases(String keyId, String region) {
+        ensureAwsManagedAcmKey(region);
         String prefix = region + "::";
         List<KmsAlias> all = aliasStore.scan(k -> k.startsWith(prefix));
         if (keyId == null || keyId.isBlank()) {
@@ -606,6 +629,31 @@ public class KmsService {
         return all.stream()
                 .filter(a -> key.getKeyId().equals(a.getTargetKeyId()))
                 .toList();
+    }
+
+    private synchronized void ensureAwsManagedAcmKey(String region) {
+        String accountId = regionResolver.getAccountId();
+        String keyId = UUID.nameUUIDFromBytes(
+                (accountId + ":" + region + ":" + AWS_MANAGED_ACM_ALIAS).getBytes(StandardCharsets.UTF_8))
+                .toString();
+        String keyStorageId = region + "::" + keyId;
+        if (keyStore.get(keyStorageId).isEmpty()) {
+            KmsKey key = new KmsKey();
+            key.setKeyId(keyId);
+            key.setArn(regionResolver.buildArn("kms", region, "key/" + keyId));
+            key.setDescription("Default key that protects ACM private keys");
+            key.setKeyManager(KmsKeyManager.AWS);
+            key.setPolicy(null);
+            keyStore.put(keyStorageId, key);
+        }
+
+        String aliasStorageId = region + "::" + AWS_MANAGED_ACM_ALIAS;
+        if (aliasStore.get(aliasStorageId).isEmpty()) {
+            aliasStore.put(aliasStorageId, new KmsAlias(
+                    AWS_MANAGED_ACM_ALIAS,
+                    regionResolver.buildArn("kms", region, AWS_MANAGED_ACM_ALIAS),
+                    keyId));
+        }
     }
 
     // ──────────────────────────── Crypto Ops (Mocks) ────────────────────────────
@@ -962,6 +1010,7 @@ public class KmsService {
 
     public void tagResource(String keyId, Map<String, String> tags, String region) {
         KmsKey key = resolveKey(keyId, region);
+        rejectAwsManagedKeyMutation(key, "TagResource");
         ReservedTags.rejectReservedTagsOnUpdate(tags);
         key.getTags().putAll(tags);
         keyStore.put(region + "::" + key.getKeyId(), key);
@@ -969,6 +1018,7 @@ public class KmsService {
 
     public void untagResource(String keyId, List<String> tagKeys, String region) {
         KmsKey key = resolveKey(keyId, region);
+        rejectAwsManagedKeyMutation(key, "UntagResource");
         tagKeys.forEach(key.getTags()::remove);
         keyStore.put(region + "::" + key.getKeyId(), key);
     }
@@ -977,6 +1027,16 @@ public class KmsService {
 
     private static boolean isSecgP256k1(KmsKeySpec spec) {
         return KmsKeySpec.ECC_SECG_P256K1 == spec;
+    }
+
+    private static void rejectAwsManagedKeyMutation(KmsKey key, String action) {
+        if (key.getKeyManager() == KmsKeyManager.AWS) {
+            throw new AwsException(
+                    "AccessDeniedException",
+                    "User is not authorized to perform: kms:" + action + " on resource: " + key.getArn()
+                            + " because no resource-based policy allows the kms:" + action + " action",
+                    400);
+        }
     }
 
     private static boolean isPKCS1v1_5(KmsKeySpec.Algorithm spec) {
@@ -1047,6 +1107,7 @@ public class KmsService {
     }
 
     private KmsKey resolveKey(String keyIdOrArn, String region) {
+        ensureAwsManagedAcmKey(region);
         String id = keyIdOrArn;
         // Alias arn
         if (id.contains(":alias/")) {

@@ -17,6 +17,7 @@ public class KmsKey {
     private String keyState = "Enabled"; // Enabled, Disabled, PendingDeletion
     private KmsKeyUsage keyUsage = KmsKeyUsage.ENCRYPT_DECRYPT;
     private KmsKeySpec keySpec = KmsKeySpec.SYMMETRIC_DEFAULT;
+    private KmsKeyManager keyManager = KmsKeyManager.CUSTOMER;
     private long creationDate;
     private long deletionDate;
     private String policy;
@@ -50,6 +51,9 @@ public class KmsKey {
 
     public KmsKeySpec getKeySpec() { return keySpec; }
     public void setKeySpec(KmsKeySpec spec) { this.keySpec = spec; }
+
+    public KmsKeyManager getKeyManager() { return keyManager; }
+    public void setKeyManager(KmsKeyManager keyManager) { this.keyManager = keyManager; }
 
     public long getCreationDate() { return creationDate; }
     public void setCreationDate(long creationDate) { this.creationDate = creationDate; }

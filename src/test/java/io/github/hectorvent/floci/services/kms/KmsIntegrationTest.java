@@ -5,11 +5,14 @@ import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.List;
+import java.util.stream.Stream;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
@@ -26,6 +29,91 @@ class KmsIntegrationTest {
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    @Test
+    void awsManagedAcmKeyDiscoveryAndTagDenialMatchKmsShape() {
+        String keyId = given()
+            .header("X-Amz-Target", "TrentService.ListAliases")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("{}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Aliases.find { it.AliasName == 'alias/aws/acm' }.TargetKeyId", notNullValue())
+            .extract().jsonPath().getString("Aliases.find { it.AliasName == 'alias/aws/acm' }.TargetKeyId");
+
+        String keyArn = "arn:aws:kms:us-east-1:000000000000:key/" + keyId;
+        given()
+            .header("X-Amz-Target", "TrentService.DescribeKey")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("{\"KeyId\":\"" + keyId + "\"}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("KeyMetadata.Arn", equalTo(keyArn))
+            .body("KeyMetadata.KeyManager", equalTo("AWS"));
+
+        given()
+            .header("X-Amz-Target", "TrentService.ListResourceTags")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("{\"KeyId\":\"" + keyId + "\"}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("AccessDeniedException"))
+            .body("message", equalTo(
+                    "User is not authorized to perform: kms:ListResourceTags on resource: " + keyArn
+                            + " because no resource-based policy allows the kms:ListResourceTags action"));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("awsManagedKeyMutationRequests")
+    void awsManagedAcmKeyMutationDenialsMatchKmsShape(String action, String requestTemplate) {
+        String keyId = given()
+            .header("X-Amz-Target", "TrentService.ListAliases")
+            .contentType(KMS_CONTENT_TYPE)
+            .body("{}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().jsonPath().getString("Aliases.find { it.AliasName == 'alias/aws/acm' }.TargetKeyId");
+
+        String keyArn = "arn:aws:kms:us-east-1:000000000000:key/" + keyId;
+        given()
+            .header("X-Amz-Target", "TrentService." + action)
+            .contentType(KMS_CONTENT_TYPE)
+            .body(requestTemplate.formatted(keyId))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("AccessDeniedException"))
+            .body("message", equalTo(
+                    "User is not authorized to perform: kms:" + action + " on resource: " + keyArn
+                            + " because no resource-based policy allows the kms:" + action + " action"));
+    }
+
+    static Stream<Arguments> awsManagedKeyMutationRequests() {
+        return Stream.of(
+                Arguments.of(
+                        "TagResource", "{\"KeyId\":\"%s\",\"Tags\":[{\"TagKey\":\"team\",\"TagValue\":\"platform\"}]}"),
+                Arguments.of(
+                        "UntagResource", "{\"KeyId\":\"%s\",\"TagKeys\":[\"team\"]}"),
+                Arguments.of("DisableKey", "{\"KeyId\":\"%s\"}"),
+                Arguments.of(
+                        "ScheduleKeyDeletion", "{\"KeyId\":\"%s\",\"PendingWindowInDays\":30}"),
+                Arguments.of(
+                        "PutKeyPolicy", "{\"KeyId\":\"%s\",\"PolicyName\":\"default\",\"Policy\":\"{}\"}"),
+                Arguments.of(
+                        "UpdateKeyDescription", "{\"KeyId\":\"%s\",\"Description\":\"updated\"}"),
+                Arguments.of("EnableKeyRotation", "{\"KeyId\":\"%s\"}"),
+                Arguments.of("DisableKeyRotation", "{\"KeyId\":\"%s\"}"),
+                Arguments.of("RotateKeyOnDemand", "{\"KeyId\":\"%s\"}"));
     }
 
     @Test
