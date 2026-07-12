@@ -5,7 +5,7 @@
 
 PYTHON ?= python3
 
-.PHONY: docs-sync docs-check docs-test
+.PHONY: docs-sync docs-check docs-test native-cloud-init-test
 
 docs-sync: ## Regenerate the action tables in docs/services from handler source (in place)
 	$(PYTHON) tools/docs/regen_action_docs.py
@@ -25,3 +25,10 @@ docs-check: ## CI gate: regenerate and fail if anything is stale or a handler is
 
 docs-test: ## Run the action-table tooling tests
 	$(PYTHON) -m pytest tools/docs -q
+
+native-cloud-init-test: ## Run the opt-in native Ubuntu cloud-init lifecycle proof against local Floci
+	cd compatibility-tests/sdk-test-java && ../../mvnw \
+		-Dtest=Ec2NativeCloudInitGuestTest \
+		-Dfloci.native-cloud-init-it=true \
+		-Dfloci.native-cloud-init.user-data-timeout-seconds=$${FLOCI_SERVICES_EC2_USER_DATA_TIMEOUT_SECONDS:?set the same timeout on the Floci server} \
+		test
