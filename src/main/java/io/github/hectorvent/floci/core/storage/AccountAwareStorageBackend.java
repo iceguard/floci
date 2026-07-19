@@ -105,6 +105,26 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     }
 
     /**
+     * Scans account-prefixed entries without discarding the owning account or logical key.
+     * Un-prefixed legacy entries are omitted because they have no recoverable account owner.
+     */
+    public List<AccountEntry<V>> scanAllAccountEntries() {
+        return delegate.keys().stream()
+                .map(rawKey -> {
+                    int slash = rawKey.indexOf('/');
+                    if (slash < 1 || slash == rawKey.length() - 1) {
+                        return null;
+                    }
+                    return delegate.get(rawKey)
+                            .map(value -> new AccountEntry<>(
+                                    rawKey.substring(0, slash), rawKey.substring(slash + 1), value))
+                            .orElse(null);
+                })
+                .filter(java.util.Objects::nonNull)
+                .toList();
+    }
+
+    /**
      * Returns all entries across every account as a map of logical-key (account prefix stripped)
      * to value. Entries without a slash-prefixed account segment are skipped.
      */
@@ -165,4 +185,6 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     private String prefixed(String key) {
         return prefix() + "/" + key;
     }
+
+    public record AccountEntry<V>(String accountId, String key, V value) {}
 }

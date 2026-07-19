@@ -22,13 +22,16 @@ public class Command {
     private String status = "Pending";
     private String statusDetails = "Pending";
     private int timeoutSeconds = 3600;
+    private int executionTimeoutSeconds = 3600;
     private int targetCount;
     private int completedCount;
     private int errorCount;
+    private int deliveryTimedOutCount;
     private String outputS3BucketName;
     private String outputS3KeyPrefix;
     private String outputS3Region;
     private String region;
+    private String accountId;
 
     public Command() {}
 
@@ -65,6 +68,9 @@ public class Command {
     public int getTimeoutSeconds() { return timeoutSeconds; }
     public void setTimeoutSeconds(int timeoutSeconds) { this.timeoutSeconds = timeoutSeconds; }
 
+    public int getExecutionTimeoutSeconds() { return executionTimeoutSeconds; }
+    public void setExecutionTimeoutSeconds(int executionTimeoutSeconds) { this.executionTimeoutSeconds = executionTimeoutSeconds; }
+
     public int getTargetCount() { return targetCount; }
     public void setTargetCount(int targetCount) { this.targetCount = targetCount; }
 
@@ -73,6 +79,9 @@ public class Command {
 
     public int getErrorCount() { return errorCount; }
     public void setErrorCount(int errorCount) { this.errorCount = errorCount; }
+
+    public int getDeliveryTimedOutCount() { return deliveryTimedOutCount; }
+    public void setDeliveryTimedOutCount(int deliveryTimedOutCount) { this.deliveryTimedOutCount = deliveryTimedOutCount; }
 
     public String getOutputS3BucketName() { return outputS3BucketName; }
     public void setOutputS3BucketName(String outputS3BucketName) { this.outputS3BucketName = outputS3BucketName; }
@@ -85,4 +94,7 @@ public class Command {
 
     public String getRegion() { return region; }
     public void setRegion(String region) { this.region = region; }
+
+    public String getAccountId() { return accountId; }
+    public void setAccountId(String accountId) { this.accountId = accountId; }
 }

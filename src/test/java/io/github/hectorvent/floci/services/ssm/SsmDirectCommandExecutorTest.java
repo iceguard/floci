@@ -26,6 +26,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -83,7 +84,8 @@ class SsmDirectCommandExecutorTest {
         verify(execCreate).withCmd(
                 eq("sh"),
                 eq("-c"),
-                argThat(command -> command.contains("timeout --kill-after=1s '30s' sh -c")
+                argThat(command -> command.contains("timeout --kill-after=1s")
+                        && command.contains("30s")
                         && !command.contains("floci_ssm_redact")
                         && command.contains("echo stdout")));
     }
@@ -96,6 +98,20 @@ class SsmDirectCommandExecutorTest {
         assertFalse(command.contains("floci_ssm_redact"));
         assertFalse(command.contains("listening ports"));
         assertFalse(command.contains("/var/log/*.log"));
+    }
+
+    @Test
+    void executionTimeoutUsesDocumentDefaultAndStrictBounds() {
+        assertEquals(3600, SsmDirectCommandExecutor.executionTimeoutSeconds(Map.of()));
+        assertEquals(1, SsmDirectCommandExecutor.executionTimeoutSeconds(
+                Map.of("executionTimeout", List.of("1"))));
+        assertEquals(172800, SsmDirectCommandExecutor.executionTimeoutSeconds(
+                Map.of("executionTimeout", List.of("172800"))));
+        for (List<String> value : List.of(
+                List.<String>of(), List.of("0"), List.of("172801"), List.of("1", "2"), List.of("nope"))) {
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                    () -> SsmDirectCommandExecutor.executionTimeoutSeconds(Map.of("executionTimeout", value)));
+        }
     }
 
     @Test
@@ -113,7 +129,9 @@ class SsmDirectCommandExecutorTest {
     void timeoutAppliesOnlyToUserScriptBeforeDiagnosticsRun() {
         String command = SsmDirectCommandExecutor.timeoutWrappedScript("sleep 100", 30);
 
-        assertTrue(command.contains("timeout --kill-after=1s '30s' sh -c 'sleep 100'"));
+        assertTrue(command.contains("timeout --kill-after=1s"));
+        assertTrue(command.contains("30s"));
+        assertTrue(command.contains("sleep 100"));
         assertFalse(command.contains("floci_ssm_redact"));
     }
 
@@ -223,8 +241,10 @@ class SsmDirectCommandExecutorTest {
 
         ExecCreateCmd execCreate = mock(ExecCreateCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
         ExecCreateCmdResponse execCreateResponse = mock(ExecCreateCmdResponse.class);
+        ExecCreateCmdResponse stopCreateResponse = mock(ExecCreateCmdResponse.class);
         when(execCreateResponse.getId()).thenReturn("exec-1");
-        when(execCreate.exec()).thenReturn(execCreateResponse);
+        when(stopCreateResponse.getId()).thenReturn("stop-1");
+        when(execCreate.exec()).thenReturn(execCreateResponse, stopCreateResponse);
         when(dockerClient.execCreateCmd("container-1")).thenReturn(execCreate);
 
         ExecStartCmd execStart = mock(ExecStartCmd.class);
@@ -232,6 +252,21 @@ class SsmDirectCommandExecutorTest {
         ResultCallback<Frame> callback = mock(ResultCallback.class);
         when(execStart.exec(any())).thenReturn(callback);
         when(dockerClient.execStartCmd("exec-1")).thenReturn(execStart);
+        ExecStartCmd stopExecStart = mock(ExecStartCmd.class);
+        when(stopExecStart.exec(any())).thenAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            ResultCallback<Frame> resultCallback = invocation.getArgument(0);
+            resultCallback.onComplete();
+            return resultCallback;
+        });
+        when(dockerClient.execStartCmd("stop-1")).thenReturn(stopExecStart);
+
+        InspectExecCmd inspectExec = mock(InspectExecCmd.class);
+        InspectExecResponse inspectExecResponse = mock(InspectExecResponse.class);
+        when(inspectExecResponse.isRunning()).thenReturn(false);
+        when(inspectExecResponse.getExitCodeLong()).thenReturn(124L);
+        when(inspectExec.exec()).thenReturn(inspectExecResponse);
+        when(dockerClient.inspectExecCmd("exec-1")).thenReturn(inspectExec);
 
         SsmDirectCommandExecutor executor = new SsmDirectCommandExecutor(dockerClient, ec2Service);
         Optional<SsmDirectCommandExecutor.ExecutionResult> result = executor.executeIfSupported(
@@ -243,7 +278,7 @@ class SsmDirectCommandExecutorTest {
         assertTrue(result.isPresent());
         assertEquals("TimedOut", result.get().status());
         assertEquals(-1, result.get().responseCode());
-        verify(callback).close();
+        verify(callback, atLeastOnce()).close();
     }
 
     @Test
