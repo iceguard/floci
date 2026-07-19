@@ -416,6 +416,7 @@ public class SsmJsonHandler {
         node.put("TargetCount", c.getTargetCount());
         node.put("CompletedCount", c.getCompletedCount());
         node.put("ErrorCount", c.getErrorCount());
+        node.put("DeliveryTimedOutCount", c.getDeliveryTimedOutCount());
         node.put("TimeoutSeconds", c.getTimeoutSeconds());
         if (c.getInstanceIds() != null) {
             ArrayNode ids = objectMapper.createArrayNode();

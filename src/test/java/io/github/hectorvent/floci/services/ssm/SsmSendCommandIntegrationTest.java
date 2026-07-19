@@ -43,7 +43,7 @@ class SsmSendCommandIntegrationTest {
     @BeforeEach
     void resetDirectExecution() {
         reset(directCommandExecutor);
-        when(directCommandExecutor.executeIfSupported(anyString(), anyString(), any(), anyInt()))
+        when(directCommandExecutor.executeIfSupported(anyString(), anyString(), any(), anyInt(), any()))
                 .thenReturn(Optional.empty());
     }
 
@@ -116,6 +116,55 @@ class SsmSendCommandIntegrationTest {
             .body("__type", equalTo("ValidationException"))
             .body("message", containsString("Value '1' at 'timeoutSeconds' failed to satisfy constraint"))
             .body("message", containsString("greater than or equal to 30"));
+    }
+
+    @Test
+    void sendCommandRejectsTimeoutAboveAwsMaximumAndMalformedParameters() {
+        given()
+            .header("X-Amz-Target", "AmazonSSM.SendCommand")
+            .contentType(SSM_CT)
+            .body("""
+                {"InstanceIds":["%s"],"DocumentName":"AWS-RunShellScript",
+                 "Parameters":{"commands":["echo hello"]},"TimeoutSeconds":2592001}
+                """.formatted(INSTANCE_ID))
+        .when().post("/")
+        .then().statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", containsString("less than or equal to 2592000"));
+
+        given()
+            .header("X-Amz-Target", "AmazonSSM.SendCommand")
+            .contentType(SSM_CT)
+            .body("""
+                {"InstanceIds":["%s"],"DocumentName":"AWS-RunShellScript",
+                 "Parameters":{"commands":"echo hello"},"TimeoutSeconds":30}
+                """.formatted(INSTANCE_ID))
+        .when().post("/")
+        .then().statusCode(400)
+            .body("__type", equalTo("InvalidParameters"));
+    }
+
+    @Test
+    void sendCommandUsesDocumentExecutionTimeoutForExpiry() throws Exception {
+        io.restassured.response.Response response = given()
+            .header("X-Amz-Target", "AmazonSSM.SendCommand")
+            .contentType(SSM_CT)
+            .body("""
+                {"InstanceIds":["%s"],"DocumentName":"AWS-RunShellScript",
+                 "Parameters":{"commands":["echo hello"],"executionTimeout":["90"]},
+                 "TimeoutSeconds":30}
+                """.formatted(INSTANCE_ID))
+        .when().post("/")
+        .then().statusCode(200)
+            .body("Command.DeliveryTimedOutCount", equalTo(0))
+            .extract().response();
+        com.fasterxml.jackson.databind.JsonNode command = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readTree(response.asString()).path("Command");
+        org.junit.jupiter.api.Assertions.assertEquals(
+                0,
+                command.path("ExpiresAfter").decimalValue()
+                        .subtract(command.path("RequestedDateTime").decimalValue())
+                        .compareTo(java.math.BigDecimal.valueOf(120)));
     }
 
     @Test
@@ -414,7 +463,8 @@ class SsmSendCommandIntegrationTest {
                 eq("i-direct-container"),
                 eq("AWS-RunShellScript"),
                 any(),
-                eq(60)))
+                eq(3600),
+                any()))
                 .thenReturn(Optional.of(new SsmDirectCommandExecutor.ExecutionResult(
                         "Success", "direct-output\n", "", 0, start, end)));
 

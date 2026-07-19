@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.services.ssm.model.Command;
 import io.github.hectorvent.floci.services.ssm.model.CommandInvocation;
 import io.github.hectorvent.floci.services.ssm.model.InstanceInformation;
@@ -24,14 +25,15 @@ import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Queue;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Handles SSM agent registration and command execution lifecycle:
@@ -44,6 +46,7 @@ public class SsmCommandService implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(SsmCommandService.class);
     private static final int MIN_TIMEOUT_SECONDS = 30;
+    private static final int MAX_TIMEOUT_SECONDS = 2_592_000;
     private static final int MAX_STDOUT_CHARS = 24000;
     private static final int MAX_STDERR_CHARS = 8000;
 
@@ -53,12 +56,9 @@ public class SsmCommandService implements Resettable {
     private final ObjectMapper objectMapper;
     private final RegionResolver regionResolver;
     private final SsmDirectCommandExecutor directCommandExecutor;
-    private final ExecutorService directExecutionExecutor;
-
-    // In-memory queues: instanceId → pending messages. Not persisted — lost on restart.
-    private final ConcurrentHashMap<String, Queue<PendingMessage>> messageQueues = new ConcurrentHashMap<>();
-    // messageId → (commandId, instanceId) for correlating SendReply back to an invocation
-    private final ConcurrentHashMap<String, String[]> messageIndex = new ConcurrentHashMap<>();
+    private volatile ExecutorService directExecutionExecutor;
+    private final AtomicLong directExecutionGeneration = new AtomicLong();
+    private final Set<String> locallyOwnedDirectExecutions = ConcurrentHashMap.newKeySet();
 
     @Inject
     public SsmCommandService(
@@ -72,16 +72,55 @@ public class SsmCommandService implements Resettable {
         this.objectMapper = objectMapper;
         this.regionResolver = regionResolver;
         this.directCommandExecutor = directCommandExecutor;
-        this.directExecutionExecutor = Executors.newCachedThreadPool(runnable -> {
+        this.directExecutionExecutor = newDirectExecutionExecutor();
+    }
+
+    private static ExecutorService newDirectExecutionExecutor() {
+        return Executors.newCachedThreadPool(runnable -> {
             Thread thread = new Thread(runnable, "floci-ssm-direct-execution");
             thread.setDaemon(true);
             return thread;
         });
     }
 
+    @Override
     public void clear() {
-        messageQueues.clear();
-        messageIndex.clear();
+        stopDirectExecutionWorkers(true);
+    }
+
+    void shutdown() {
+        stopDirectExecutionWorkers(false);
+    }
+
+    private void stopDirectExecutionWorkers(boolean restart) {
+        List<SsmDirectCommandExecutor.ExecutionIdentity> activeExecutions = new ArrayList<>();
+        ExecutorService executor;
+        synchronized (this) {
+            directExecutionGeneration.incrementAndGet();
+            for (StoredInvocation stored : allInvocations()) {
+                CommandInvocation invocation = stored.invocation();
+                hydrateAccountId(invocation, stored.accountId());
+                if (invocation.isDirectExecution() && invocation.getDirectExecId() != null
+                        && isActiveInvocation(invocation.getStatus())) {
+                    activeExecutions.add(executionIdentity(invocation));
+                }
+            }
+            executor = directExecutionExecutor;
+            locallyOwnedDirectExecutions.clear();
+            if (restart) {
+                directExecutionExecutor = newDirectExecutionExecutor();
+            }
+        }
+        activeExecutions.forEach(directCommandExecutor::stopExecution);
+        executor.shutdownNow();
+        try {
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                LOG.warn("SSM direct-execution workers did not terminate within 5 seconds");
+            }
+        }
+        catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     // ── Agent registration ──────────────────────────────────────────────────
@@ -135,15 +174,16 @@ public class SsmCommandService implements Resettable {
             throw new AwsException("InvalidInstanceId", "At least one InstanceId is required.", 400);
         }
 
-        Map<String, List<String>> parameters = parseParameters(request.path("Parameters"));
+        Map<String, List<String>> parameters = parseParameters(request.get("Parameters"));
+        int executionTimeoutSeconds = executionTimeoutSeconds(documentName, parameters);
         String comment = request.path("Comment").asText("");
-        int timeoutSeconds = request.path("TimeoutSeconds").asInt(3600);
-        validateTimeoutSeconds(timeoutSeconds);
+        int timeoutSeconds = parseTimeoutSeconds(request.get("TimeoutSeconds"));
         String documentVersion = request.path("DocumentVersion").asText("$DEFAULT");
         String outputS3Bucket = request.path("OutputS3BucketName").asText("");
         String outputS3Prefix = request.path("OutputS3KeyPrefix").asText("");
 
         String commandId = UUID.randomUUID().toString();
+        String accountId = regionResolver.getAccountId();
         Instant now = Instant.now();
         List<DirectExecutionRequest> directExecutionRequests = new ArrayList<>();
 
@@ -158,16 +198,18 @@ public class SsmCommandService implements Resettable {
         command.setStatus("Pending");
         command.setStatusDetails(statusDetails("Pending"));
         command.setTimeoutSeconds(timeoutSeconds);
+        command.setExecutionTimeoutSeconds(executionTimeoutSeconds);
         command.setTargetCount(instanceIds.size());
         command.setOutputS3BucketName(outputS3Bucket.isEmpty() ? null : outputS3Bucket);
         command.setOutputS3KeyPrefix(outputS3Prefix.isEmpty() ? null : outputS3Prefix);
         command.setOutputS3Region(region);
         command.setRegion(region);
-        command.setExpiresAfter(now.plusSeconds(timeoutSeconds));
+        command.setAccountId(accountId);
+        command.setExpiresAfter(now.plusSeconds((long) timeoutSeconds + executionTimeoutSeconds));
 
         command.setStatus("InProgress");
         command.setStatusDetails(statusDetails("InProgress"));
-        commandStore.put(commandKey(region, commandId), command);
+        putCommand(command);
 
         // Create invocations and queue messages or directly execute against Floci EC2 containers.
         for (String instanceId : instanceIds) {
@@ -181,16 +223,18 @@ public class SsmCommandService implements Resettable {
             inv.setStatus("Pending");
             inv.setStatusDetails(statusDetails("Pending"));
             inv.setRegion(region);
+            inv.setAccountId(accountId);
+            inv.setExecutionTimeoutSeconds(executionTimeoutSeconds);
+            inv.setDeliveryDeadline(now.plusSeconds((long) timeoutSeconds + executionTimeoutSeconds));
 
             if (directCommandExecutor.supports(instanceId, documentName)) {
-                inv.setStatus("InProgress");
-                inv.setStatusDetails(statusDetails("InProgress"));
-                invocationStore.put(invocationKey(region, commandId, instanceId), inv);
+                inv.setDirectExecution(true);
+                putInvocation(inv);
                 directExecutionRequests.add(new DirectExecutionRequest(instanceId, documentName, parameters));
             }
             else {
-                invocationStore.put(invocationKey(region, commandId, instanceId), inv);
-                queueMessage(commandId, instanceId, documentName, parameters, timeoutSeconds, region);
+                prepareMessage(inv, documentName, parameters, timeoutSeconds, region);
+                putInvocation(inv);
             }
         }
 
@@ -202,17 +246,55 @@ public class SsmCommandService implements Resettable {
                     directExecutionRequest.instanceId(),
                     directExecutionRequest.documentName(),
                     directExecutionRequest.parameters(),
-                    timeoutSeconds,
-                    region);
+                    executionTimeoutSeconds,
+                    region,
+                    accountId);
         }
         return response;
     }
 
-    private static void validateTimeoutSeconds(int timeoutSeconds) {
+    private static int parseTimeoutSeconds(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return 3_600;
+        }
+        if (!node.isIntegralNumber() || !node.canConvertToInt()) {
+            throw timeoutValidation(node.toString(), "an integer");
+        }
+        int timeoutSeconds = node.intValue();
         if (timeoutSeconds < MIN_TIMEOUT_SECONDS) {
             throw new AwsException(
                     "ValidationException",
                     "1 validation error detected: Value '" + timeoutSeconds + "' at 'timeoutSeconds' failed to satisfy constraint: Member must have value greater than or equal to 30",
+                    400);
+        }
+        if (timeoutSeconds > MAX_TIMEOUT_SECONDS) {
+            throw new AwsException(
+                    "ValidationException",
+                    "1 validation error detected: Value '" + timeoutSeconds + "' at 'timeoutSeconds' failed to satisfy constraint: Member must have value less than or equal to 2592000",
+                    400);
+        }
+        return timeoutSeconds;
+    }
+
+    private static AwsException timeoutValidation(String value, String constraint) {
+        return new AwsException(
+                "ValidationException",
+                "1 validation error detected: Value '" + value + "' at 'timeoutSeconds' failed to satisfy constraint: Member must be " + constraint,
+                400);
+    }
+
+    private static int executionTimeoutSeconds(String documentName, Map<String, List<String>> parameters) {
+        if (!"AWS-RunShellScript".equals(documentName)) {
+            return SsmDirectCommandExecutor.DEFAULT_EXECUTION_TIMEOUT_SECONDS;
+        }
+        try {
+            return SsmDirectCommandExecutor.executionTimeoutSeconds(parameters);
+        }
+        catch (IllegalArgumentException e) {
+            throw new AwsException(
+                    "InvalidParameters",
+                    "Parameter executionTimeout is not valid for document " + documentName
+                            + ". The value must be an integer from 1 to 172800.",
                     400);
         }
     }
@@ -224,6 +306,7 @@ public class SsmCommandService implements Resettable {
     }
 
     public List<Command> listCommands(String commandId, String instanceId, String region) {
+        expireInvocations(Instant.now());
         String prefix = region + "::";
         return commandStore.scan(k -> {
             if (!k.startsWith(prefix)) return false;
@@ -237,6 +320,7 @@ public class SsmCommandService implements Resettable {
     }
 
     public List<CommandInvocation> listCommandInvocations(String commandId, String instanceId, String region) {
+        expireInvocations(Instant.now());
         String prefix = region + "::";
         return invocationStore.scan(k -> {
             if (!k.startsWith(prefix)) return false;
@@ -246,7 +330,7 @@ public class SsmCommandService implements Resettable {
         });
     }
 
-    public void cancelCommand(String commandId, List<String> targetInstanceIds, String region) {
+    public synchronized void cancelCommand(String commandId, List<String> targetInstanceIds, String region) {
         Command command = commandStore.get(commandKey(region, commandId))
                 .orElseThrow(() -> new AwsException("InvalidCommandId",
                         "Command " + commandId + " does not exist.", 400));
@@ -258,15 +342,14 @@ public class SsmCommandService implements Resettable {
         for (String instanceId : targets) {
             String invKey = invocationKey(region, commandId, instanceId);
             invocationStore.get(invKey).ifPresent(inv -> {
-                if ("Pending".equals(inv.getStatus()) || "InProgress".equals(inv.getStatus())) {
+                if (isActiveInvocation(inv.getStatus())) {
                     inv.setStatus("Cancelled");
                     inv.setStatusDetails("Cancelled");
+                    inv.setMessagePayload(null);
+                    if (inv.isDirectExecution() && inv.getDirectExecId() != null) {
+                        directCommandExecutor.stopExecution(executionIdentity(inv));
+                    }
                     invocationStore.put(invKey, inv);
-                }
-                // Remove any queued (not-yet-polled) messages for this instance
-                Queue<PendingMessage> q = messageQueues.get(instanceId);
-                if (q != null) {
-                    q.removeIf(m -> m.commandId().equals(commandId));
                 }
             });
         }
@@ -281,7 +364,8 @@ public class SsmCommandService implements Resettable {
         return failActiveInvocationsForInstances(region, Set.of(instanceId), statusDetails);
     }
 
-    public int failActiveInvocationsForInstances(String region, Set<String> instanceIds, String statusDetails) {
+    public synchronized int failActiveInvocationsForInstances(
+            String region, Set<String> instanceIds, String statusDetails) {
         if (instanceIds == null || instanceIds.isEmpty()) {
             return 0;
         }
@@ -306,82 +390,64 @@ public class SsmCommandService implements Resettable {
             failed++;
         }
 
-        for (String instanceId : instanceIds) {
-            Queue<PendingMessage> queue = messageQueues.remove(instanceId);
-            if (queue != null) {
-                queue.clear();
-            }
-        }
-        messageIndex.entrySet().removeIf(entry -> {
-            String[] meta = entry.getValue();
-            return meta.length == 3
-                    && instanceIds.contains(meta[1])
-                    && region.equals(meta[2]);
-        });
         commandIds.forEach(commandId -> updateCommandStatus(commandId, region));
         return failed;
     }
 
     // ── ec2messages agent protocol ──────────────────────────────────────────
 
-    public List<Map<String, Object>> getMessages(String instanceId, String messagesRequestId, int visibilityTimeout) {
-        Queue<PendingMessage> queue = messageQueues.get(instanceId);
-        List<Map<String, Object>> result = new ArrayList<>();
-        if (queue == null || queue.isEmpty()) {
-            return result;
+    public synchronized List<Map<String, Object>> getMessages(
+            String instanceId, String messagesRequestId, int visibilityTimeout) {
+        Instant now = Instant.now();
+        expireInvocations(now);
+        CommandInvocation invocation = invocationStore.scan(key -> key.endsWith("::" + instanceId)).stream()
+                .filter(inv -> "Pending".equals(inv.getStatus()))
+                .filter(inv -> inv.getMessagePayload() != null)
+                .filter(inv -> inv.getMessageVisibleAfter() == null || !inv.getMessageVisibleAfter().isAfter(now))
+                .findFirst()
+                .orElse(null);
+        if (invocation == null) {
+            return List.of();
         }
+        invocation.setMessageVisibleAfter(now.plusSeconds(Math.max(0, visibilityTimeout)));
+        invocationStore.put(invocationKey(
+                invocation.getRegion(), invocation.getCommandId(), invocation.getInstanceId()), invocation);
 
-        PendingMessage msg = queue.poll();
-        if (msg == null) {
-            return result;
-        }
-
-        // Track for AcknowledgeMessage / SendReply correlation
-        messageIndex.put(msg.messageId(), new String[]{msg.commandId(), instanceId, msg.region()});
-
-        result.add(Map.of(
-                "MessageId", msg.messageId(),
+        LOG.infov("GetMessages: instanceId={0} returned messageId={1}", instanceId, invocation.getMessageId());
+        return List.of(Map.of(
+                "MessageId", invocation.getMessageId(),
                 "Destination", instanceId,
-                "CreatedDate", msg.createdDate().toString(),
-                "Topic", "aws.ssm.sendCommand." + msg.region(),
-                "Payload", msg.payload()
-        ));
-
-        LOG.infov("GetMessages: instanceId={0} returned messageId={1}", instanceId, msg.messageId());
-        return result;
+                "CreatedDate", invocation.getMessageCreatedDate().toString(),
+                "Topic", "aws.ssm.sendCommand." + invocation.getRegion(),
+                "Payload", invocation.getMessagePayload()));
     }
 
-    public void acknowledgeMessage(String messageId) {
-        // Message was already removed from queue on GetMessages. Just update invocation to InProgress.
-        String[] meta = messageIndex.get(messageId);
-        if (meta == null) {
-            return;
-        }
-        String commandId = meta[0];
-        String instanceId = meta[1];
-        String region = meta[2];
-
-        String invKey = invocationKey(region, commandId, instanceId);
-        invocationStore.get(invKey).ifPresent(inv -> {
-            if ("Pending".equals(inv.getStatus())) {
-                inv.setStatus("InProgress");
-                inv.setStatusDetails(statusDetails("InProgress"));
-                inv.setExecutionStartDateTime(Instant.now());
-                invocationStore.put(invKey, inv);
+    public synchronized void acknowledgeMessage(String messageId) {
+        findInvocationByMessageId(messageId).ifPresent(inv -> {
+            if (!"Pending".equals(inv.getStatus())) {
+                return;
             }
+            Instant now = Instant.now();
+            inv.setStatus("InProgress");
+            inv.setStatusDetails(statusDetails("InProgress"));
+            inv.setExecutionStartDateTime(now);
+            inv.setExecutionDeadline(now.plusSeconds(inv.getExecutionTimeoutSeconds()));
+            inv.setMessageAcknowledged(true);
+            putInvocation(inv);
+            LOG.debugv("AcknowledgeMessage: messageId={0} commandId={1}", messageId, inv.getCommandId());
         });
-        LOG.debugv("AcknowledgeMessage: messageId={0} commandId={1}", messageId, commandId);
     }
 
-    public void sendReply(String messageId, String payloadBase64) {
-        String[] meta = messageIndex.remove(messageId);
-        if (meta == null) {
+    public synchronized void sendReply(String messageId, String payloadBase64) {
+        CommandInvocation existing = findInvocationByMessageId(messageId).orElse(null);
+        if (existing == null) {
             LOG.warnv("SendReply: unknown messageId={0}", messageId);
             return;
         }
-        String commandId = meta[0];
-        String instanceId = meta[1];
-        String region = meta[2];
+        String commandId = existing.getCommandId();
+        String instanceId = existing.getInstanceId();
+        String region = existing.getRegion();
+        String accountId = existing.getAccountId();
 
         try {
             byte[] decoded = Base64.getDecoder().decode(payloadBase64);
@@ -416,47 +482,55 @@ public class SsmCommandService implements Resettable {
             }
 
             String invKey = invocationKey(region, commandId, instanceId);
-            CommandInvocation inv = invocationStore.get(invKey).orElse(null);
-            if (inv != null) {
+            CommandInvocation inv = getInvocation(accountId, invKey).orElse(null);
+            if (inv != null && isActiveInvocation(inv.getStatus())) {
                 inv.setStatus(toInvocationStatus(status));
                 inv.setStatusDetails(statusDetails(toInvocationStatus(status)));
                 inv.setStandardOutputContent(stdout);
                 inv.setStandardErrorContent(stderr);
                 inv.setResponseCode(returnCode);
                 inv.setExecutionEndDateTime(endTime);
-                invocationStore.put(invKey, inv);
+                inv.setMessagePayload(null);
+                putInvocation(inv);
             }
 
             // Recalculate command status
-            updateCommandStatus(commandId, region);
+            updateCommandStatus(commandId, region, accountId);
             LOG.infov("SendReply: commandId={0} instanceId={1} status={2} rc={3}", commandId, instanceId, status, returnCode);
         } catch (Exception e) {
             LOG.warnv(e, "Failed to parse SendReply payload for messageId={0}", messageId);
         }
     }
 
-    public void failMessage(String messageId, String failureType) {
-        String[] meta = messageIndex.remove(messageId);
-        if (meta == null) {
+    public synchronized void failMessage(String messageId, String failureType) {
+        CommandInvocation existing = findInvocationByMessageId(messageId).orElse(null);
+        if (existing == null) {
             return;
         }
-        String commandId = meta[0];
-        String instanceId = meta[1];
-        String region = meta[2];
+        String commandId = existing.getCommandId();
+        String instanceId = existing.getInstanceId();
+        String region = existing.getRegion();
+        String accountId = existing.getAccountId();
 
         String invKey = invocationKey(region, commandId, instanceId);
-        invocationStore.get(invKey).ifPresent(inv -> {
+        getInvocation(accountId, invKey).ifPresent(inv -> {
+            if (!isActiveInvocation(inv.getStatus())) {
+                return;
+            }
             inv.setStatus("Failed");
             inv.setStatusDetails("Failed: " + failureType);
             inv.setExecutionEndDateTime(Instant.now());
-            invocationStore.put(invKey, inv);
+            putInvocation(inv);
         });
-        updateCommandStatus(commandId, region);
+        updateCommandStatus(commandId, region, accountId);
         LOG.warnv("FailMessage: commandId={0} instanceId={1} failureType={2}", commandId, instanceId, failureType);
     }
 
-    public void deleteMessage(String messageId) {
-        messageIndex.remove(messageId);
+    public synchronized void deleteMessage(String messageId) {
+        findInvocationByMessageId(messageId).ifPresent(inv -> {
+            inv.setMessagePayload(null);
+            putInvocation(inv);
+        });
     }
 
     // ── CodeDeploy integration helpers ─────────────────────────────────────
@@ -468,7 +542,12 @@ public class SsmCommandService implements Resettable {
     public String sendCommandToInstance(String instanceId, String documentName,
                                         Map<String, List<String>> parameters,
                                         int timeoutSeconds, String region) {
+        if (timeoutSeconds < MIN_TIMEOUT_SECONDS || timeoutSeconds > MAX_TIMEOUT_SECONDS) {
+            throw new IllegalArgumentException("timeoutSeconds must be from 30 to 2592000");
+        }
+        int executionTimeoutSeconds = executionTimeoutSeconds(documentName, parameters);
         String commandId = UUID.randomUUID().toString();
+        String accountId = regionResolver.getAccountId();
         Instant now = Instant.now();
 
         Command command = new Command();
@@ -481,10 +560,12 @@ public class SsmCommandService implements Resettable {
         command.setStatus("InProgress");
         command.setStatusDetails(statusDetails("InProgress"));
         command.setTimeoutSeconds(timeoutSeconds);
+        command.setExecutionTimeoutSeconds(executionTimeoutSeconds);
         command.setTargetCount(1);
         command.setRegion(region);
-        command.setExpiresAfter(now.plusSeconds(timeoutSeconds));
-        commandStore.put(commandKey(region, commandId), command);
+        command.setAccountId(accountId);
+        command.setExpiresAfter(now.plusSeconds((long) timeoutSeconds + executionTimeoutSeconds));
+        putCommand(command);
 
         CommandInvocation inv = new CommandInvocation();
         inv.setCommandId(commandId);
@@ -495,9 +576,12 @@ public class SsmCommandService implements Resettable {
         inv.setStatus("Pending");
         inv.setStatusDetails(statusDetails("Pending"));
         inv.setRegion(region);
-        invocationStore.put(invocationKey(region, commandId, instanceId), inv);
+        inv.setAccountId(accountId);
+        inv.setExecutionTimeoutSeconds(executionTimeoutSeconds);
+        inv.setDeliveryDeadline(now.plusSeconds((long) timeoutSeconds + executionTimeoutSeconds));
+        prepareMessage(inv, documentName, parameters, timeoutSeconds, region);
+        putInvocation(inv);
 
-        queueMessage(commandId, instanceId, documentName, parameters, timeoutSeconds, region);
         return commandId;
     }
 
@@ -514,30 +598,84 @@ public class SsmCommandService implements Resettable {
             String instanceId,
             String documentName,
             Map<String, List<String>> parameters,
-            int timeoutSeconds,
-            String region) {
+            int executionTimeoutSeconds,
+            String region,
+            String accountId) {
+        long generation = directExecutionGeneration.get();
+        ExecutorService executor = directExecutionExecutor;
         CompletableFuture.runAsync(() -> {
             String invKey = invocationKey(region, commandId, instanceId);
-            CommandInvocation invocation = invocationStore.get(invKey).orElse(null);
-            if (invocation == null || "Cancelled".equals(invocation.getStatus())) {
+            String executionKey = directExecutionKey(accountId, invKey);
+            if (!isCurrentDirectExecutionGeneration(generation)) {
+                return;
+            }
+            CommandInvocation invocation = getInvocation(accountId, invKey).orElse(null);
+            if (invocation == null || !isActiveInvocation(invocation.getStatus())) {
                 return;
             }
 
-            SsmDirectCommandExecutor.ExecutionResult result = directCommandExecutor
-                    .executeIfSupported(instanceId, documentName, parameters, timeoutSeconds)
-                    .orElse(null);
-            if (result == null) {
-                invocation.setStatus("Pending");
-                invocation.setStatusDetails(statusDetails("Pending"));
-                invocationStore.put(invKey, invocation);
-                queueMessage(commandId, instanceId, documentName, parameters, timeoutSeconds, region);
-                updateCommandStatus(commandId, region);
-                return;
+            SsmDirectCommandExecutor.ExecutionResult result;
+            try {
+                result = directCommandExecutor
+                        .executeIfSupported(instanceId, documentName, parameters, executionTimeoutSeconds, identity -> {
+                            synchronized (this) {
+                                if (!isCurrentDirectExecutionGeneration(generation)) {
+                                    directCommandExecutor.stopExecution(identity);
+                                    throw new IllegalStateException("SSM direct execution was reset");
+                                }
+                                CommandInvocation current = getInvocation(accountId, invKey).orElse(null);
+                                if (current == null || !isActiveInvocation(current.getStatus())) {
+                                    throw new IllegalStateException(
+                                            "SSM invocation became terminal before Docker exec start");
+                                }
+                                current.setStatus("InProgress");
+                                current.setStatusDetails(statusDetails("InProgress"));
+                                current.setDirectContainerId(identity.containerId());
+                                current.setDirectExecId(identity.execId());
+                                current.setDirectRuntimeFile(identity.runtimeFile());
+                                current.setExecutionStartDateTime(identity.startedAt());
+                                current.setExecutionDeadline(identity.deadline());
+                                locallyOwnedDirectExecutions.add(executionKey);
+                                putInvocation(current);
+                            }
+                        })
+                        .orElse(null);
+                synchronized (this) {
+                    if (!isCurrentDirectExecutionGeneration(generation)) {
+                        return;
+                    }
+                    invocation = getInvocation(accountId, invKey).orElse(null);
+                    if (invocation == null || !isActiveInvocation(invocation.getStatus())) {
+                        return;
+                    }
+                    if (result == null) {
+                        invocation.setStatus("Pending");
+                        invocation.setStatusDetails(statusDetails("Pending"));
+                        invocation.setDirectExecution(false);
+                        prepareMessage(invocation, documentName, parameters,
+                                Math.toIntExact(java.time.Duration.between(
+                                        invocation.getRequestedDateTime(), invocation.getDeliveryDeadline()).getSeconds()),
+                                region);
+                        putInvocation(invocation);
+                        updateCommandStatus(commandId, region, accountId);
+                        return;
+                    }
+                    if ("InProgress".equals(result.status())) {
+                        return;
+                    }
+                    applyDirectResult(invocation, result);
+                    putInvocation(invocation);
+                    updateCommandStatus(commandId, region, accountId);
+                }
             }
-            applyDirectResult(invocation, result);
-            invocationStore.put(invKey, invocation);
-            updateCommandStatus(commandId, region);
-        }, directExecutionExecutor);
+            finally {
+                locallyOwnedDirectExecutions.remove(executionKey);
+            }
+        }, executor);
+    }
+
+    private boolean isCurrentDirectExecutionGeneration(long generation) {
+        return generation == directExecutionGeneration.get();
     }
 
     private void applyDirectResult(CommandInvocation invocation, SsmDirectCommandExecutor.ExecutionResult result) {
@@ -548,6 +686,8 @@ public class SsmCommandService implements Resettable {
         invocation.setResponseCode(result.responseCode());
         invocation.setExecutionStartDateTime(result.executionStartDateTime());
         invocation.setExecutionEndDateTime(result.executionEndDateTime());
+        invocation.setDirectExecId(null);
+        invocation.setDirectRuntimeFile(null);
     }
 
     private static String truncateOutput(String output, int maxChars) {
@@ -560,12 +700,15 @@ public class SsmCommandService implements Resettable {
         return output.substring(0, maxChars);
     }
 
-    private void queueMessage(String commandId, String instanceId, String documentName,
-                              Map<String, List<String>> parameters, int timeoutSeconds, String region) {
+    private void prepareMessage(CommandInvocation invocation, String documentName,
+                                Map<String, List<String>> parameters, int timeoutSeconds, String region) {
         String messageId = UUID.randomUUID().toString();
-        String payload = buildCommandPayload(commandId, documentName, documentVersion(parameters), parameters, timeoutSeconds, region);
-        PendingMessage msg = new PendingMessage(messageId, commandId, region, Instant.now(), payload);
-        messageQueues.computeIfAbsent(instanceId, k -> new ConcurrentLinkedQueue<>()).add(msg);
+        invocation.setMessageId(messageId);
+        invocation.setMessagePayload(buildCommandPayload(
+                invocation.getCommandId(), documentName, documentVersion(parameters), parameters, timeoutSeconds, region));
+        invocation.setMessageCreatedDate(Instant.now());
+        invocation.setMessageVisibleAfter(null);
+        invocation.setMessageAcknowledged(false);
     }
 
     private String buildCommandPayload(String commandId, String documentName, String docVersion,
@@ -590,7 +733,7 @@ public class SsmCommandService implements Resettable {
                 }
             }
             payload.set("Parameters", params);
-            payload.set("DocumentContent", buildDocumentContent(documentName, parameters, timeoutSeconds));
+            payload.set("DocumentContent", buildDocumentContent(documentName));
 
             return Base64.getEncoder().encodeToString(objectMapper.writeValueAsBytes(payload));
         } catch (Exception e) {
@@ -598,7 +741,7 @@ public class SsmCommandService implements Resettable {
         }
     }
 
-    private JsonNode buildDocumentContent(String documentName, Map<String, List<String>> parameters, int timeoutSeconds) {
+    private JsonNode buildDocumentContent(String documentName) {
         ObjectNode doc = objectMapper.createObjectNode();
         doc.put("schemaVersion", "2.2");
         doc.put("description", documentName);
@@ -617,7 +760,7 @@ public class SsmCommandService implements Resettable {
 
         ObjectNode toParam = objectMapper.createObjectNode();
         toParam.put("type", "String");
-        toParam.put("default", String.valueOf(timeoutSeconds));
+        toParam.put("default", String.valueOf(SsmDirectCommandExecutor.DEFAULT_EXECUTION_TIMEOUT_SECONDS));
         toParam.put("description", "Execution timeout in seconds.");
         docParams.set("executionTimeout", toParam);
         doc.set("parameters", docParams);
@@ -649,28 +792,44 @@ public class SsmCommandService implements Resettable {
     }
 
     private void updateCommandStatus(String commandId, String region) {
-        Command command = commandStore.get(commandKey(region, commandId)).orElse(null);
+        updateCommandStatus(commandId, region, regionResolver.getAccountId());
+    }
+
+    private void updateCommandStatus(String commandId, String region, String accountId) {
+        Command command = getCommand(accountId, commandKey(region, commandId)).orElse(null);
         if (command == null) {
             return;
+        }
+        if (command.getAccountId() == null) {
+            command.setAccountId(accountId);
         }
 
         List<String> instanceIds = command.getInstanceIds();
         int completed = 0;
         int errors = 0;
+        int unsuccessful = 0;
         int timedOut = 0;
+        int deliveryTimedOut = 0;
         boolean anyInProgress = false;
 
         for (String iid : instanceIds) {
-            CommandInvocation inv = invocationStore.get(invocationKey(region, commandId, iid)).orElse(null);
+            CommandInvocation inv = getInvocation(accountId, invocationKey(region, commandId, iid)).orElse(null);
             if (inv == null) continue;
             String s = inv.getStatus();
             if ("Success".equals(s)) {
                 completed++;
             } else if ("Failed".equals(s) || "TimedOut".equals(s) || "Cancelled".equals(s)) {
                 completed++;
-                errors++;
+                unsuccessful++;
+                if ("Failed".equals(s)
+                        || ("TimedOut".equals(s) && "Execution Timed Out".equals(inv.getStatusDetails()))) {
+                    errors++;
+                }
                 if ("TimedOut".equals(s)) {
                     timedOut++;
+                    if ("Delivery Timed Out".equals(inv.getStatusDetails())) {
+                        deliveryTimedOut++;
+                    }
                 }
             } else if ("InProgress".equals(s) || "Pending".equals(s)) {
                 anyInProgress = true;
@@ -679,14 +838,17 @@ public class SsmCommandService implements Resettable {
 
         command.setCompletedCount(completed);
         command.setErrorCount(errors);
+        command.setDeliveryTimedOutCount(deliveryTimedOut);
 
         if (!anyInProgress && completed == instanceIds.size()) {
-            String status = commandStatus(errors, timedOut, instanceIds.size());
+            String status = commandStatus(unsuccessful, timedOut, instanceIds.size());
             command.setStatus(status);
-            command.setStatusDetails(statusDetails(command.getStatus()));
+            command.setStatusDetails("TimedOut".equals(status) && deliveryTimedOut == instanceIds.size()
+                    ? "Delivery Timed Out"
+                    : statusDetails(status));
         }
 
-        commandStore.put(commandKey(region, commandId), command);
+        putCommand(command);
     }
 
     private static String commandStatus(int errors, int timedOut, int targetCount) {
@@ -716,6 +878,181 @@ public class SsmCommandService implements Resettable {
         return "Pending".equals(status) || "InProgress".equals(status);
     }
 
+    synchronized void restorePersistedLifecycle() {
+        Instant now = Instant.now();
+        Set<CommandReference> commands = new LinkedHashSet<>();
+        for (StoredInvocation stored : allInvocations()) {
+            CommandInvocation invocation = stored.invocation();
+            if (hydrateAccountId(invocation, stored.accountId())) {
+                putInvocation(invocation);
+            }
+            commands.add(new CommandReference(
+                    invocation.getCommandId(), invocation.getRegion(), stored.accountId()));
+            if (!isActiveInvocation(invocation.getStatus())) {
+                continue;
+            }
+            if (invocation.isDirectExecution() && invocation.getDirectExecId() != null) {
+                reconcileDirectExecution(invocation, now);
+            }
+        }
+        expireInvocations(now);
+        for (CommandReference command : commands) {
+            updateCommandStatus(command.commandId(), command.region(), command.accountId());
+        }
+    }
+
+    synchronized void expireInvocations(Instant now) {
+        Set<CommandReference> changedCommands = new LinkedHashSet<>();
+        for (StoredInvocation stored : allInvocations()) {
+            CommandInvocation invocation = stored.invocation();
+            if (hydrateAccountId(invocation, stored.accountId())) {
+                putInvocation(invocation);
+            }
+            if (!isActiveInvocation(invocation.getStatus())) {
+                continue;
+            }
+            if ("Pending".equals(invocation.getStatus())
+                    && invocation.getDeliveryDeadline() != null
+                    && !now.isBefore(invocation.getDeliveryDeadline())) {
+                completeTimeout(invocation, "Delivery Timed Out", now);
+                changedCommands.add(new CommandReference(
+                        invocation.getCommandId(), invocation.getRegion(), invocation.getAccountId()));
+                continue;
+            }
+            if ("InProgress".equals(invocation.getStatus())
+                    && invocation.getExecutionDeadline() != null
+                    && !now.isBefore(invocation.getExecutionDeadline())) {
+                if (invocation.isDirectExecution() && invocation.getDirectExecId() != null
+                        && !directCommandExecutor.stopExecution(executionIdentity(invocation))) {
+                    LOG.warnv("SSM execution {0} could not be stopped at its deadline; retaining InProgress",
+                            invocation.getDirectExecId());
+                    continue;
+                }
+                completeTimeout(invocation, "Execution Timed Out", now);
+                changedCommands.add(new CommandReference(
+                        invocation.getCommandId(), invocation.getRegion(), invocation.getAccountId()));
+            }
+        }
+        for (CommandReference changed : changedCommands) {
+            updateCommandStatus(changed.commandId(), changed.region(), changed.accountId());
+        }
+    }
+
+    private void reconcileDirectExecution(CommandInvocation invocation, Instant now) {
+        if (locallyOwnedDirectExecutions.contains(directExecutionKey(
+                invocation.getAccountId(), invocationKey(
+                        invocation.getRegion(), invocation.getCommandId(), invocation.getInstanceId())))) {
+            return;
+        }
+        SsmDirectCommandExecutor.ExecutionIdentity identity = executionIdentity(invocation);
+        SsmDirectCommandExecutor.ExecutionState state = directCommandExecutor.inspectExecution(identity);
+        if (state == SsmDirectCommandExecutor.ExecutionState.RUNNING) {
+            if (invocation.getExecutionDeadline() != null && !now.isBefore(invocation.getExecutionDeadline())) {
+                expireInvocations(now);
+            }
+            return;
+        }
+        if (state == SsmDirectCommandExecutor.ExecutionState.FINISHED) {
+            Optional<SsmDirectCommandExecutor.ExecutionResult> recovered =
+                    directCommandExecutor.recoverFinishedExecution(identity);
+            if (recovered.isPresent() && isActiveInvocation(invocation.getStatus())) {
+                applyDirectResult(invocation, recovered.get());
+                putInvocation(invocation);
+                updateCommandStatus(invocation.getCommandId(), invocation.getRegion(), invocation.getAccountId());
+            }
+            return;
+        }
+        if (invocation.getExecutionDeadline() != null && !now.isBefore(invocation.getExecutionDeadline())) {
+            if (invocation.getDirectExecId() != null && !directCommandExecutor.stopExecution(identity)) {
+                LOG.warnv("SSM execution {0} could not be stopped after reconciliation; retaining InProgress",
+                        invocation.getDirectExecId());
+                return;
+            }
+            completeTimeout(invocation, "Execution Timed Out", now);
+            updateCommandStatus(invocation.getCommandId(), invocation.getRegion(), invocation.getAccountId());
+        }
+    }
+
+    private void completeTimeout(CommandInvocation invocation, String details, Instant now) {
+        if (!isActiveInvocation(invocation.getStatus())) {
+            return;
+        }
+        invocation.setStatus("TimedOut");
+        invocation.setStatusDetails(details);
+        invocation.setResponseCode(-1);
+        invocation.setExecutionEndDateTime(now);
+        invocation.setMessagePayload(null);
+        invocation.setDirectExecId(null);
+        invocation.setDirectRuntimeFile(null);
+        putInvocation(invocation);
+    }
+
+    private Optional<CommandInvocation> findInvocationByMessageId(String messageId) {
+        return invocationStore.scan(key -> true).stream()
+                .filter(invocation -> messageId.equals(invocation.getMessageId()))
+                .findFirst();
+    }
+
+    private void putInvocation(CommandInvocation invocation) {
+        String key = invocationKey(invocation.getRegion(), invocation.getCommandId(), invocation.getInstanceId());
+        if (invocationStore instanceof AccountAwareStorageBackend<CommandInvocation> accountAware
+                && invocation.getAccountId() != null) {
+            accountAware.putForAccount(invocation.getAccountId(), key, invocation);
+        }
+        else {
+            invocationStore.put(key, invocation);
+        }
+    }
+
+    private Optional<CommandInvocation> getInvocation(String accountId, String key) {
+        if (invocationStore instanceof AccountAwareStorageBackend<CommandInvocation> accountAware
+                && accountId != null) {
+            return accountAware.getForAccount(accountId, key);
+        }
+        return invocationStore.get(key);
+    }
+
+    private List<StoredInvocation> allInvocations() {
+        if (invocationStore instanceof AccountAwareStorageBackend<CommandInvocation> accountAware) {
+            return accountAware.scanAllAccountEntries().stream()
+                    .map(entry -> new StoredInvocation(entry.accountId(), entry.key(), entry.value()))
+                    .toList();
+        }
+        return invocationStore.keys().stream()
+                .map(key -> invocationStore.get(key)
+                        .map(invocation -> new StoredInvocation(invocation.getAccountId(), key, invocation))
+                        .orElse(null))
+                .filter(java.util.Objects::nonNull)
+                .toList();
+    }
+
+    private Optional<Command> getCommand(String accountId, String key) {
+        if (commandStore instanceof AccountAwareStorageBackend<Command> accountAware && accountId != null) {
+            return accountAware.getForAccount(accountId, key);
+        }
+        return commandStore.get(key);
+    }
+
+    private void putCommand(Command command) {
+        String key = commandKey(command.getRegion(), command.getCommandId());
+        if (commandStore instanceof AccountAwareStorageBackend<Command> accountAware
+                && command.getAccountId() != null) {
+            accountAware.putForAccount(command.getAccountId(), key, command);
+        }
+        else {
+            commandStore.put(key, command);
+        }
+    }
+
+    private static SsmDirectCommandExecutor.ExecutionIdentity executionIdentity(CommandInvocation invocation) {
+        return new SsmDirectCommandExecutor.ExecutionIdentity(
+                invocation.getDirectContainerId(),
+                invocation.getDirectExecId(),
+                invocation.getDirectRuntimeFile(),
+                invocation.getExecutionStartDateTime(),
+                invocation.getExecutionDeadline());
+    }
+
     private static String statusDetails(String status) {
         return switch (status) {
             case "InProgress" -> "In Progress";
@@ -737,13 +1074,16 @@ public class SsmCommandService implements Resettable {
         copy.setStatus(source.getStatus());
         copy.setStatusDetails(source.getStatusDetails());
         copy.setTimeoutSeconds(source.getTimeoutSeconds());
+        copy.setExecutionTimeoutSeconds(source.getExecutionTimeoutSeconds());
         copy.setTargetCount(source.getTargetCount());
         copy.setCompletedCount(source.getCompletedCount());
         copy.setErrorCount(source.getErrorCount());
+        copy.setDeliveryTimedOutCount(source.getDeliveryTimedOutCount());
         copy.setOutputS3BucketName(source.getOutputS3BucketName());
         copy.setOutputS3KeyPrefix(source.getOutputS3KeyPrefix());
         copy.setOutputS3Region(source.getOutputS3Region());
         copy.setRegion(source.getRegion());
+        copy.setAccountId(source.getAccountId());
         return copy;
     }
 
@@ -752,17 +1092,45 @@ public class SsmCommandService implements Resettable {
             String documentName,
             Map<String, List<String>> parameters) {}
 
-    @SuppressWarnings("unchecked")
+    private record CommandReference(String commandId, String region, String accountId) {}
+
+    private record StoredInvocation(String accountId, String key, CommandInvocation invocation) {}
+
+    private static boolean hydrateAccountId(CommandInvocation invocation, String accountId) {
+        if (invocation.getAccountId() == null) {
+            invocation.setAccountId(accountId);
+            return true;
+        }
+        return false;
+    }
+
     private Map<String, List<String>> parseParameters(JsonNode parametersNode) {
-        if (parametersNode == null || parametersNode.isNull() || !parametersNode.isObject()) {
+        if (parametersNode == null || parametersNode.isNull()) {
             return Map.of();
         }
-        try {
-            return objectMapper.convertValue(parametersNode,
-                    new TypeReference<Map<String, List<String>>>() {});
-        } catch (Exception e) {
-            return Map.of();
+        if (!parametersNode.isObject()) {
+            throw invalidParameters("Parameters must be an object whose values are string arrays.");
         }
+        Map<String, List<String>> result = new java.util.LinkedHashMap<>();
+        parametersNode.fields().forEachRemaining(entry -> {
+            JsonNode value = entry.getValue();
+            if (!value.isArray()) {
+                throw invalidParameters("Parameter " + entry.getKey() + " must be a string array.");
+            }
+            List<String> values = new ArrayList<>();
+            value.forEach(element -> {
+                if (!element.isTextual()) {
+                    throw invalidParameters("Parameter " + entry.getKey() + " must contain only strings.");
+                }
+                values.add(element.textValue());
+            });
+            result.put(entry.getKey(), List.copyOf(values));
+        });
+        return Map.copyOf(result);
+    }
+
+    private static AwsException invalidParameters(String message) {
+        return new AwsException("InvalidParameters", message, 400);
     }
 
     private static String instanceKey(String region, String instanceId) {
@@ -777,5 +1145,8 @@ public class SsmCommandService implements Resettable {
         return region + "::" + commandId + "::" + instanceId;
     }
 
-    record PendingMessage(String messageId, String commandId, String region, Instant createdDate, String payload) {}
+    private static String directExecutionKey(String accountId, String invocationKey) {
+        return String.valueOf(accountId) + "::" + invocationKey;
+    }
+
 }

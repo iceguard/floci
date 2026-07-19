@@ -264,6 +264,37 @@ class SsmTest {
 
     @Test
     @Order(14)
+    void sendCommandUsesSeparateDeliveryAndExecutionTimeouts() {
+        SendCommandResponse response = ssm.sendCommand(SendCommandRequest.builder()
+                .documentName("AWS-RunShellScript")
+                .instanceIds(COMMAND_INSTANCE_ID + "-timeouts")
+                .parameters(Map.of(
+                        "commands", List.of("echo floci-sdk"),
+                        "executionTimeout", List.of("90")))
+                .timeoutSeconds(30)
+                .build());
+
+        assertThat(response.command().timeoutSeconds()).isEqualTo(30);
+        assertThat(response.command().deliveryTimedOutCount()).isZero();
+        assertThat(response.command().expiresAfter().getEpochSecond()
+                - response.command().requestedDateTime().getEpochSecond()).isEqualTo(120);
+
+        assertThatThrownBy(() -> ssm.sendCommand(SendCommandRequest.builder()
+                .documentName("AWS-RunShellScript")
+                .instanceIds(COMMAND_INSTANCE_ID)
+                .parameters(Map.of(
+                        "commands", List.of("echo floci-sdk"),
+                        "executionTimeout", List.of("172801")))
+                .timeoutSeconds(30)
+                .build()))
+                .isInstanceOfSatisfying(SsmException.class, error -> {
+                    assertThat(error.statusCode()).isEqualTo(400);
+                    assertThat(error.awsErrorDetails().errorCode()).isEqualTo("InvalidParameters");
+                });
+    }
+
+    @Test
+    @Order(15)
     void sendCommandCreatesPendingInvocation() {
         SendCommandResponse response = ssm.sendCommand(SendCommandRequest.builder()
                 .documentName("AWS-RunShellScript")
@@ -289,7 +320,7 @@ class SsmTest {
     }
 
     @Test
-    @Order(15)
+    @Order(16)
     void listRunCommandsAndInvocations() {
         ListCommandsResponse commands = ssm.listCommands(
                 ListCommandsRequest.builder().commandId(commandId).build());
@@ -316,7 +347,7 @@ class SsmTest {
     }
 
     @Test
-    @Order(16)
+    @Order(17)
     void cancelCommandUpdatesInvocationStatus() {
         ssm.cancelCommand(CancelCommandRequest.builder()
                 .commandId(commandId)

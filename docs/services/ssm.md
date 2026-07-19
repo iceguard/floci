@@ -50,7 +50,9 @@
 
 If the target is not a Floci EC2 container, or if the document is not supported for direct execution, Floci falls back to the SSM agent polling flow. In that mode, `SendCommand` queues an ec2messages payload and the invocation completes after an agent calls `SendReply`.
 
-Direct command output follows the AWS inline output limits: first 24,000 characters of stdout and first 8,000 characters of stderr. Commands that exceed `TimeoutSeconds` are constrained inside the target container when the container has the `timeout` command available, and terminal timeout results are marked `TimedOut` with `StatusDetails` set to `Execution Timed Out`; commands with nonzero exit codes are marked `Failed`.
+Direct command output follows the AWS inline output limits: first 24,000 characters of stdout and first 8,000 characters of stderr. `TimeoutSeconds` controls delivery and accepts AWS's `30..2592000` range. The `AWS-RunShellScript` `executionTimeout` parameter controls plugin execution, accepts `1..172800`, and defaults to 3600 seconds. `ExpiresAfter` includes both periods.
+
+Pending delivery, visibility state, execution deadlines, and direct Docker execution identity are persisted. Restart restores pending messages, reconciles active direct executions, and repairs command aggregates from terminal invocations. Undelivered commands report `Delivery Timed Out` and increment `DeliveryTimedOutCount`; only failed and execution-timed-out invocations increment `ErrorCount`. Terminal cancellation and timeout states are not replaced by late agent replies or executor results.
 
 ## Configuration
 

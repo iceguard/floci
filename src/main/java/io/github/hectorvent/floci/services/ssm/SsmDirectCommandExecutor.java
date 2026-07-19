@@ -20,11 +20,14 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 @ApplicationScoped
 public class SsmDirectCommandExecutor {
 
     private static final Logger LOG = Logger.getLogger(SsmDirectCommandExecutor.class);
+    static final int DEFAULT_EXECUTION_TIMEOUT_SECONDS = 3_600;
+    static final int MAX_EXECUTION_TIMEOUT_SECONDS = 172_800;
 
     private final DockerClient dockerClient;
     private final Ec2Service ec2Service;
@@ -39,7 +42,16 @@ public class SsmDirectCommandExecutor {
             String instanceId,
             String documentName,
             Map<String, List<String>> parameters,
-            int timeoutSeconds) {
+            int executionTimeoutSeconds) {
+        return executeIfSupported(instanceId, documentName, parameters, executionTimeoutSeconds, ignored -> {});
+    }
+
+    public Optional<ExecutionResult> executeIfSupported(
+            String instanceId,
+            String documentName,
+            Map<String, List<String>> parameters,
+            int executionTimeoutSeconds,
+            Consumer<ExecutionIdentity> identityConsumer) {
         if (!supports(instanceId, documentName)) {
             return Optional.empty();
         }
@@ -57,7 +69,8 @@ public class SsmDirectCommandExecutor {
                 .orElse(null);
 
         try {
-            return Optional.of(executeInContainer(instance.getDockerContainerId(), script, workingDirectory, timeoutSeconds));
+            return Optional.of(executeInContainer(
+                    instance.getDockerContainerId(), script, workingDirectory, executionTimeoutSeconds, identityConsumer));
         }
         catch (Exception e) {
             LOG.warnv(e, "SSM direct command failed for instance {0}", instanceId);
@@ -77,9 +90,15 @@ public class SsmDirectCommandExecutor {
         return ec2Service.isInstanceContainerRunning(instanceId);
     }
 
-    private ExecutionResult executeInContainer(String containerId, String script, String workingDirectory, int timeoutSeconds)
+    private ExecutionResult executeInContainer(
+            String containerId,
+            String script,
+            String workingDirectory,
+            int executionTimeoutSeconds,
+            Consumer<ExecutionIdentity> identityConsumer)
             throws InterruptedException {
-        String[] cmd = {"sh", "-c", timeoutWrappedScript(script, timeoutSeconds)};
+        String runtimeFile = "/tmp/floci-ssm-" + java.util.UUID.randomUUID();
+        String[] cmd = {"sh", "-c", timeoutWrappedScript(script, executionTimeoutSeconds, runtimeFile)};
         var create = dockerClient.execCreateCmd(containerId)
                 .withCmd(cmd)
                 .withAttachStdout(true)
@@ -89,10 +108,12 @@ public class SsmDirectCommandExecutor {
         }
 
         String execId = create.exec().getId();
+        Instant start = Instant.now();
+        identityConsumer.accept(new ExecutionIdentity(
+                containerId, execId, runtimeFile, start, start.plusSeconds(executionTimeoutSeconds)));
         CountDownLatch latch = new CountDownLatch(1);
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        Instant start = Instant.now();
 
         ResultCallback<Frame> callback = dockerClient.execStartCmd(execId).exec(new ResultCallback.Adapter<Frame>() {
             @Override
@@ -105,7 +126,8 @@ public class SsmDirectCommandExecutor {
                 try {
                     target.write(payload);
                 }
-                catch (IOException ignored) {
+                catch (IOException e) {
+                    LOG.debug("Unable to capture SSM direct command output", e);
                 }
             }
 
@@ -120,18 +142,22 @@ public class SsmDirectCommandExecutor {
                     stderr.write((throwable.getMessage() != null ? throwable.getMessage() : throwable.toString())
                             .getBytes(StandardCharsets.UTF_8));
                 }
-                catch (IOException ignored) {
+                catch (IOException e) {
+                    LOG.debug("Unable to capture SSM direct command failure", e);
                 }
                 latch.countDown();
             }
         });
 
-        boolean completed = latch.await(hostTimeoutSeconds(timeoutSeconds), TimeUnit.SECONDS);
+        boolean completed = latch.await(hostTimeoutSeconds(executionTimeoutSeconds), TimeUnit.SECONDS);
         if (!completed) {
             closeQuietly(callback);
+            if (!stopExecution(containerId, execId, runtimeFile)) {
+                return ExecutionResult.inProgress(start);
+            }
             return ExecutionResult.timedOut(
                     stdout.toString(StandardCharsets.UTF_8),
-                    "Timed out after " + timeoutSeconds + "s",
+                    "Timed out after " + executionTimeoutSeconds + "s",
                     start);
         }
 
@@ -151,18 +177,122 @@ public class SsmDirectCommandExecutor {
     }
 
     static String timeoutWrappedScript(String script, int timeoutSeconds) {
-        return userScriptCommand(script, timeoutSeconds);
+        return timeoutWrappedScript(script, timeoutSeconds, "/tmp/floci-ssm-runtime");
     }
 
-    private static String userScriptCommand(String script, int timeoutSeconds) {
+    static String timeoutWrappedScript(String script, int timeoutSeconds, String runtimeFile) {
         String command = "sh -c " + shellSingleQuote(script);
         if (timeoutSeconds < 1) {
             return command;
         }
         String timeout = timeoutSeconds + "s";
-        return "if command -v timeout >/dev/null 2>&1; then "
-                + "timeout --kill-after=1s " + shellSingleQuote(timeout) + " " + command + "; "
-                + "else " + command + "; fi";
+        String timed = "if command -v timeout >/dev/null 2>&1; then exec timeout --kill-after=1s "
+                + shellSingleQuote(timeout) + " " + command + "; else exec " + command + "; fi";
+        return "runtime_file=" + shellSingleQuote(runtimeFile) + "; "
+                + "if command -v setsid >/dev/null 2>&1; then setsid sh -c " + shellSingleQuote(timed)
+                + " & else sh -c " + shellSingleQuote(timed) + " & fi; "
+                + "pid=$!; echo \"$pid\" > \"$runtime_file\"; "
+                + "wait \"$pid\"; rc=$?; rm -f \"$runtime_file\"; exit \"$rc\"";
+    }
+
+    public ExecutionState inspectExecution(ExecutionIdentity identity) {
+        try {
+            var inspection = dockerClient.inspectExecCmd(identity.execId()).exec();
+            if (Boolean.TRUE.equals(inspection.isRunning())) {
+                return ExecutionState.RUNNING;
+            }
+            return inspection.getExitCodeLong() == null ? ExecutionState.UNKNOWN : ExecutionState.FINISHED;
+        }
+        catch (Exception e) {
+            LOG.debugv(e, "Unable to inspect SSM Docker exec {0}", identity.execId());
+            return ExecutionState.UNKNOWN;
+        }
+    }
+
+    public boolean stopExecution(ExecutionIdentity identity) {
+        return stopExecution(identity.containerId(), identity.execId(), identity.runtimeFile());
+    }
+
+    public Optional<ExecutionResult> recoverFinishedExecution(ExecutionIdentity identity) {
+        try {
+            var inspection = dockerClient.inspectExecCmd(identity.execId()).exec();
+            if (Boolean.TRUE.equals(inspection.isRunning()) || inspection.getExitCodeLong() == null) {
+                return Optional.empty();
+            }
+            int responseCode = inspection.getExitCodeLong().intValue();
+            Instant start = identity.startedAt() != null ? identity.startedAt() : Instant.now();
+            if (isTimeoutExitCode(responseCode)) {
+                return Optional.of(ExecutionResult.timedOut("", "", start));
+            }
+            if (responseCode == 0) {
+                return Optional.of(ExecutionResult.success("", "", 0, start));
+            }
+            return Optional.of(ExecutionResult.failed("", "", responseCode, start));
+        }
+        catch (Exception e) {
+            LOG.debugv(e, "Unable to recover SSM Docker exec {0}", identity.execId());
+            return Optional.empty();
+        }
+    }
+
+    private boolean stopExecution(String containerId, String execId, String runtimeFile) {
+        try {
+            String script = "runtime_file=" + shellSingleQuote(runtimeFile) + "; "
+                    + "pid=$(cat \"$runtime_file\" 2>/dev/null || true); "
+                    + "if [ -n \"$pid\" ]; then kill -TERM -- -\"$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null || true; fi; "
+                    + "sleep 1; "
+                    + "if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null; then "
+                    + "kill -KILL -- -\"$pid\" 2>/dev/null || kill -KILL \"$pid\" 2>/dev/null || true; fi; "
+                    + "rm -f \"$runtime_file\"";
+            var stop = dockerClient.execCreateCmd(containerId)
+                    .withCmd("sh", "-c", script)
+                    .withAttachStdout(false)
+                    .withAttachStderr(false)
+                    .exec();
+            CountDownLatch latch = new CountDownLatch(1);
+            ResultCallback<Frame> callback = dockerClient.execStartCmd(stop.getId()).exec(new ResultCallback.Adapter<Frame>() {
+                @Override
+                public void onComplete() { latch.countDown(); }
+
+                @Override
+                public void onError(Throwable throwable) { latch.countDown(); }
+            });
+            boolean completed = latch.await(3, TimeUnit.SECONDS);
+            if (!completed) {
+                closeQuietly(callback);
+                return false;
+            }
+            return inspectExecution(new ExecutionIdentity(
+                    containerId, execId, runtimeFile, null, null)) == ExecutionState.FINISHED;
+        }
+        catch (Exception e) {
+            LOG.warnv(e, "Unable to stop SSM Docker exec {0}", execId);
+            return false;
+        }
+    }
+
+    static int executionTimeoutSeconds(Map<String, List<String>> parameters) {
+        List<String> values = parameters.get("executionTimeout");
+        if (values == null) {
+            return DEFAULT_EXECUTION_TIMEOUT_SECONDS;
+        }
+        if (values.size() != 1) {
+            throw new IllegalArgumentException("executionTimeout must contain exactly one value");
+        }
+        String value = values.getFirst();
+        if (value == null || !value.matches("[1-9][0-9]{0,6}")) {
+            throw new IllegalArgumentException("executionTimeout must be an integer from 1 to 172800");
+        }
+        try {
+            int parsed = Integer.parseInt(value);
+            if (parsed > MAX_EXECUTION_TIMEOUT_SECONDS) {
+                throw new IllegalArgumentException("executionTimeout must be an integer from 1 to 172800");
+            }
+            return parsed;
+        }
+        catch (NumberFormatException e) {
+            throw new IllegalArgumentException("executionTimeout must be an integer from 1 to 172800", e);
+        }
     }
 
     static String diagnosticWrappedScript(String script) {
@@ -199,7 +329,8 @@ public class SsmDirectCommandExecutor {
                 try {
                     output.write(payload);
                 }
-                catch (IOException ignored) {
+                catch (IOException e) {
+                    LOG.debug("Unable to capture SSM direct command diagnostics", e);
                 }
             }
 
@@ -264,7 +395,8 @@ public class SsmDirectCommandExecutor {
         try {
             closeable.close();
         }
-        catch (IOException ignored) {
+        catch (IOException e) {
+            LOG.debug("Unable to close SSM Docker exec callback", e);
         }
     }
 
@@ -294,5 +426,22 @@ public class SsmDirectCommandExecutor {
         static ExecutionResult timedOut(String standardOutput, String standardError, Instant start) {
             return new ExecutionResult("TimedOut", standardOutput, standardError, -1, start, Instant.now());
         }
+
+        static ExecutionResult inProgress(Instant start) {
+            return new ExecutionResult("InProgress", "", "", -1, start, null);
+        }
+    }
+
+    public record ExecutionIdentity(
+            String containerId,
+            String execId,
+            String runtimeFile,
+            Instant startedAt,
+            Instant deadline) {}
+
+    public enum ExecutionState {
+        RUNNING,
+        FINISHED,
+        UNKNOWN
     }
 }
