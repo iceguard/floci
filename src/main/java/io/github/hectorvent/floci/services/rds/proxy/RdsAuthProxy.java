@@ -17,12 +17,14 @@ public class RdsAuthProxy {
     private static final Logger LOG = Logger.getLogger(RdsAuthProxy.class);
 
     private final int backendPort;
-    private final boolean iamEnabled;
+    private volatile boolean iamEnabled;
     private final String instanceId;
     private final String backendHost;
     private final String masterUsername;
     private final String masterPassword;
     private final String dbName;
+    private final String dbUserArnPrefix;
+    private final String endpointHost;
     private final DatabaseEngine engine;
     private final RdsSigV4Validator sigV4;
     private final PasswordValidator passwordValidator;
@@ -33,6 +35,7 @@ public class RdsAuthProxy {
     public RdsAuthProxy(String instanceId, String backendHost, int backendPort,
                         DatabaseEngine engine, boolean iamEnabled,
                         String masterUsername, String masterPassword, String dbName,
+                        String dbUserArnPrefix, String endpointHost,
                         RdsSigV4Validator sigV4, PasswordValidator passwordValidator) {
         this.instanceId = instanceId;
         this.backendHost = backendHost;
@@ -42,6 +45,8 @@ public class RdsAuthProxy {
         this.masterUsername = masterUsername;
         this.masterPassword = masterPassword;
         this.dbName = dbName;
+        this.dbUserArnPrefix = dbUserArnPrefix;
+        this.endpointHost = endpointHost;
         this.sigV4 = sigV4;
         this.passwordValidator = passwordValidator;
     }
@@ -66,6 +71,10 @@ public class RdsAuthProxy {
         }
     }
 
+    public void setIamEnabled(boolean iamEnabled) {
+        this.iamEnabled = iamEnabled;
+    }
+
     private void acceptLoop() {
         while (running) {
             try {
@@ -81,14 +90,16 @@ public class RdsAuthProxy {
     }
 
     private void handleConnection(Socket client) {
+        Socket backend = null;
         try {
             client.setTcpNoDelay(true);
-            Socket backend = new Socket(backendHost, backendPort);
+            backend = new Socket(backendHost, backendPort);
             backend.setTcpNoDelay(true);
 
             switch (engine) {
                 case POSTGRES -> PostgresProtocolHandler.handleAuth(
-                        client, backend, masterUsername, masterPassword, dbName,
+                        client, backend, masterUsername, masterPassword, dbName, dbUserArnPrefix,
+                        endpointHost, serverSocket.getLocalPort(),
                         iamEnabled, sigV4, passwordValidator::validate);
                 case MYSQL, MARIADB -> MySqlProtocolHandler.handleAuth(
                         client, backend, masterUsername, masterPassword,
@@ -97,10 +108,14 @@ public class RdsAuthProxy {
         } catch (Exception e) {
             LOG.debugv("RDS connection error for instance {0}: {1}", instanceId, e.getMessage());
             closeQuietly(client);
+            closeQuietly(backend);
         }
     }
 
     private static void closeQuietly(Socket s) {
+        if (s == null) {
+            return;
+        }
         try { s.close(); } catch (IOException ignored) {}
     }
 

@@ -1,15 +1,12 @@
 package com.floci.test;
 
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.rds.RdsClient;
 import software.amazon.awssdk.services.rds.model.CreateDbInstanceRequest;
@@ -21,6 +18,7 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.concurrent.Executors;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Properties;
@@ -41,10 +39,11 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class RdsIamTokenCompatTest {
 
-    private static final StaticCredentialsProvider CREDENTIALS =
-            StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
     private static final Region REGION = Region.US_EAST_1;
     private static final String USERNAME = "admin";
+    private static final String APPLICATION_USERNAME = "application_user";
+    private static final String NON_IAM_USERNAME = "password_only_user";
+    private static final String APPLICATION_PASSWORD = "application-pass-123";
     private static final String PASSWORD = "secret-pass-123";
     private static final String DATABASE = "appdb";
     private static final int PROXY_PORT_MIN = 7000;
@@ -53,33 +52,41 @@ class RdsIamTokenCompatTest {
     private static RdsClient rds;
     private static String instanceId;
     private static int proxyPort;
-    private static boolean instanceReady;
+    private static String endpointHost;
+    private static boolean instanceCreated;
+    private static RdsIamTestPrincipal iamPrincipal;
 
     @BeforeAll
-    static void setup() {
+    static void setup() throws Exception {
         rds = TestFixtures.rdsClient();
         instanceId = TestFixtures.uniqueName("rds-iam");
-        try {
-            var response = rds.createDBInstance(CreateDbInstanceRequest.builder()
-                    .dbInstanceIdentifier(instanceId)
-                    .dbInstanceClass("db.t3.micro")
-                    .engine("postgres")
-                    .masterUsername(USERNAME)
-                    .masterUserPassword(PASSWORD)
-                    .dbName(DATABASE)
-                    .allocatedStorage(20)
-                    .enableIAMDatabaseAuthentication(true)
-                    .build());
-            proxyPort = response.dbInstance().endpoint().port();
-            instanceReady = true;
-        } catch (Exception e) {
-            instanceReady = false;
+        var response = rds.createDBInstance(CreateDbInstanceRequest.builder()
+                .dbInstanceIdentifier(instanceId)
+                .dbInstanceClass("db.t3.micro")
+                .engine("postgres")
+                .masterUsername(USERNAME)
+                .masterUserPassword(PASSWORD)
+                .dbName(DATABASE)
+                .allocatedStorage(20)
+                .enableIAMDatabaseAuthentication(true)
+                .build());
+        instanceCreated = true;
+        proxyPort = response.dbInstance().endpoint().port();
+        endpointHost = response.dbInstance().endpoint().address();
+        try (Connection connection = awaitPostgresConnection(USERNAME, PASSWORD);
+             Statement statement = connection.createStatement()) {
+            statement.execute("CREATE ROLE " + APPLICATION_USERNAME
+                    + " LOGIN PASSWORD '" + APPLICATION_PASSWORD + "'");
+            statement.execute("GRANT rds_iam TO " + APPLICATION_USERNAME);
+            statement.execute("CREATE ROLE " + NON_IAM_USERNAME + " LOGIN");
         }
+        iamPrincipal = RdsIamTestPrincipal.create(
+                response.dbInstance().dbiResourceId(), APPLICATION_USERNAME);
     }
 
     @AfterAll
     static void cleanup() {
-        if (rds != null && instanceReady && instanceId != null) {
+        if (rds != null && instanceCreated && instanceId != null) {
             try {
                 rds.deleteDBInstance(DeleteDbInstanceRequest.builder()
                         .dbInstanceIdentifier(instanceId)
@@ -89,26 +96,28 @@ class RdsIamTokenCompatTest {
             }
             rds.close();
         }
+        if (iamPrincipal != null) {
+            iamPrincipal.close();
+        }
     }
 
     @Test
     @Order(1)
     @DisplayName("SDK-generated IAM token is accepted by the proxy")
     void sdkGeneratedTokenIsAccepted() throws Exception {
-        assumeInstanceReady();
-
         String token = rds.utilities().generateAuthenticationToken(
                 GenerateAuthenticationTokenRequest.builder()
-                        .hostname(TestFixtures.proxyHost())
+                        .hostname(endpointHost)
                         .port(proxyPort)
-                        .username(USERNAME)
+                        .username(APPLICATION_USERNAME)
                         .region(REGION)
-                        .credentialsProvider(CREDENTIALS)
+                        .credentialsProvider(iamPrincipal.credentialsProvider())
                         .build());
 
-        Connection conn = awaitPostgresConnection(USERNAME, token);
+        Connection conn = awaitPostgresConnection(APPLICATION_USERNAME, token);
         try {
             assertThat(selectOne(conn)).isEqualTo(1);
+            assertThat(databaseIdentity(conn)).containsExactly(APPLICATION_USERNAME, APPLICATION_USERNAME);
         } finally {
             conn.close();
         }
@@ -118,70 +127,134 @@ class RdsIamTokenCompatTest {
     @Order(2)
     @DisplayName("Token signed for a different user is rejected")
     void tokenForDifferentUserIsRejected() {
-        assumeInstanceReady();
-
         String token = rds.utilities().generateAuthenticationToken(
                 GenerateAuthenticationTokenRequest.builder()
-                        .hostname(TestFixtures.proxyHost())
+                        .hostname(endpointHost)
                         .port(proxyPort)
                         .username("other-user")
                         .region(REGION)
-                        .credentialsProvider(CREDENTIALS)
+                        .credentialsProvider(iamPrincipal.credentialsProvider())
                         .build());
 
-        assertThatThrownBy(() -> openPostgresConnection(USERNAME, token))
+        assertThatThrownBy(() -> openPostgresConnection(APPLICATION_USERNAME, token))
                 .isInstanceOf(SQLException.class)
-                .hasMessageContaining("password authentication failed");
+                .hasMessageContaining("PAM authentication failed");
     }
 
     @Test
     @Order(3)
     @DisplayName("Token with tampered signature is rejected")
     void tokenWithTamperedSignatureIsRejected() {
-        assumeInstanceReady();
-
         String token = rds.utilities().generateAuthenticationToken(
                 GenerateAuthenticationTokenRequest.builder()
-                        .hostname(TestFixtures.proxyHost())
+                        .hostname(endpointHost)
                         .port(proxyPort)
-                        .username(USERNAME)
+                        .username(APPLICATION_USERNAME)
                         .region(REGION)
-                        .credentialsProvider(CREDENTIALS)
+                        .credentialsProvider(iamPrincipal.credentialsProvider())
                         .build());
 
         String tampered = token.substring(0, token.length() - 1)
                 + (token.endsWith("a") ? "b" : "a");
 
-        assertThatThrownBy(() -> openPostgresConnection(USERNAME, tampered))
+        assertThatThrownBy(() -> openPostgresConnection(APPLICATION_USERNAME, tampered))
                 .isInstanceOf(SQLException.class)
-                .hasMessageContaining("password authentication failed");
+                .hasMessageContaining("PAM authentication failed");
     }
 
     @Test
     @Order(4)
     @DisplayName("Token missing X-Amz-Signature parameter is rejected")
     void tokenMissingSignatureIsRejected() {
-        assumeInstanceReady();
-
         String token = rds.utilities().generateAuthenticationToken(
                 GenerateAuthenticationTokenRequest.builder()
-                        .hostname(TestFixtures.proxyHost())
+                        .hostname(endpointHost)
                         .port(proxyPort)
-                        .username(USERNAME)
+                        .username(APPLICATION_USERNAME)
                         .region(REGION)
-                        .credentialsProvider(CREDENTIALS)
+                        .credentialsProvider(iamPrincipal.credentialsProvider())
                         .build());
 
         String withoutSignature = token.replaceFirst("&X-Amz-Signature=[0-9a-f]+", "");
 
-        assertThatThrownBy(() -> openPostgresConnection(USERNAME, withoutSignature))
-                .isInstanceOf(SQLException.class)
-                .hasMessageContaining("password authentication failed");
+        assertThatThrownBy(() -> openPostgresConnection(APPLICATION_USERNAME, withoutSignature))
+                .isInstanceOf(SQLException.class);
     }
 
-    private static void assumeInstanceReady() {
-        Assumptions.assumeTrue(instanceReady && proxyPort > 0,
-                "RDS instance not available in this environment");
+    @Test
+    @Order(5)
+    @DisplayName("IAM token is rejected when PostgreSQL role lacks rds_iam membership")
+    void tokenForRoleWithoutRdsIamMembershipIsRejected() {
+        String token = rds.utilities().generateAuthenticationToken(
+                GenerateAuthenticationTokenRequest.builder()
+                        .hostname(endpointHost)
+                        .port(proxyPort)
+                        .username(NON_IAM_USERNAME)
+                        .region(REGION)
+                        .credentialsProvider(iamPrincipal.credentialsProvider())
+                        .build());
+
+        assertThatThrownBy(() -> openPostgresConnection(NON_IAM_USERNAME, token))
+                .isInstanceOf(SQLException.class)
+                .hasMessageContaining("PAM authentication failed");
+    }
+
+    @Test
+    @Order(6)
+    @DisplayName("Application login without an IAM token or password is rejected")
+    void applicationLoginWithoutValidCredentialIsRejected() {
+        assertThatThrownBy(() -> openPostgresConnection(APPLICATION_USERNAME, ""))
+                .isInstanceOf(SQLException.class);
+    }
+
+    @Test
+    @Order(7)
+    @DisplayName("PostgreSQL password cannot bypass rds_iam authentication")
+    void rdsIamRoleCannotBypassIamWithPassword() {
+        assertThatThrownBy(() -> openPostgresConnection(APPLICATION_USERNAME, APPLICATION_PASSWORD))
+                .isInstanceOf(SQLException.class)
+                .hasMessageContaining("PAM authentication failed");
+    }
+
+    @Test
+    @Order(8)
+    @DisplayName("Concurrent IAM logins for the same PostgreSQL role both succeed")
+    void concurrentIamLoginsAreSerialized() throws Exception {
+        String token = rds.utilities().generateAuthenticationToken(
+                GenerateAuthenticationTokenRequest.builder()
+                        .hostname(endpointHost)
+                        .port(proxyPort)
+                        .username(APPLICATION_USERNAME)
+                        .region(REGION)
+                        .credentialsProvider(iamPrincipal.credentialsProvider())
+                        .build());
+        var executor = Executors.newFixedThreadPool(2);
+        try {
+            var first = executor.submit(() -> connectOnceAndSelectOne(APPLICATION_USERNAME, token));
+            var second = executor.submit(() -> connectOnceAndSelectOne(APPLICATION_USERNAME, token));
+            assertThat(first.get()).isEqualTo(1);
+            assertThat(second.get()).isEqualTo(1);
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    @Order(9)
+    @DisplayName("IAM login preserves the PostgreSQL role password verifier")
+    void iamLoginPreservesOriginalRolePassword() throws Exception {
+        try (Connection administrator = awaitPostgresConnection(USERNAME, PASSWORD);
+             Statement statement = administrator.createStatement()) {
+            statement.execute("REVOKE rds_iam FROM " + APPLICATION_USERNAME);
+        }
+        try {
+            assertThat(connectAndSelectOne(APPLICATION_USERNAME, APPLICATION_PASSWORD)).isEqualTo(1);
+        } finally {
+            try (Connection administrator = awaitPostgresConnection(USERNAME, PASSWORD);
+                 Statement statement = administrator.createStatement()) {
+                statement.execute("GRANT rds_iam TO " + APPLICATION_USERNAME);
+            }
+        }
     }
 
     private static Connection awaitPostgresConnection(String username, String password) throws Exception {
@@ -214,6 +287,26 @@ class RdsIamTokenCompatTest {
              ResultSet rs = st.executeQuery("select 1")) {
             assertThat(rs.next()).isTrue();
             return rs.getInt(1);
+        }
+    }
+
+    private static int connectAndSelectOne(String username, String password) throws Exception {
+        try (Connection connection = awaitPostgresConnection(username, password)) {
+            return selectOne(connection);
+        }
+    }
+
+    private static int connectOnceAndSelectOne(String username, String password) throws Exception {
+        try (Connection connection = openPostgresConnection(username, password)) {
+            return selectOne(connection);
+        }
+    }
+
+    private static java.util.List<String> databaseIdentity(Connection conn) throws SQLException {
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("select current_user, session_user")) {
+            assertThat(rs.next()).isTrue();
+            return java.util.List.of(rs.getString(1), rs.getString(2));
         }
     }
 }

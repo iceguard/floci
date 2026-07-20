@@ -405,6 +405,7 @@ public class RdsService implements Resettable {
         if (!mock) {
             proxyManager.startProxy(id, engine, iamEnabled, proxyPort, backendHost, backendPort,
                     masterUsername, masterPassword, dbName,
+                    dbUserArnPrefixForInstance(instance), endpoint.address(),
                     (user, pw) -> validateDbPassword(id, user, pw));
         }
 
@@ -650,6 +651,7 @@ public class RdsService implements Resettable {
         }
         if (iamEnabled != null) {
             instance.setIamDatabaseAuthenticationEnabled(iamEnabled);
+            proxyManager.setIamEnabled(id, iamEnabled);
         }
         if (dbSubnetGroupName != null && !dbSubnetGroupName.isBlank()) {
             getDbSubnetGroup(dbSubnetGroupName, effectiveRegion(region));
@@ -750,6 +752,7 @@ public class RdsService implements Resettable {
                     instance.isIamDatabaseAuthenticationEnabled(),
                     instance.getProxyPort(), instance.getContainerHost(), instance.getContainerPort(),
                     effectiveMasterUser, instance.getMasterPassword(), instance.getDbName(),
+                    dbUserArnPrefixForInstance(instance), instance.getEndpoint().address(),
                     (user, pw) -> validateDbPassword(id, user, pw));
         }
 
@@ -869,6 +872,8 @@ public class RdsService implements Resettable {
             String effectiveMasterUser = masterUsername != null ? masterUsername : "root";
             proxyManager.startProxy(id, engine, iamEnabled, proxyPort, cluster.getContainerHost(), cluster.getContainerPort(),
                     effectiveMasterUser, masterPassword, databaseName,
+                    dbUserArnPrefix(cluster.getDbClusterArn(), cluster.getDbClusterResourceId()),
+                    cluster.getEndpoint().address(),
                     (user, pw) -> validateDbClusterPassword(id, user, pw));
         }
 
@@ -898,6 +903,7 @@ public class RdsService implements Resettable {
         }
         if (iamEnabled != null) {
             cluster.setIamDatabaseAuthenticationEnabled(iamEnabled);
+            proxyManager.setIamEnabled(id, iamEnabled);
         }
         clusters.put(id, cluster);
         LOG.infov("DB cluster {0} modified", id);
@@ -1184,6 +1190,29 @@ public class RdsService implements Resettable {
         return password != null && password.equals(cluster.getMasterPassword());
     }
 
+    static String dbUserArnPrefix(String rdsArn, String resourceId) {
+        if (rdsArn == null || resourceId == null) {
+            return null;
+        }
+        String[] parts = rdsArn.split(":", 6);
+        if (parts.length != 6 || !"arn".equals(parts[0]) || parts[3].isBlank() || parts[4].isBlank()) {
+            return null;
+        }
+        return "%s:%s:rds-db:%s:%s:dbuser:%s/".formatted(
+                parts[0], parts[1], parts[3], parts[4], resourceId);
+    }
+
+    private String dbUserArnPrefixForInstance(DbInstance instance) {
+        String clusterId = instance.getDbClusterIdentifier();
+        if (clusterId != null && !clusterId.isBlank()) {
+            DbCluster cluster = clusters.get(clusterId).orElse(null);
+            if (cluster != null) {
+                return dbUserArnPrefix(cluster.getDbClusterArn(), cluster.getDbClusterResourceId());
+            }
+        }
+        return dbUserArnPrefix(instance.getDbInstanceArn(), instance.getDbiResourceId());
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private DatabaseEngine resolveEngine(String engineParam) {
@@ -1342,6 +1371,8 @@ public class RdsService implements Resettable {
                         cluster.isIamDatabaseAuthenticationEnabled(), proxyPort,
                         handle.getHost(), handle.getPort(), effectiveMasterUser,
                         cluster.getMasterPassword(), cluster.getDatabaseName(),
+                        dbUserArnPrefix(cluster.getDbClusterArn(), cluster.getDbClusterResourceId()),
+                        cluster.getEndpoint().address(),
                         (user, pw) -> validateDbClusterPassword(cluster.getDbClusterIdentifier(), user, pw));
                 cluster.setStatus(DbInstanceStatus.AVAILABLE);
             } catch (Exception e) {
@@ -1409,6 +1440,7 @@ public class RdsService implements Resettable {
                         instance.isIamDatabaseAuthenticationEnabled(), proxyPort,
                         backendHost, backendPort, effectiveMasterUser,
                         instance.getMasterPassword(), instance.getDbName(),
+                        dbUserArnPrefixForInstance(instance), instance.getEndpoint().address(),
                         (user, pw) -> validateDbPassword(instance.getDbInstanceIdentifier(), user, pw));
                 instance.setStatus(DbInstanceStatus.AVAILABLE);
             } catch (Exception e) {

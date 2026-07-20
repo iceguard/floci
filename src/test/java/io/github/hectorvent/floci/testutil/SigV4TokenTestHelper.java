@@ -18,6 +18,8 @@ public final class SigV4TokenTestHelper {
 
     private static final DateTimeFormatter DATETIME_FMT =
             DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
+    private static final DateTimeFormatter DATE_FMT =
+            DateTimeFormatter.ofPattern("yyyyMMdd").withZone(ZoneOffset.UTC);
 
     private SigV4TokenTestHelper() {
     }
@@ -64,8 +66,8 @@ public final class SigV4TokenTestHelper {
             Instant timestamp,
             int expiresSeconds
     ) throws Exception {
-        return createRdsToken(host, port, dbUser, accessKeyId, secretKey, null,
-                timestamp, expiresSeconds);
+        return createRdsToken(host, port, dbUser, accessKeyId, secretKey,
+                null, "us-east-1", timestamp, expiresSeconds);
     }
 
     public static String createRdsToken(
@@ -78,13 +80,28 @@ public final class SigV4TokenTestHelper {
             Instant timestamp,
             int expiresSeconds
     ) throws Exception {
+        return createRdsToken(host, port, dbUser, accessKeyId, secretKey,
+                sessionToken, "us-east-1", timestamp, expiresSeconds);
+    }
+
+    public static String createRdsToken(
+            String host,
+            int port,
+            String dbUser,
+            String accessKeyId,
+            String secretKey,
+            String sessionToken,
+            String region,
+            Instant timestamp,
+            int expiresSeconds
+    ) throws Exception {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("Action", "connect");
         params.put("DBUser", dbUser);
         if (sessionToken != null) {
             params.put("X-Amz-Security-Token", sessionToken);
         }
-        return signToken(host, port, host + ":" + port, accessKeyId, secretKey, "us-east-1",
+        return signToken(host, port, host + ":" + port, accessKeyId, secretKey, region,
                 "rds-db", timestamp, expiresSeconds, params);
     }
 
@@ -100,11 +117,12 @@ public final class SigV4TokenTestHelper {
             int expiresSeconds,
             Map<String, String> params
     ) throws Exception {
-        String date = DateTimeFormatter.BASIC_ISO_DATE.withZone(ZoneOffset.UTC).format(timestamp);
+        String date = DATE_FMT.format(timestamp);
         String dateTime = DATETIME_FMT.format(timestamp);
         String credentialScope = date + "/" + region + "/" + service + "/aws4_request";
 
         Map<String, String> queryParams = new LinkedHashMap<>(params);
+        queryParams.put("X-Amz-Algorithm", "AWS4-HMAC-SHA256");
         queryParams.put("X-Amz-Credential", accessKeyId + "/" + credentialScope);
         queryParams.put("X-Amz-Date", dateTime);
         queryParams.put("X-Amz-Expires", Integer.toString(expiresSeconds));

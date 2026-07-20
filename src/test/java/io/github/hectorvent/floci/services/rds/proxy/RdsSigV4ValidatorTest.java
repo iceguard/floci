@@ -1,6 +1,9 @@
 package io.github.hectorvent.floci.services.rds.proxy;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.AccessKey;
 import io.github.hectorvent.floci.testutil.IamServiceTestHelper;
 import io.github.hectorvent.floci.testutil.SigV4TokenTestHelper;
 import org.junit.jupiter.api.Test;
@@ -11,6 +14,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RdsSigV4ValidatorTest {
+
+    private static final String DB_USER_ARN =
+            "arn:aws:rds-db:us-east-1:123456789012:dbuser:db-ABCDEFGHIJKLMNOPQRSTUVWX/app_user";
 
     @Test
     void validateAcceptsTokenSignedByStandardSigV4() throws Exception {
@@ -85,6 +91,28 @@ class RdsSigV4ValidatorTest {
                 Instant.now().minusSeconds(1200),
                 900
         );
+
+        assertFalse(validator.validate(token, "admin"));
+    }
+
+    @Test
+    void validateRejectsTokenLifetimeLongerThanFifteenMinutes() throws Exception {
+        IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDRDS", "secret-rds");
+        RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "admin", "AKIDRDS", "secret-rds",
+                Instant.now(), 901);
+
+        assertFalse(validator.validate(token, "admin"));
+    }
+
+    @Test
+    void validateRejectsTokenTooFarInTheFuture() throws Exception {
+        IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDRDS", "secret-rds");
+        RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "admin", "AKIDRDS", "secret-rds",
+                Instant.now().plusSeconds(301), 900);
 
         assertFalse(validator.validate(token, "admin"));
     }
@@ -246,7 +274,7 @@ class RdsSigV4ValidatorTest {
     void validateAcceptsTokenSignedWithStsSessionCredentials() throws Exception {
         String accessKeyId = "ASIAIOSFODNN7EXAMPLE";
         String secretAccessKey = "sts-generated-secret-key";
-        String sessionToken = "sts-session-token";
+        String sessionToken = "sts+session/token=";
         IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(
                 accessKeyId, secretAccessKey, sessionToken);
 
@@ -287,6 +315,19 @@ class RdsSigV4ValidatorTest {
 
         assertFalse(validator.validate(token, "admin"),
                 "Validator must reject STS token signed with wrong secret");
+    }
+
+    @Test
+    void validateRejectsSessionTokenForLongTermCredential() throws Exception {
+        String accessKeyId = "AKIDRDS";
+        String secretAccessKey = "secret-rds";
+        IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey(
+                accessKeyId, secretAccessKey);
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "admin", accessKeyId, secretAccessKey,
+                "unexpected-session-token", Instant.now().minusSeconds(60), 900);
+
+        assertFalse(new RdsSigV4Validator(iamService).validate(token, "admin"));
     }
 
     @Test
@@ -342,5 +383,139 @@ class RdsSigV4ValidatorTest {
                 "unknown-token", Instant.now().minusSeconds(60), 900);
 
         assertFalse(new RdsSigV4Validator(iamService).validate(token, "admin"));
+    }
+
+    @Test
+    void authorizeAcceptsTokenWithExactRdsDbConnectPermission() throws Exception {
+        IamService iamService = IamServiceTestHelper.emptyIamService();
+        iamService.createUser("application", "/");
+        AccessKey key = iamService.createAccessKey("application");
+        iamService.putUserPolicy("application", "rds-connect", policyFor(DB_USER_ARN));
+        RdsSigV4Validator validator = authorizedValidator(iamService);
+        String token = tokenFor("app_user", key);
+
+        assertTrue(authorize(validator, token));
+    }
+
+    @Test
+    void authorizeAcceptsInstanceProfileSessionWithExactRdsDbConnectPermission() throws Exception {
+        IamService iamService = IamServiceTestHelper.emptyIamService();
+        var role = iamService.createRole("application-role", "/", "{}", null, 3600, null);
+        iamService.putRolePolicy("application-role", "rds-connect", policyFor(DB_USER_ARN));
+        String accessKeyId = "ASIAAPPLICATIONROLE";
+        String secretAccessKey = "instance-profile-secret";
+        String sessionToken = "instance-profile-session-token";
+        iamService.registerSession(accessKeyId, secretAccessKey, sessionToken, role.getArn(),
+                "application-session", "123456789012", role.getRoleId(),
+                Instant.now().plusSeconds(3600), null, "123456789012", null, null);
+        RdsSigV4Validator validator = authorizedValidator(iamService);
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "app_user", accessKeyId, secretAccessKey,
+                sessionToken, "us-east-1", Instant.now().minusSeconds(60), 900);
+
+        assertTrue(authorize(validator, token));
+    }
+
+    @Test
+    void authorizeRejectsTokenScopedToDifferentDatabaseUser() throws Exception {
+        IamService iamService = IamServiceTestHelper.emptyIamService();
+        iamService.createUser("application", "/");
+        AccessKey key = iamService.createAccessKey("application");
+        iamService.putUserPolicy("application", "rds-connect", policyFor(
+                "arn:aws:rds-db:us-east-1:123456789012:dbuser:db-ABCDEFGHIJKLMNOPQRSTUVWX/other_user"));
+        RdsSigV4Validator validator = authorizedValidator(iamService);
+        String token = tokenFor("app_user", key);
+
+        assertFalse(authorize(validator, token));
+    }
+
+    @Test
+    void authorizeRejectsKnownCallerWithoutRdsDbConnectPermission() throws Exception {
+        IamService iamService = IamServiceTestHelper.emptyIamService();
+        iamService.createUser("application", "/");
+        AccessKey key = iamService.createAccessKey("application");
+        RdsSigV4Validator validator = authorizedValidator(iamService);
+
+        assertFalse(authorize(validator, tokenFor("app_user", key)));
+    }
+
+    @Test
+    void authorizeRejectsSelfConsistentTokenForDifferentEndpoint() throws Exception {
+        IamService iamService = IamServiceTestHelper.emptyIamService();
+        iamService.createUser("application", "/");
+        AccessKey key = iamService.createAccessKey("application");
+        iamService.putUserPolicy("application", "rds-connect", policyFor(DB_USER_ARN));
+        RdsSigV4Validator validator = authorizedValidator(iamService);
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "other.example.local", 5432, "app_user", key.getAccessKeyId(), key.getSecretAccessKey(),
+                Instant.now().minusSeconds(60), 900);
+
+        assertFalse(authorize(validator, token));
+    }
+
+    @Test
+    void authorizeRejectsSelfConsistentTokenForDifferentRegion() throws Exception {
+        IamService iamService = IamServiceTestHelper.emptyIamService();
+        iamService.createUser("application", "/");
+        AccessKey key = iamService.createAccessKey("application");
+        iamService.putUserPolicy("application", "rds-connect", policyFor(DB_USER_ARN));
+        RdsSigV4Validator validator = authorizedValidator(iamService);
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "app_user", key.getAccessKeyId(), key.getSecretAccessKey(),
+                null, "eu-west-1", Instant.now().minusSeconds(60), 900);
+
+        assertFalse(authorize(validator, token));
+    }
+
+    @Test
+    void authorizeRejectsInactiveAccessKey() throws Exception {
+        IamService iamService = IamServiceTestHelper.emptyIamService();
+        iamService.createUser("application", "/");
+        AccessKey key = iamService.createAccessKey("application");
+        iamService.putUserPolicy("application", "rds-connect", policyFor(DB_USER_ARN));
+        String token = tokenFor("app_user", key);
+        iamService.updateAccessKey("application", key.getAccessKeyId(), "Inactive");
+
+        assertFalse(authorize(authorizedValidator(iamService), token));
+    }
+
+    @Test
+    void validateRejectsUnknownAccessKeyEvenWhenTokenUsesKeyIdAsSecret() throws Exception {
+        IamService iamService = IamServiceTestHelper.emptyIamService();
+        RdsSigV4Validator validator = authorizedValidator(iamService);
+        String accessKeyId = "AKIAUNKNOWNSELFSECRET";
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "app_user", accessKeyId, accessKeyId,
+                Instant.now().minusSeconds(60), 900);
+
+        assertFalse(validator.validate(token, "app_user"));
+    }
+
+    private static RdsSigV4Validator authorizedValidator(IamService iamService) {
+        return new RdsSigV4Validator(iamService, new IamPolicyEvaluator(new ObjectMapper()));
+    }
+
+    private static String tokenFor(String user, AccessKey key) throws Exception {
+        return SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, user, key.getAccessKeyId(), key.getSecretAccessKey(),
+                Instant.now().minusSeconds(60), 900);
+    }
+
+    private static boolean authorize(RdsSigV4Validator validator, String token) {
+        return validator.validateAndAuthorize(
+                token, "app_user", DB_USER_ARN, "db.example.local", 5432);
+    }
+
+    private static String policyFor(String resource) {
+        return """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "rds-db:connect",
+                    "Resource": "%s"
+                  }]
+                }
+                """.formatted(resource);
     }
 }

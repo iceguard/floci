@@ -1,6 +1,9 @@
 package io.github.hectorvent.floci.services.rds.proxy;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -15,7 +18,11 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
+import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
+
+import static io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision.ALLOW;
 
 /**
  * Validates RDS IAM auth tokens (SigV4 presigned URLs).
@@ -29,12 +36,22 @@ public class RdsSigV4Validator {
     private static final Logger LOG = Logger.getLogger(RdsSigV4Validator.class);
     private static final DateTimeFormatter DATETIME_FMT =
             DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC);
+    private static final DateTimeFormatter DATE_FMT =
+            DateTimeFormatter.ofPattern("yyyyMMdd").withZone(ZoneOffset.UTC);
+    private static final int MAX_TOKEN_LIFETIME_SECONDS = 900;
+    private static final int MAX_CLOCK_SKEW_SECONDS = 300;
 
     private final IamService iamService;
+    private final IamPolicyEvaluator policyEvaluator;
 
     @Inject
-    public RdsSigV4Validator(IamService iamService) {
+    public RdsSigV4Validator(IamService iamService, IamPolicyEvaluator policyEvaluator) {
         this.iamService = iamService;
+        this.policyEvaluator = policyEvaluator;
+    }
+
+    RdsSigV4Validator(IamService iamService) {
+        this(iamService, new IamPolicyEvaluator(new ObjectMapper()));
     }
 
     /**
@@ -48,6 +65,41 @@ public class RdsSigV4Validator {
      * @return true if the token signature is valid, the DBUser matches, and the token is not expired
      */
     public boolean validate(String token, String clientUsername) {
+        return validateToken(token, clientUsername).isPresent();
+    }
+
+    /**
+     * Validates the token and requires the caller to have {@code rds-db:connect}
+     * permission for the exact database-user ARN.
+     */
+    public boolean validateAndAuthorize(String token, String clientUsername, String dbUserArn) {
+        return validateAndAuthorize(token, clientUsername, dbUserArn, null, -1);
+    }
+
+    public boolean validateAndAuthorize(String token, String clientUsername, String dbUserArn,
+                                        String expectedHost, int expectedPort) {
+        String expectedRegion = arnRegion(dbUserArn);
+        Optional<ValidatedToken> validated = validateToken(
+                token, clientUsername, expectedHost, expectedPort, expectedRegion);
+        if (validated.isEmpty()) {
+            return false;
+        }
+        CallerContext caller = iamService.resolveCallerContext(validated.get().accessKeyId());
+        if (caller == null) {
+            LOG.debugv("RDS IAM token caller has no resolvable IAM identity: accessKey={0}",
+                    validated.get().accessKeyId());
+            return false;
+        }
+        return policyEvaluator.evaluate(caller, null, "rds-db:connect", dbUserArn, Map.of()) == ALLOW;
+    }
+
+    private Optional<ValidatedToken> validateToken(String token, String clientUsername) {
+        return validateToken(token, clientUsername, null, -1, null);
+    }
+
+    private Optional<ValidatedToken> validateToken(String token, String clientUsername,
+                                                   String expectedHost, int expectedPort,
+                                                   String expectedRegion) {
         try {
             URI uri = URI.create("http://" + token);
             String host = uri.getHost();
@@ -56,11 +108,16 @@ public class RdsSigV4Validator {
 
             if (host == null || rawQuery == null) {
                 LOG.debugv("RDS IAM token missing host or query string");
-                return false;
+                return Optional.empty();
             }
 
             // RDS tokens sign host:port in the canonical host header
             String authority = (port > 0) ? host + ":" + port : host;
+            if (expectedHost != null && (!expectedHost.equalsIgnoreCase(host) || expectedPort != port)) {
+                LOG.debugv("RDS IAM token endpoint mismatch: expected={0}:{1}, token={2}",
+                        expectedHost, expectedPort, authority);
+                return Optional.empty();
+            }
 
             String[] rawPairs = rawQuery.split("&");
             String action = findRawParam(rawPairs, "Action");
@@ -71,41 +128,63 @@ public class RdsSigV4Validator {
             String sessionToken = findRawParam(rawPairs, "X-Amz-Security-Token");
             String signedHeaders = findRawParam(rawPairs, "X-Amz-SignedHeaders");
             String signature = findRawParam(rawPairs, "X-Amz-Signature");
+            String algorithm = findRawParam(rawPairs, "X-Amz-Algorithm");
 
             if (!"connect".equals(action) || dbUser == null || dateTime == null || expires == null
-                    || credential == null || signedHeaders == null || signature == null) {
+                    || credential == null || signature == null
+                    || !"AWS4-HMAC-SHA256".equals(algorithm) || !"host".equals(signedHeaders)) {
                 LOG.debugv("RDS IAM token missing required SigV4 parameters");
-                return false;
+                return Optional.empty();
             }
 
             if (clientUsername != null && !clientUsername.equals(dbUser)) {
                 LOG.debugv("RDS IAM token DBUser mismatch: client={0}, token={1}",
                         clientUsername, dbUser);
-                return false;
+                return Optional.empty();
             }
 
             Instant tokenTime = Instant.from(DATETIME_FMT.parse(dateTime));
             int expirySeconds = Integer.parseInt(expires);
-            if (Instant.now().isAfter(tokenTime.plusSeconds(expirySeconds))) {
+            Instant now = Instant.now();
+            if (expirySeconds <= 0 || expirySeconds > MAX_TOKEN_LIFETIME_SECONDS
+                    || tokenTime.isAfter(now.plusSeconds(MAX_CLOCK_SKEW_SECONDS))
+                    || now.isAfter(tokenTime.plusSeconds(expirySeconds))) {
                 LOG.debugv("RDS IAM token expired");
-                return false;
+                return Optional.empty();
             }
 
             String decodedCredential = urlDecode(credential);
             String[] credParts = decodedCredential.split("/");
             if (credParts.length < 5) {
-                return false;
+                return Optional.empty();
             }
             String accessKeyId = credParts[0];
             String date = credParts[1];
             String region = credParts[2];
             String service = credParts[3];
+            if (!DATE_FMT.format(tokenTime).equals(date)) {
+                LOG.debugv("RDS IAM token credential date does not match X-Amz-Date");
+                return Optional.empty();
+            }
+            if (!"rds-db".equals(service) || !"aws4_request".equals(credParts[4])) {
+                LOG.debugv("RDS IAM token has invalid credential scope service={0}", service);
+                return Optional.empty();
+            }
+            if (expectedRegion != null && !expectedRegion.equals(region)) {
+                LOG.debugv("RDS IAM token region mismatch: expected={0}, token={1}",
+                        expectedRegion, region);
+                return Optional.empty();
+            }
             String credentialScope = date + "/" + region + "/" + service + "/aws4_request";
 
+            if (!accessKeyId.startsWith("ASIA") && sessionToken != null) {
+                LOG.debugv("RDS IAM token has a session token for long-term accessKey={0}", accessKeyId);
+                return Optional.empty();
+            }
             String secretKey = iamService.findSigningSecret(accessKeyId, sessionToken).orElse(null);
             if (secretKey == null) {
                 LOG.debugv("RDS IAM token has invalid temporary credentials for accessKey={0}", accessKeyId);
-                return false;
+                return Optional.empty();
             }
 
             // Canonical query string: sorted pairs, excluding X-Amz-Signature
@@ -135,12 +214,24 @@ public class RdsSigV4Validator {
             if (!valid) {
                 LOG.debugv("RDS IAM token signature mismatch for accessKey={0}", accessKeyId);
             }
-            return valid;
+            return valid
+                    ? Optional.of(new ValidatedToken(accessKeyId))
+                    : Optional.empty();
 
         } catch (Exception e) {
             LOG.debugv("RDS IAM token validation error: {0}", e.getMessage());
-            return false;
+            return Optional.empty();
         }
+    }
+
+    private record ValidatedToken(String accessKeyId) {}
+
+    private static String arnRegion(String arn) {
+        if (arn == null) {
+            return null;
+        }
+        String[] parts = arn.split(":", 6);
+        return parts.length == 6 && !parts[3].isBlank() ? parts[3] : null;
     }
 
     private static String rawParamName(String rawPair) {

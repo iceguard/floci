@@ -12,7 +12,9 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLContext;
@@ -23,6 +25,10 @@ import java.security.cert.X509Certificate;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 class PostgresProtocolHandlerTest {
 
@@ -262,6 +268,211 @@ class PostgresProtocolHandlerTest {
         }
     }
 
+    @Test
+    void rejectsInvalidAdministratorPasswordBeforeBackendAuthentication() throws Exception {
+        AtomicReference<Integer> firstBackendByte = new AtomicReference<>();
+        try (ServerSocket backendServer = new ServerSocket(0);
+             ServerSocket clientServer = new ServerSocket(0)) {
+            Thread backendThread = Thread.ofVirtual().start(() -> {
+                try (Socket socket = backendServer.accept()) {
+                    firstBackendByte.set(socket.getInputStream().read());
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            try (Socket ourClient = new Socket("localhost", clientServer.getLocalPort())) {
+                Socket proxyClient = clientServer.accept();
+                Socket backend = new Socket("localhost", backendServer.getLocalPort());
+                Thread authThread = Thread.ofVirtual().start(() -> {
+                    try {
+                        PostgresProtocolHandler.handleAuth(
+                                proxyClient, backend,
+                                "dbadmin", "adminpass", "postgres",
+                                false, testSigV4Validator(),
+                                (user, pass) -> false);
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+
+                DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
+                DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
+                writeStartup(clientOut, "dbadmin", "postgres");
+                readCleartextPasswordChallenge(clientIn);
+                writePassword(clientOut, "wrong-password");
+
+                assertEquals('E', clientIn.readByte());
+                authThread.join(5_000);
+                backendThread.join(5_000);
+                assertEquals(-1, firstBackendByte.get());
+            }
+        }
+    }
+
+    @Test
+    void rejectsApplicationIamTokenWithoutExactRdsDbConnectPermission() throws Exception {
+        RdsSigV4Validator validator = mock(RdsSigV4Validator.class);
+        String token = "db.example.local:5432/?X-Amz-Signature=invalid";
+        String dbUserArnPrefix =
+                "arn:aws:rds-db:us-east-1:123456789012:dbuser:db-ABCDEFGHIJKLMNOPQRSTUVWX/";
+        when(validator.validateAndAuthorize(token, "app_user", dbUserArnPrefix + "app_user",
+                "db.example.local", 5432))
+                .thenReturn(false);
+
+        AtomicReference<Integer> firstBackendByte = new AtomicReference<>();
+        try (ServerSocket backendServer = new ServerSocket(0);
+             ServerSocket clientServer = new ServerSocket(0)) {
+            Thread backendThread = Thread.ofVirtual().start(() -> {
+                try (Socket socket = backendServer.accept()) {
+                    firstBackendByte.set(socket.getInputStream().read());
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            try (Socket ourClient = new Socket("localhost", clientServer.getLocalPort())) {
+                Socket proxyClient = clientServer.accept();
+                Socket backend = new Socket("localhost", backendServer.getLocalPort());
+                Thread authThread = Thread.ofVirtual().start(() -> {
+                    try {
+                        PostgresProtocolHandler.handleAuth(
+                                proxyClient, backend,
+                                "dbadmin", "adminpass", "postgres", dbUserArnPrefix,
+                                "db.example.local", 5432,
+                                true, validator, (user, pass) -> true);
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+
+                DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
+                DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
+                writeStartup(clientOut, "app_user", "postgres");
+                readCleartextPasswordChallenge(clientIn);
+                writePassword(clientOut, token);
+
+                assertEquals('E', clientIn.readByte());
+                authThread.join(5_000);
+                backendThread.join(5_000);
+                assertEquals(-1, firstBackendByte.get());
+                verify(validator).validateAndAuthorize(token, "app_user", dbUserArnPrefix + "app_user",
+                        "db.example.local", 5432);
+            }
+        }
+    }
+
+    @Test
+    void authorizedApplicationIamTokenUsesRequestedPostgresIdentity() throws Exception {
+        RdsSigV4Validator validator = mock(RdsSigV4Validator.class);
+        String token = "db.example.local:5432/?X-Amz-Signature=valid";
+        String dbUserArnPrefix =
+                "arn:aws:rds-db:us-east-1:123456789012:dbuser:db-ABCDEFGHIJKLMNOPQRSTUVWX/";
+        when(validator.validateAndAuthorize(token, "app_user", dbUserArnPrefix + "app_user",
+                "db.example.local", 5432))
+                .thenReturn(true);
+        AtomicReference<String> backendUser = new AtomicReference<>();
+        AtomicReference<String> roleSql = new AtomicReference<>();
+        List<String> administratorSql = new ArrayList<>();
+
+        try (ServerSocket backendServer = new ServerSocket(0);
+             ServerSocket clientServer = new ServerSocket(0)) {
+            Thread backendThread = Thread.ofVirtual().start(() -> {
+                try {
+                    mockBackendIamRole(backendServer, backendUser, roleSql, administratorSql, true);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            try (Socket ourClient = new Socket("localhost", clientServer.getLocalPort())) {
+                Socket proxyClient = clientServer.accept();
+                Socket backend = new Socket("localhost", backendServer.getLocalPort());
+                Thread authThread = Thread.ofVirtual().start(() -> {
+                    try {
+                        PostgresProtocolHandler.handleAuth(
+                                proxyClient, backend,
+                                "dbadmin", "adminpass", "postgres", dbUserArnPrefix,
+                                "db.example.local", 5432,
+                                true, validator, (user, pass) -> true);
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+
+                DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
+                DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
+                writeStartup(clientOut, "app_user", "postgres");
+                readCleartextPasswordChallenge(clientIn);
+                writePassword(clientOut, token);
+                readAuthenticationOk(clientIn);
+                readReadyForQuery(clientIn);
+
+                authThread.join(5_000);
+                backendThread.join(5_000);
+                assertEquals("app_user", backendUser.get());
+                assertTrue(roleSql.get().contains("FROM pg_auth_members membership"));
+                assertTrue(roleSql.get().contains("WHERE granted_role.rolname = 'rds_iam'"));
+                assertTrue(roleSql.get().contains("member_role.rolname = 'app_user'"));
+                assertTrue(administratorSql.stream().anyMatch(sql -> sql.contains("pg_advisory_lock")));
+                assertTrue(administratorSql.stream().anyMatch(sql ->
+                        sql.contains("SELECT rolpassword FROM pg_authid")));
+                assertTrue(administratorSql.stream().anyMatch(sql ->
+                        sql.contains("ALTER ROLE \"app_user\" PASSWORD 'SCRAM-SHA-256$original'")));
+                assertTrue(administratorSql.stream().anyMatch(sql -> sql.contains("pg_advisory_unlock")));
+            }
+        }
+    }
+
+    @Test
+    void rejectsAuthorizedIamTokenWhenDatabaseRoleLacksRdsIamMembership() throws Exception {
+        RdsSigV4Validator validator = mock(RdsSigV4Validator.class);
+        String token = "db.example.local:5432/?X-Amz-Signature=valid";
+        String dbUserArnPrefix =
+                "arn:aws:rds-db:us-east-1:123456789012:dbuser:db-ABCDEFGHIJKLMNOPQRSTUVWX/";
+        when(validator.validateAndAuthorize(token, "app_user", dbUserArnPrefix + "app_user",
+                "db.example.local", 5432))
+                .thenReturn(true);
+
+        try (ServerSocket backendServer = new ServerSocket(0);
+             ServerSocket clientServer = new ServerSocket(0)) {
+            Thread backendThread = Thread.ofVirtual().start(() -> {
+                try {
+                    mockBackendIamRole(backendServer, new AtomicReference<>(), new AtomicReference<>(),
+                            new ArrayList<>(), false);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            try (Socket ourClient = new Socket("localhost", clientServer.getLocalPort())) {
+                Socket proxyClient = clientServer.accept();
+                Socket backend = new Socket("localhost", backendServer.getLocalPort());
+                Thread authThread = Thread.ofVirtual().start(() -> {
+                    try {
+                        PostgresProtocolHandler.handleAuth(
+                                proxyClient, backend,
+                                "dbadmin", "adminpass", "postgres", dbUserArnPrefix,
+                                "db.example.local", 5432,
+                                true, validator, (user, pass) -> true);
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+
+                DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
+                DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
+                writeStartup(clientOut, "app_user", "postgres");
+                readCleartextPasswordChallenge(clientIn);
+                writePassword(clientOut, token);
+
+                assertEquals('E', clientIn.readByte());
+                authThread.join(5_000);
+                backendThread.join(5_000);
+            }
+        }
+    }
+
     private static RdsSigV4Validator testSigV4Validator() {
         return new RdsSigV4Validator(IamServiceTestHelper.iamServiceWithAccessKey("AKIATEST", "secret"));
     }
@@ -334,6 +545,109 @@ class PostgresProtocolHandlerTest {
             int queryLength = in.readInt();
             in.readNBytes(queryLength - 4);
         }
+    }
+
+    private static void mockBackendIamRole(ServerSocket server, AtomicReference<String> backendUser,
+                                           AtomicReference<String> roleSql,
+                                           List<String> administratorSql,
+                                           boolean rdsIamMember) throws IOException {
+        try (Socket administratorSocket = server.accept()) {
+            DataInputStream in = new DataInputStream(administratorSocket.getInputStream());
+            DataOutputStream out = new DataOutputStream(administratorSocket.getOutputStream());
+
+            int length = in.readInt();
+            assertEquals(STARTUP_PROTOCOL_VERSION, in.readInt());
+            assertEquals("dbadmin", parseStartupParams(in.readNBytes(length - 8)).get("user"));
+
+            out.writeByte('R');
+            out.writeInt(8);
+            out.writeInt(3);
+            out.flush();
+            assertEquals('p', in.readByte());
+            in.readNBytes(in.readInt() - 4);
+            out.writeByte('R');
+            out.writeInt(8);
+            out.writeInt(0);
+            out.writeByte('Z');
+            out.writeInt(5);
+            out.writeByte('I');
+            out.flush();
+
+            roleSql.set(readSimpleQuery(in));
+            administratorSql.add(roleSql.get());
+
+            writeSingleColumnResult(out, rdsIamMember ? "t" : "f");
+
+            if (!rdsIamMember) {
+                return;
+            }
+
+            administratorSql.add(readSimpleQuery(in));
+            writeSingleColumnResult(out, "t");
+
+            administratorSql.add(readSimpleQuery(in));
+            writeSingleColumnResult(out, "SCRAM-SHA-256$original");
+
+            administratorSql.add(readSimpleQuery(in));
+            writeReadyForQuery(out);
+
+            try (Socket userSocket = server.accept()) {
+                DataInputStream userIn = new DataInputStream(userSocket.getInputStream());
+                DataOutputStream userOut = new DataOutputStream(userSocket.getOutputStream());
+                int userStartupLength = userIn.readInt();
+                assertEquals(STARTUP_PROTOCOL_VERSION, userIn.readInt());
+                backendUser.set(parseStartupParams(userIn.readNBytes(userStartupLength - 8)).get("user"));
+
+                userOut.writeByte('R');
+                userOut.writeInt(8);
+                userOut.writeInt(3);
+                userOut.flush();
+                assertEquals('p', userIn.readByte());
+                userIn.readNBytes(userIn.readInt() - 4);
+                userOut.writeByte('R');
+                userOut.writeInt(8);
+                userOut.writeInt(0);
+                userOut.writeByte('Z');
+                userOut.writeInt(5);
+                userOut.writeByte('I');
+                userOut.flush();
+
+                administratorSql.add(readSimpleQuery(in));
+                writeReadyForQuery(out);
+
+                administratorSql.add(readSimpleQuery(in));
+                writeSingleColumnResult(out, "t");
+
+                userIn.read();
+            }
+        }
+    }
+
+    private static String readSimpleQuery(DataInputStream in) throws IOException {
+        assertEquals('Q', in.readByte());
+        int length = in.readInt();
+        byte[] query = in.readNBytes(length - 5);
+        assertEquals(0, in.readByte());
+        return new String(query, StandardCharsets.UTF_8);
+    }
+
+    private static void writeSingleColumnResult(DataOutputStream out, String value) throws IOException {
+        byte[] bytes = value == null ? null : value.getBytes(StandardCharsets.UTF_8);
+        out.writeByte('D');
+        out.writeInt(4 + 2 + 4 + (bytes == null ? 0 : bytes.length));
+        out.writeShort(1);
+        out.writeInt(bytes == null ? -1 : bytes.length);
+        if (bytes != null) {
+            out.write(bytes);
+        }
+        writeReadyForQuery(out);
+    }
+
+    private static void writeReadyForQuery(DataOutputStream out) throws IOException {
+        out.writeByte('Z');
+        out.writeInt(5);
+        out.writeByte('I');
+        out.flush();
     }
 
     private static void writeStartup(DataOutputStream out, String user, String database) throws IOException {

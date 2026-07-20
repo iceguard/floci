@@ -963,7 +963,9 @@ public class IamService implements SessionAccountLookup {
     // =========================================================================
 
     public Optional<String> findSecretKey(String accessKeyId) {
-        Optional<String> fromAccessKey = accessKeys.get(accessKeyId).map(AccessKey::getSecretAccessKey);
+        Optional<String> fromAccessKey = accessKeys.get(accessKeyId)
+                .filter(key -> "Active".equals(key.getStatus()))
+                .map(AccessKey::getSecretAccessKey);
         if (fromAccessKey.isPresent()) {
             return fromAccessKey;
         }
@@ -1296,7 +1298,8 @@ public class IamService implements SessionAccountLookup {
      */
     public CallerContext resolveCallerContext(String accessKeyId) {
         // Check user access keys
-        Optional<AccessKey> akOpt = accessKeys.get(accessKeyId);
+        Optional<AccessKey> akOpt = accessKeys.get(accessKeyId)
+                .filter(key -> "Active".equals(key.getStatus()));
         if (akOpt.isPresent()) {
             String userName = akOpt.get().getUserName();
             List<String> identityPolicies = collectUserPolicies(userName);
