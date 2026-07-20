@@ -102,6 +102,32 @@ class AutoScalingServiceTest {
     }
 
     @Test
+    void deletePolicyIsScopedToRegionAndAutoScalingGroup() {
+        service.createAutoScalingGroup(REGION,
+                "other-asg", null, "lt-original", null, "1", null,
+                0, 3, 1, 300, List.of("us-east-1a"), List.of("subnet-12345678"),
+                List.of(), List.of(), "EC2", 0, List.of("Default"),
+                java.util.Map.of(), java.util.Map.of());
+        service.createAutoScalingGroup("us-west-2",
+                "test-asg", null, "lt-original", null, "1", null,
+                0, 3, 1, 300, List.of("us-west-2a"), List.of("subnet-12345678"),
+                List.of(), List.of(), "EC2", 0, List.of("Default"),
+                java.util.Map.of(), java.util.Map.of());
+        service.putScalingPolicy(REGION, "test-asg", "shared-name", null, null,
+                1, 0, null, null);
+        service.putScalingPolicy(REGION, "other-asg", "shared-name", null, null,
+                1, 0, null, null);
+        service.putScalingPolicy("us-west-2", "test-asg", "shared-name", null, null,
+                1, 0, null, null);
+
+        service.deletePolicy(REGION, "test-asg", "shared-name");
+
+        assertTrue(service.describePolicies(REGION, "test-asg", List.of("shared-name")).isEmpty());
+        assertEquals(1, service.describePolicies(REGION, "other-asg", List.of("shared-name")).size());
+        assertEquals(1, service.describePolicies("us-west-2", "test-asg", List.of("shared-name")).size());
+    }
+
+    @Test
     void createAutoScalingGroupRejectsResolvedLaunchTemplateWithoutImageId() {
         Ec2Service ec2Service = mock(Ec2Service.class);
         service.ec2Service = ec2Service;

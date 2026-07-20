@@ -82,7 +82,7 @@ class CloudFormationAutoScalingIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"))
-            .body(containsString(":autoScalingGroup:" + asgName));
+            .body(containsString(":autoScalingGroupName/" + asgName));
 
         // The group really exists in Auto Scaling and references the launch configuration.
         given()
