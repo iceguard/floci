@@ -15,6 +15,35 @@ public final class IamServiceTestHelper {
     private IamServiceTestHelper() {
     }
 
+    public static IamService emptyIamService() {
+        try {
+            Constructor<IamService> constructor = IamService.class.getDeclaredConstructor(
+                    StorageBackend.class,
+                    StorageBackend.class,
+                    StorageBackend.class,
+                    StorageBackend.class,
+                    StorageBackend.class,
+                    StorageBackend.class,
+                    StorageBackend.class,
+                    RegionResolver.class
+            );
+            constructor.setAccessible(true);
+
+            return constructor.newInstance(
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    new InMemoryStorage<>(),
+                    new RegionResolver("us-east-1", "123456789012")
+            );
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Failed to construct IamService test fixture", e);
+        }
+    }
+
     public static IamService iamServiceWithAccessKey(String accessKeyId, String secretAccessKey) {
         try {
             Constructor<IamService> constructor = IamService.class.getDeclaredConstructor(
@@ -47,7 +76,6 @@ public final class IamServiceTestHelper {
         }
     }
 
-    @SuppressWarnings("unchecked")
     public static IamService iamServiceWithSessionCredential(
             String accessKeyId, String secretAccessKey, String sessionToken) {
         return iamServiceWithSessionCredential(
