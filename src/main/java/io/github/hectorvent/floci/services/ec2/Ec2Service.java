@@ -2123,6 +2123,11 @@ public class Ec2Service implements ContainerTeardown {
         return new LaunchTemplateData(versionData(launchTemplate, resolvedVersion));
     }
 
+    public LaunchTemplate resolveLaunchTemplate(String region, String id, String name) {
+        ensureDefaultResources(region);
+        return findLaunchTemplate(region, id, name);
+    }
+
     public LaunchTemplate deleteLaunchTemplate(String region, String id, String name) {
         ensureDefaultResources(region);
         LaunchTemplate launchTemplate = findLaunchTemplate(region, id, name);

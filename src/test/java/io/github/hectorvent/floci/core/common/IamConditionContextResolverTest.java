@@ -25,6 +25,7 @@ class IamConditionContextResolverTest {
                     mock(KmsService.class),
                     null,
                     null,
+                    null,
                     null);
 
     @Test
