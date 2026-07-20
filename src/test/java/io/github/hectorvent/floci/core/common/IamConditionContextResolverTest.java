@@ -24,6 +24,7 @@ class IamConditionContextResolverTest {
                     new AwsJsonRequestResolver(new ObjectMapper()),
                     mock(KmsService.class),
                     null,
+                    null,
                     null);
 
     @Test

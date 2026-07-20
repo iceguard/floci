@@ -76,6 +76,7 @@ public class ResourceArnBuilder {
             case "kms"            -> buildKmsArn(ctx, path, region, accountId);
             case "iam"            -> buildIamArn(ctx, accountId);
             case "rds"            -> buildRdsArn(ctx, region, accountId);
+            case "elasticloadbalancing" -> buildElbArn(ctx, region, accountId);
             default               -> "*";
         };
     }
@@ -184,7 +185,28 @@ public class ResourceArnBuilder {
 
     public List<AuthorizationRequest> additionalAuthorizations(
             String action, String primaryResource, Map<String, List<String>> conditionContext) {
+        if (!hasRequestTags(conditionContext)) {
+            return List.of();
+        }
+        Map<String, List<String>> addTagsContext = new LinkedHashMap<>(conditionContext);
+        if ("elasticloadbalancing:CreateTargetGroup".equals(action)) {
+            addTagsContext.put("elasticloadbalancing:CreateAction", List.of("CreateTargetGroup"));
+            return List.of(new AuthorizationRequest(
+                    "elasticloadbalancing:AddTags", primaryResource, Map.copyOf(addTagsContext)));
+        }
+        if ("elasticloadbalancing:CreateListener".equals(action)) {
+            addTagsContext.put("elasticloadbalancing:CreateAction", List.of("CreateListener"));
+            return List.of(new AuthorizationRequest(
+                    "elasticloadbalancing:AddTags",
+                    futureListenerArn(primaryResource),
+                    Map.copyOf(addTagsContext)));
+        }
         return List.of();
+    }
+
+    private static boolean hasRequestTags(Map<String, List<String>> conditionContext) {
+        return conditionContext != null && conditionContext.keySet().stream()
+                .anyMatch(key -> key.regionMatches(true, 0, "aws:RequestTag/", 0, 15));
     }
 
     public record AuthorizationRequest(
@@ -416,6 +438,22 @@ public class ResourceArnBuilder {
         };
     }
 
+    // ── Elastic Load Balancing v2 ───────────────────────────────────────────────
+    private String buildElbArn(ContainerRequestContext ctx, String region, String accountId) {
+        String action = formRequestResolver.firstParameter(ctx, "Action");
+        return switch (action == null ? "" : action) {
+            case "CreateLoadBalancer" -> futureLoadBalancerArn(ctx, region, accountId);
+            case "CreateTargetGroup" -> futureTargetGroupArn(ctx, region, accountId);
+            case "CreateListener" -> exactFormResource(ctx, "LoadBalancerArn");
+            case "DeleteListener" -> exactFormResource(ctx, "ListenerArn");
+            case "DeleteLoadBalancer" -> exactFormResource(ctx, "LoadBalancerArn");
+            case "DeleteTargetGroup", "DeregisterTargets", "ModifyTargetGroup",
+                    "ModifyTargetGroupAttributes", "RegisterTargets" ->
+                    exactFormResource(ctx, "TargetGroupArn");
+            default -> "*";
+        };
+    }
+
     private String requestedRdsArn(
             ContainerRequestContext ctx,
             String region,
@@ -427,6 +465,45 @@ public class ResourceArnBuilder {
             return "*";
         }
         return AwsArnUtils.Arn.of("rds", region, accountId, resourceType + ":" + name).toString();
+    }
+
+    private String futureLoadBalancerArn(ContainerRequestContext ctx, String region, String accountId) {
+        String name = formRequestResolver.firstParameter(ctx, "Name");
+        if (name == null || name.isBlank()) {
+            return "*";
+        }
+        String loadBalancerType = formRequestResolver.firstParameter(ctx, "Type");
+        String resourceType = switch (loadBalancerType == null ? "" : loadBalancerType) {
+            case "network" -> "net";
+            case "gateway" -> "gwy";
+            default -> "app";
+        };
+        return AwsArnUtils.Arn.of("elasticloadbalancing", region, accountId,
+                "loadbalancer/" + resourceType + "/" + name + "/0000000000000000").toString();
+    }
+
+    private String futureTargetGroupArn(ContainerRequestContext ctx, String region, String accountId) {
+        String name = formRequestResolver.firstParameter(ctx, "Name");
+        return name == null || name.isBlank()
+                ? "*"
+                : AwsArnUtils.Arn.of("elasticloadbalancing", region, accountId,
+                        "targetgroup/" + name + "/0000000000000000").toString();
+    }
+
+    private static String futureListenerArn(String loadBalancerArn) {
+        String marker = ":loadbalancer/";
+        int markerIndex = loadBalancerArn == null ? -1 : loadBalancerArn.indexOf(marker);
+        if (markerIndex < 0) {
+            return "*";
+        }
+        return loadBalancerArn.substring(0, markerIndex)
+                + ":listener/" + loadBalancerArn.substring(markerIndex + marker.length())
+                + "/0000000000000000";
+    }
+
+    private String exactFormResource(ContainerRequestContext ctx, String parameter) {
+        String resource = formRequestResolver.firstParameter(ctx, parameter);
+        return resource == null || resource.isBlank() ? "*" : resource;
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.rds.RdsService;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -24,18 +25,21 @@ public class IamConditionContextResolver {
     private final KmsService kmsService;
     private final RdsService rdsService;
     private final RequestContext requestContext;
+    private final ElbV2Service elbV2Service;
 
     @Inject
     public IamConditionContextResolver(AwsFormRequestResolver formRequestResolver,
                                        AwsJsonRequestResolver jsonRequestResolver,
                                        KmsService kmsService,
                                        RdsService rdsService,
-                                       RequestContext requestContext) {
+                                       RequestContext requestContext,
+                                       ElbV2Service elbV2Service) {
         this.formRequestResolver = formRequestResolver;
         this.jsonRequestResolver = jsonRequestResolver;
         this.kmsService = kmsService;
         this.rdsService = rdsService;
         this.requestContext = requestContext;
+        this.elbV2Service = elbV2Service;
     }
 
     public Map<String, List<String>> resolve(String credentialScope, String action,
@@ -45,8 +49,64 @@ public class IamConditionContextResolver {
             case "iam" -> iamConditionContext(action, ctx);
             case "kms" -> kmsConditionContext(action, ctx, region);
             case "rds" -> rdsConditionContext(action, ctx);
+            case "elasticloadbalancing" -> elbConditionContext(action, ctx);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> elbConditionContext(
+            String action, ContainerRequestContext ctx) {
+        boolean create = "elasticloadbalancing:CreateLoadBalancer".equals(action)
+                || "elasticloadbalancing:CreateTargetGroup".equals(action)
+                || "elasticloadbalancing:CreateListener".equals(action);
+        boolean createListener = "elasticloadbalancing:CreateListener".equals(action);
+        boolean deleteListener = "elasticloadbalancing:DeleteListener".equals(action);
+        boolean loadBalancerMutation = "elasticloadbalancing:DeleteLoadBalancer".equals(action);
+        boolean targetGroupMutation = switch (action) {
+            case "elasticloadbalancing:DeleteTargetGroup",
+                    "elasticloadbalancing:DeregisterTargets",
+                    "elasticloadbalancing:ModifyTargetGroup",
+                    "elasticloadbalancing:ModifyTargetGroupAttributes",
+                    "elasticloadbalancing:RegisterTargets" -> true;
+            default -> false;
+        };
+        if (!create && !deleteListener && !loadBalancerMutation && !targetGroupMutation) {
+            return null;
+        }
+
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if (create) {
+            readFormTags(ctx, "Tags.member", conditions);
+        }
+        if (loadBalancerMutation || targetGroupMutation) {
+            String resourceArn = formRequestResolver.firstParameter(
+                    ctx, loadBalancerMutation ? "LoadBalancerArn" : "TargetGroupArn");
+            if (resourceArn != null && !resourceArn.isBlank()) {
+                elbV2Service.describeTags(List.of(resourceArn))
+                        .getOrDefault(resourceArn, Map.of())
+                        .forEach((tagKey, tagValue) ->
+                                conditions.put("aws:ResourceTag/" + tagKey, List.of(tagValue)));
+            }
+        }
+        if (createListener && formRequestResolver != null && elbV2Service != null) {
+            String loadBalancerArn = formRequestResolver.firstParameter(ctx, "LoadBalancerArn");
+            if (loadBalancerArn != null && !loadBalancerArn.isBlank()) {
+                elbV2Service.describeTags(List.of(loadBalancerArn))
+                        .getOrDefault(loadBalancerArn, Map.of())
+                        .forEach((tagKey, tagValue) ->
+                                conditions.put("aws:ResourceTag/" + tagKey, List.of(tagValue)));
+            }
+        }
+        if (deleteListener && formRequestResolver != null && elbV2Service != null) {
+            String listenerArn = formRequestResolver.firstParameter(ctx, "ListenerArn");
+            if (listenerArn != null && !listenerArn.isBlank()) {
+                elbV2Service.describeTags(List.of(listenerArn))
+                        .getOrDefault(listenerArn, Map.of())
+                        .forEach((tagKey, tagValue) ->
+                                conditions.put("aws:ResourceTag/" + tagKey, List.of(tagValue)));
+            }
+        }
+        return conditions.isEmpty() ? null : conditions;
     }
 
     private Map<String, List<String>> iamConditionContext(String action, ContainerRequestContext ctx) {

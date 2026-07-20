@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.iam;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.PolicyStatement;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -58,6 +59,13 @@ public class IamPolicyEvaluator {
     }
 
     private static final Logger LOG = Logger.getLogger(IamPolicyEvaluator.class);
+    private static final String ELB_ADD_TAGS = "elasticloadbalancing:AddTags";
+    private static final String ELB_CREATE_ACTION = "elasticloadbalancing:createaction";
+    private static final Map<String, String> ELB_CREATE_RESOURCE_PREFIXES = Map.of(
+            "CreateListener", "listener/",
+            "CreateLoadBalancer", "loadbalancer/",
+            "CreateRule", "listener-rule/",
+            "CreateTargetGroup", "targetgroup/");
 
     private final ObjectMapper objectMapper;
 
@@ -147,18 +155,18 @@ public class IamPolicyEvaluator {
         List<PolicyStatement> boundaryStmts = caller.boundaryPolicyDocument() == null
                 ? null : parseAll(List.of(caller.boundaryPolicyDocument()));
 
-        if (anyExplicitDeny(identityStmts, action, resource, ctx)
-                || (sessionStmts != null && anyExplicitDeny(sessionStmts, action, resource, ctx))
-                || (boundaryStmts != null && anyExplicitDeny(boundaryStmts, action, resource, ctx))) {
+        if (anySimulationExplicitDeny(identityStmts, action, resource, ctx)
+                || (sessionStmts != null && anySimulationExplicitDeny(sessionStmts, action, resource, ctx))
+                || (boundaryStmts != null && anySimulationExplicitDeny(boundaryStmts, action, resource, ctx))) {
             return SimulationDecision.EXPLICIT_DENY;
         }
-        if (!anyExplicitAllow(identityStmts, action, resource, ctx)) {
+        if (!anySimulationExplicitAllow(identityStmts, action, resource, ctx)) {
             return SimulationDecision.IMPLICIT_DENY;
         }
-        if (sessionStmts != null && !anyExplicitAllow(sessionStmts, action, resource, ctx)) {
+        if (sessionStmts != null && !anySimulationExplicitAllow(sessionStmts, action, resource, ctx)) {
             return SimulationDecision.IMPLICIT_DENY;
         }
-        if (boundaryStmts != null && !anyExplicitAllow(boundaryStmts, action, resource, ctx)) {
+        if (boundaryStmts != null && !anySimulationExplicitAllow(boundaryStmts, action, resource, ctx)) {
             return SimulationDecision.IMPLICIT_DENY;
         }
         return SimulationDecision.ALLOWED;
@@ -213,11 +221,41 @@ public class IamPolicyEvaluator {
         return false;
     }
 
+    private boolean anySimulationExplicitDeny(
+            List<PolicyStatement> statements,
+            String action,
+            String resource,
+            Map<String, List<String>> context) {
+        return statements.stream()
+                .anyMatch(statement -> statement.isDeny()
+                        && matchesSimulationStatement(statement, action, resource, context));
+    }
+
+    private boolean anySimulationExplicitAllow(
+            List<PolicyStatement> statements,
+            String action,
+            String resource,
+            Map<String, List<String>> context) {
+        return statements.stream()
+                .anyMatch(statement -> statement.isAllow()
+                        && matchesSimulationStatement(statement, action, resource, context));
+    }
+
     private boolean matchesStatement(PolicyStatement stmt, String action, String resource,
                                       Map<String, List<String>> ctx) {
         return matchesAction(stmt, action)
                 && matchesResource(stmt, resource)
                 && matchesConditions(stmt.getConditions(), ctx);
+    }
+
+    private boolean matchesSimulationStatement(
+            PolicyStatement statement,
+            String action,
+            String resource,
+            Map<String, List<String>> context) {
+        return matchesAction(statement, action)
+                && matchesSimulationResource(statement, action, resource, context)
+                && matchesConditions(statement.getConditions(), context);
     }
 
     /** Action: matches if any Action pattern matches; NotAction: matches if NO pattern matches. */
@@ -238,6 +276,57 @@ public class IamPolicyEvaluator {
         }
         if (stmt.getNotResources() != null) {
             return !matchesAny(stmt.getNotResources(), resource);
+        }
+        return false;
+    }
+
+    private boolean matchesSimulationResource(
+            PolicyStatement statement,
+            String action,
+            String resource,
+            Map<String, List<String>> context) {
+        List<String> createActions = context.get(ELB_CREATE_ACTION);
+        if (!ELB_ADD_TAGS.equalsIgnoreCase(action)
+                || !"*".equals(resource)
+                || createActions == null
+                || createActions.stream().noneMatch(ELB_CREATE_RESOURCE_PREFIXES::containsKey)) {
+            return matchesResource(statement, resource);
+        }
+
+        if (statement.getResources() != null) {
+            return matchesAny(statement.getResources(), resource)
+                    || matchesElbCreationResource(statement.getResources(), createActions);
+        }
+        if (statement.getNotResources() != null) {
+            return !(matchesAny(statement.getNotResources(), resource)
+                    || matchesElbCreationResource(statement.getNotResources(), createActions));
+        }
+        return false;
+    }
+
+    private boolean matchesElbCreationResource(List<String> patterns, List<String> createActions) {
+        for (String pattern : patterns) {
+            AwsArnUtils.Arn arn;
+            try {
+                arn = AwsArnUtils.parse(pattern);
+            }
+            catch (IllegalArgumentException malformed) {
+                continue;
+            }
+            if (!"aws".equals(arn.partition())
+                    || !"elasticloadbalancing".equals(arn.service())
+                    || arn.region().isBlank()
+                    || arn.accountId().isBlank()
+                    || arn.region().contains("*")
+                    || arn.accountId().contains("*")) {
+                continue;
+            }
+            for (String createAction : createActions) {
+                String resourcePrefix = ELB_CREATE_RESOURCE_PREFIXES.get(createAction);
+                if (resourcePrefix != null && arn.resource().startsWith(resourcePrefix)) {
+                    return true;
+                }
+            }
         }
         return false;
     }
