@@ -330,6 +330,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if ("s3".equals(credentialScope)) {
             return s3XmlError(code, message);
         }
+        if ("ec2".equals(credentialScope)) {
+            return ec2XmlAccessDenied(message);
+        }
         if (isFormEncoded(requestMediaType)) {
             return queryXmlError(code, message);
         }
@@ -364,6 +367,21 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                   .elem("Message", message)
                   .elem("RequestId", UUID.randomUUID().toString())
                 .end("Error")
+                .build();
+        return Response.status(403).type(MediaType.APPLICATION_XML).entity(xml).build();
+    }
+
+    private static Response ec2XmlAccessDenied(String message) {
+        String xml = new XmlBuilder()
+                .start("Response")
+                  .start("Errors")
+                    .start("Error")
+                      .elem("Code", "UnauthorizedOperation")
+                      .elem("Message", message)
+                    .end("Error")
+                  .end("Errors")
+                  .elem("RequestID", UUID.randomUUID().toString())
+                .end("Response")
                 .build();
         return Response.status(403).type(MediaType.APPLICATION_XML).entity(xml).build();
     }

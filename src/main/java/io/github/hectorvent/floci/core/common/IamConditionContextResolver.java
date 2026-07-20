@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.rds.RdsService;
@@ -26,6 +27,7 @@ public class IamConditionContextResolver {
     private final RdsService rdsService;
     private final RequestContext requestContext;
     private final ElbV2Service elbV2Service;
+    private final Ec2Service ec2Service;
 
     @Inject
     public IamConditionContextResolver(AwsFormRequestResolver formRequestResolver,
@@ -33,13 +35,15 @@ public class IamConditionContextResolver {
                                        KmsService kmsService,
                                        RdsService rdsService,
                                        RequestContext requestContext,
-                                       ElbV2Service elbV2Service) {
+                                       ElbV2Service elbV2Service,
+                                       Ec2Service ec2Service) {
         this.formRequestResolver = formRequestResolver;
         this.jsonRequestResolver = jsonRequestResolver;
         this.kmsService = kmsService;
         this.rdsService = rdsService;
         this.requestContext = requestContext;
         this.elbV2Service = elbV2Service;
+        this.ec2Service = ec2Service;
     }
 
     public Map<String, List<String>> resolve(String credentialScope, String action,
@@ -50,8 +54,66 @@ public class IamConditionContextResolver {
             case "kms" -> kmsConditionContext(action, ctx, region);
             case "rds" -> rdsConditionContext(action, ctx);
             case "elasticloadbalancing" -> elbConditionContext(action, ctx);
+            case "ec2" -> ec2ConditionContext(action, ctx, region);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> ec2ConditionContext(
+            String action, ContainerRequestContext ctx, String region) {
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if (region != null && !region.isBlank()) {
+            conditions.put("aws:RequestedRegion", List.of(region));
+        }
+        if ("ec2:CreateLaunchTemplate".equals(action)) {
+            readLaunchTemplateRequestTags(ctx, conditions);
+        } else if ("ec2:DeleteLaunchTemplate".equals(action)) {
+            addLaunchTemplateResourceTags(ctx, region, conditions);
+        } else {
+            return null;
+        }
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    private void readLaunchTemplateRequestTags(
+            ContainerRequestContext ctx, Map<String, List<String>> conditions) {
+        for (int specification = 1; ; specification++) {
+            String prefix = "TagSpecification." + specification;
+            String resourceType = formRequestResolver.firstParameter(ctx, prefix + ".ResourceType");
+            if (resourceType == null) {
+                return;
+            }
+            if (!"launch-template".equals(resourceType)) {
+                continue;
+            }
+            for (int tag = 1; ; tag++) {
+                String tagPrefix = prefix + ".Tag." + tag;
+                String key = formRequestResolver.firstParameter(ctx, tagPrefix + ".Key");
+                if (key == null) {
+                    break;
+                }
+                String value = formRequestResolver.firstParameter(ctx, tagPrefix + ".Value");
+                if (value != null) {
+                    conditions.put("aws:RequestTag/" + key, List.of(value));
+                }
+            }
+        }
+    }
+
+    private void addLaunchTemplateResourceTags(
+            ContainerRequestContext ctx, String region, Map<String, List<String>> conditions) {
+        String id = formRequestResolver.firstParameter(ctx, "LaunchTemplateId");
+        String name = formRequestResolver.firstParameter(ctx, "LaunchTemplateName");
+        try {
+            ec2Service.resolveLaunchTemplate(region, id, name).getTags().forEach(tag -> {
+                if (tag.getKey() != null && tag.getValue() != null) {
+                    conditions.put("aws:ResourceTag/" + tag.getKey(), List.of(tag.getValue()));
+                }
+            });
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve EC2 launch template tags for {0}: {1}",
+                    id != null ? id : name, e.getMessage());
+        }
     }
 
     private Map<String, List<String>> elbConditionContext(
@@ -99,22 +161,6 @@ public class IamConditionContextResolver {
                     .getOrDefault(resourceArn, Map.of())
                     .forEach((tagKey, tagValue) ->
                             conditions.put("aws:ResourceTag/" + tagKey, List.of(tagValue)));
-        }
-    }
-
-    private void readFormTags(
-            ContainerRequestContext ctx,
-            String prefix,
-            Map<String, List<String>> conditions) {
-        for (int index = 1; ; index++) {
-            String key = formRequestResolver.firstParameter(ctx, prefix + "." + index + ".Key");
-            if (key == null) {
-                return;
-            }
-            String value = formRequestResolver.firstParameter(ctx, prefix + "." + index + ".Value");
-            if (value != null) {
-                conditions.put("aws:RequestTag/" + key, List.of(value));
-            }
         }
     }
 

@@ -77,6 +77,7 @@ public class ResourceArnBuilder {
             case "iam"            -> buildIamArn(ctx, accountId);
             case "rds"            -> buildRdsArn(ctx, region, accountId);
             case "elasticloadbalancing" -> buildElbArn(ctx, region, accountId);
+            case "ec2"            -> buildEc2Arn(ctx, region, accountId);
             default               -> "*";
         };
     }
@@ -185,6 +186,12 @@ public class ResourceArnBuilder {
 
     public List<AuthorizationRequest> additionalAuthorizations(
             String action, String primaryResource, Map<String, List<String>> conditionContext) {
+        if ("ec2:CreateLaunchTemplate".equals(action) && hasRequestTags(conditionContext)) {
+            Map<String, List<String>> createTagsContext = new LinkedHashMap<>(conditionContext);
+            createTagsContext.put("ec2:CreateAction", List.of("CreateLaunchTemplate"));
+            return List.of(new AuthorizationRequest(
+                    "ec2:CreateTags", primaryResource, Map.copyOf(createTagsContext)));
+        }
         if (!hasRequestTags(conditionContext)) {
             return List.of();
         }
@@ -452,6 +459,31 @@ public class ResourceArnBuilder {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────────
+
+    private String buildEc2Arn(ContainerRequestContext ctx, String region, String accountId) {
+        String action = formRequestResolver.firstParameter(ctx, "Action");
+        if ("CreateLaunchTemplate".equals(action)) {
+            return AwsArnUtils.Arn.of("ec2", region, accountId,
+                    "launch-template/lt-00000000000000000").toString();
+        }
+        if (!"DeleteLaunchTemplate".equals(action)) {
+            return "*";
+        }
+        String id = formRequestResolver.firstParameter(ctx, "LaunchTemplateId");
+        String name = formRequestResolver.firstParameter(ctx, "LaunchTemplateName");
+        try {
+            String resolvedId = ec2Service.resolveLaunchTemplate(region, id, name).getLaunchTemplateId();
+            return AwsArnUtils.Arn.of(
+                    "ec2", region, accountId, "launch-template/" + resolvedId).toString();
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve EC2 launch template resource {0}: {1}",
+                    id != null ? id : name, e.getMessage());
+            return id == null || id.isBlank()
+                    ? "*"
+                    : AwsArnUtils.Arn.of(
+                            "ec2", region, accountId, "launch-template/" + id).toString();
+        }
+    }
 
     private String buildElbArn(ContainerRequestContext ctx, String region, String accountId) {
         String action = formRequestResolver.firstParameter(ctx, "Action");
