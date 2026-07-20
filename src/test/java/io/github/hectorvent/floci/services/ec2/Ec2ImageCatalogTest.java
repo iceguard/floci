@@ -35,7 +35,6 @@ class Ec2ImageCatalogTest {
                 "ami-ubuntu2204",
                 "ami-ubuntu2404-arm64",
                 "ami-ubuntu2404-amd64",
-                "ami-ubuntu2404-cloud-arm64",
                 "ami-debian12",
                 "ami-alpine",
                 "ami-0abcdef1234567893"), imageIds);
@@ -44,6 +43,7 @@ class Ec2ImageCatalogTest {
         assertTrue(imageCatalog.findByIdOrAlias("ami-amazonlinux2023").isPresent());
         assertTrue(imageCatalog.findByIdOrAlias("ami-ubuntu2004").isPresent());
         assertTrue(imageCatalog.findByIdOrAlias("ami-ubuntu2404").isPresent());
+        assertTrue(imageCatalog.findByIdOrAlias("ami-ubuntu2404-cloud-arm64").isPresent());
         assertTrue(imageCatalog.findByIdOrAlias("ami-ubuntu2404-cloud").isPresent());
     }
 
@@ -52,7 +52,8 @@ class Ec2ImageCatalogTest {
         imageCatalog.images()
                 .forEach(image -> assertEquals(image.dockerImage, amiImageResolver.resolve(image.imageId)));
 
-        List.of("ami-amazonlinux2", "ami-amazonlinux2023", "ami-ubuntu2004", "ami-ubuntu2404")
+        List.of("ami-amazonlinux2", "ami-amazonlinux2023", "ami-ubuntu2004", "ami-ubuntu2404",
+                        "ami-ubuntu2404-cloud-arm64", "ami-ubuntu2404-cloud")
                 .forEach(alias -> assertEquals(
                         imageCatalog.findByIdOrAlias(alias).orElseThrow().dockerImage,
                         amiImageResolver.resolve(alias)));
@@ -60,9 +61,10 @@ class Ec2ImageCatalogTest {
 
     @Test
     void resolverExposesCloudImageGuestRuntimeMetadata() {
-        ResolvedAmiImage image = amiImageResolver.resolveImage("ami-ubuntu2404-cloud");
+        ResolvedAmiImage image = amiImageResolver.resolveImage("ami-ubuntu2404-arm64");
 
-        assertEquals("floci/ami-ubuntu:24.04-arm64", image.dockerImage());
+        assertEquals("floci/ami-ubuntu:24.04-arm64-sha256-15188696da114a3ffd3d3554f5858a0c3ac257933656e85feb4e0e83ad542b4a",
+                image.dockerImage());
         assertEquals(ResolvedAmiImage.SYSTEMD_RUNTIME, image.guestRuntime());
         assertTrue(image.cloudInit());
         assertTrue(image.systemd());
