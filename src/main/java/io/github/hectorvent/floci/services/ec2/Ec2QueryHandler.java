@@ -13,13 +13,10 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
-import java.io.ByteArrayInputStream;
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.zip.GZIPInputStream;
 
 @ApplicationScoped
 public class Ec2QueryHandler {
@@ -536,12 +533,7 @@ public class Ec2QueryHandler {
         String clientToken = p.getFirst("ClientToken");
         List<String> sgIds = getList(p, "SecurityGroupId");
 
-        // UserData is base64-encoded in the wire format
-        String userDataEncoded = p.getFirst("UserData");
-        String userData = null;
-        if (userDataEncoded != null && !userDataEncoded.isBlank()) {
-            userData = decodeUserData(userDataEncoded);
-        }
+        Ec2UserData userData = Ec2UserData.fromEncoded(p.getFirst("UserData"));
 
         String iamInstanceProfileArn = resolveIamInstanceProfileArn(p);
 
@@ -565,7 +557,9 @@ public class Ec2QueryHandler {
             imageId = firstNonBlank(imageId, launchTemplateData.getImageId());
             instanceType = firstNonBlank(instanceType, launchTemplateData.getInstanceType());
             keyName = firstNonBlank(keyName, launchTemplateData.getKeyName());
-            userData = firstNonBlank(userData, launchTemplateData.getUserData());
+            if (userData == null) {
+                userData = Ec2UserData.fromEncoded(launchTemplateData.getEncodedUserData());
+            }
             iamInstanceProfileArn = firstNonBlank(iamInstanceProfileArn, launchTemplateData.getIamInstanceProfileArn());
             if (sgIds.isEmpty()) {
                 sgIds = new ArrayList<>(launchTemplateData.getSecurityGroupIds());
@@ -578,7 +572,7 @@ public class Ec2QueryHandler {
             }
         }
 
-        Reservation res = service.runInstances(region, imageId, instanceType, minCount, maxCount,
+        Reservation res = service.runInstancesWithUserData(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn);
 
         XmlBuilder xml = new XmlBuilder()
@@ -828,6 +822,8 @@ public class Ec2QueryHandler {
             xml.start("disableApiStop").elem("value", String.valueOf(inst.isDisableApiStop())).end("disableApiStop");
         } else if ("disableApiTermination".equals(attribute)) {
             xml.start("disableApiTermination").elem("value", String.valueOf(inst.isDisableApiTermination())).end("disableApiTermination");
+        } else if ("userData".equals(attribute) && inst.getEncodedUserData() != null) {
+            xml.start("userData").elem("value", inst.getEncodedUserData()).end("userData");
         } else if ("groupSet".equals(attribute)) {
             xml.start("groupSet");
             for (GroupIdentifier gi : inst.getSecurityGroups()) {
@@ -1976,7 +1972,6 @@ public class Ec2QueryHandler {
     // ─── Launch Template handlers ─────────────────────────────────────────────
 
     private Response handleCreateLaunchTemplate(MultivaluedMap<String, String> p, String region) {
-        String encodedUserData = p.getFirst("LaunchTemplateData.UserData");
         LaunchTemplate launchTemplate = service.createLaunchTemplate(
                 region,
                 p.getFirst("LaunchTemplateName"),
@@ -1984,8 +1979,7 @@ public class Ec2QueryHandler {
                 p.getFirst("LaunchTemplateData.InstanceType"),
                 p.getFirst("LaunchTemplateData.KeyName"),
                 parseLaunchTemplateSecurityGroupIds(p),
-                decodeUserData(encodedUserData),
-                encodedUserData,
+                Ec2UserData.fromEncoded(p.getFirst("LaunchTemplateData.UserData")),
                 resolveIamInstanceProfileArn(p, "LaunchTemplateData.IamInstanceProfile"),
                 parseTagsForResource(p, "launch-template"),
                 parseLaunchTemplateDataTagsForResource(p, "instance"));
@@ -1998,7 +1992,6 @@ public class Ec2QueryHandler {
     }
 
     private Response handleCreateLaunchTemplateVersion(MultivaluedMap<String, String> p, String region) {
-        String encodedUserData = p.getFirst("LaunchTemplateData.UserData");
         LaunchTemplate launchTemplate = service.createLaunchTemplateVersion(
                 region,
                 p.getFirst("LaunchTemplateId"),
@@ -2008,8 +2001,7 @@ public class Ec2QueryHandler {
                 p.getFirst("LaunchTemplateData.InstanceType"),
                 p.getFirst("LaunchTemplateData.KeyName"),
                 parseLaunchTemplateSecurityGroupIds(p),
-                decodeUserData(encodedUserData),
-                encodedUserData,
+                Ec2UserData.fromEncoded(p.getFirst("LaunchTemplateData.UserData")),
                 resolveIamInstanceProfileArn(p, "LaunchTemplateData.IamInstanceProfile"),
                 parseLaunchTemplateDataTagsForResource(p, "instance"));
         XmlBuilder xml = new XmlBuilder()
@@ -2576,27 +2568,6 @@ public class Ec2QueryHandler {
         return new ArrayList<>(groups);
     }
 
-    private String decodeUserData(String userDataEncoded) {
-        if (userDataEncoded == null || userDataEncoded.isBlank()) {
-            return null;
-        }
-        byte[] decoded;
-        try {
-            decoded = Base64.getDecoder().decode(userDataEncoded);
-        } catch (IllegalArgumentException e) {
-            throw new AwsException("InvalidParameterValue", "UserData is not valid base64 content.", 400);
-        }
-        if (decoded.length >= 2 && (decoded[0] & 0xff) == 0x1f && (decoded[1] & 0xff) == 0x8b) {
-            try (GZIPInputStream gzip = new GZIPInputStream(new ByteArrayInputStream(decoded))) {
-                decoded = gzip.readAllBytes();
-            }
-            catch (IOException e) {
-                throw new AwsException("InvalidParameterValue", "UserData is not valid gzip content.", 400);
-            }
-        }
-        return new String(decoded, StandardCharsets.UTF_8);
-    }
-
     private String vpcEndpointXml(VpcEndpoint endpoint) {
         XmlBuilder xml = new XmlBuilder()
                 .elem("vpcEndpointId", endpoint.getVpcEndpointId())
@@ -2859,11 +2830,7 @@ public class Ec2QueryHandler {
         String keyName = p.getFirst("LaunchSpecification.KeyName");
         String subnetId = p.getFirst("LaunchSpecification.SubnetId");
         List<String> securityGroupIds = getList(p, "LaunchSpecification.SecurityGroupId");
-        String userDataEncoded = p.getFirst("LaunchSpecification.UserData");
-        String userData = null;
-        if (userDataEncoded != null && !userDataEncoded.isBlank()) {
-            userData = new String(Base64.getDecoder().decode(userDataEncoded), StandardCharsets.UTF_8);
-        }
+        Ec2UserData userData = Ec2UserData.fromEncoded(p.getFirst("LaunchSpecification.UserData"));
         String iamInstanceProfileArn = p.getFirst("LaunchSpecification.IamInstanceProfile.Arn");
 
         // Parse TagSpecifications
@@ -2970,9 +2937,8 @@ public class Ec2QueryHandler {
             }
             xml.end("groupSet");
 
-            if (spec.getUserData() != null) {
-                String encodedUserData = Base64.getEncoder().encodeToString(spec.getUserData().getBytes(StandardCharsets.UTF_8));
-                xml.elem("userData", encodedUserData);
+            if (spec.getEncodedUserData() != null) {
+                xml.elem("userData", spec.getEncodedUserData());
             }
             if (spec.getIamInstanceProfileArn() != null) {
                 xml.start("iamInstanceProfile")

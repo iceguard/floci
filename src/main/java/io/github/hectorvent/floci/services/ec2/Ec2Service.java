@@ -606,6 +606,16 @@ public class Ec2Service implements ContainerTeardown {
                                     List<String> securityGroupIds, String subnetId,
                                     String clientToken, List<Tag> instanceTags,
                                     String userData, String iamInstanceProfileArn) {
+        return runInstancesWithUserData(region, imageId, instanceType, minCount, maxCount, keyName,
+                securityGroupIds, subnetId, clientToken, instanceTags,
+                Ec2UserData.fromText(userData), iamInstanceProfileArn);
+    }
+
+    public Reservation runInstancesWithUserData(String region, String imageId, String instanceType,
+                                                int minCount, int maxCount, String keyName,
+                                                List<String> securityGroupIds, String subnetId,
+                                                String clientToken, List<Tag> instanceTags,
+                                                Ec2UserData userData, String iamInstanceProfileArn) {
         if (imageId == null || imageId.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter ImageId", 400);
         }
@@ -672,7 +682,7 @@ public class Ec2Service implements ContainerTeardown {
             inst.setAmiLaunchIndex(i);
             inst.setClientToken(clientToken);
             inst.setRegion(region);
-            inst.setUserData(userData);
+            inst.setEncodedUserData(userData != null ? userData.encoded() : null);
             inst.setIamInstanceProfileArn(iamInstanceProfileArn);
             if (instanceTags != null && !instanceTags.isEmpty()) {
                 inst.setTags(new ArrayList<>(instanceTags));
@@ -1821,8 +1831,7 @@ public class Ec2Service implements ContainerTeardown {
 
     public LaunchTemplate createLaunchTemplate(String region, String name, String imageId,
                                                String instanceType, String keyName,
-                                               List<String> securityGroupIds, String userData,
-                                               String encodedUserData,
+                                               List<String> securityGroupIds, Ec2UserData userData,
                                                String iamInstanceProfileArn,
                                                List<Tag> launchTemplateTags, List<Tag> instanceTags) {
         ensureDefaultResources(region);
@@ -1845,8 +1854,7 @@ public class Ec2Service implements ContainerTeardown {
         launchTemplate.setImageId(imageId);
         launchTemplate.setInstanceType(instanceType);
         launchTemplate.setKeyName(keyName);
-        launchTemplate.setUserData(userData);
-        launchTemplate.setEncodedUserData(encodedUserData);
+        launchTemplate.setEncodedUserData(userData != null ? userData.encoded() : null);
         launchTemplate.setIamInstanceProfileArn(iamInstanceProfileArn);
         if (securityGroupIds != null) {
             launchTemplate.setSecurityGroupIds(new ArrayList<>(securityGroupIds));
@@ -1863,11 +1871,23 @@ public class Ec2Service implements ContainerTeardown {
         return launchTemplate;
     }
 
+    public LaunchTemplate createLaunchTemplate(String region, String name, String imageId,
+                                               String instanceType, String keyName,
+                                               List<String> securityGroupIds, String userData,
+                                               String encodedUserData,
+                                               String iamInstanceProfileArn,
+                                               List<Tag> launchTemplateTags, List<Tag> instanceTags) {
+        Ec2UserData exactUserData = encodedUserData != null
+                ? Ec2UserData.fromEncoded(encodedUserData)
+                : Ec2UserData.fromText(userData);
+        return createLaunchTemplate(region, name, imageId, instanceType, keyName, securityGroupIds,
+                exactUserData, iamInstanceProfileArn, launchTemplateTags, instanceTags);
+    }
+
     public LaunchTemplate createLaunchTemplateVersion(String region, String id, String name,
                                                       String sourceVersion,
                                                       String imageId, String instanceType, String keyName,
-                                                      List<String> securityGroupIds, String userData,
-                                                      String encodedUserData,
+                                                      List<String> securityGroupIds, Ec2UserData userData,
                                                       String iamInstanceProfileArn,
                                                       List<Tag> instanceTags) {
         ensureDefaultResources(region);
@@ -1886,9 +1906,8 @@ public class Ec2Service implements ContainerTeardown {
         if (keyName != null && !keyName.isBlank()) {
             data.setKeyName(keyName);
         }
-        if (userData != null && !userData.isBlank()) {
-            data.setUserData(userData);
-            data.setEncodedUserData(encodedUserData);
+        if (userData != null) {
+            data.setEncodedUserData(userData.encoded());
         }
         if (iamInstanceProfileArn != null && !iamInstanceProfileArn.isBlank()) {
             data.setIamInstanceProfileArn(iamInstanceProfileArn);
@@ -1903,6 +1922,20 @@ public class Ec2Service implements ContainerTeardown {
         applyData(launchTemplate, data);
         launchTemplates.put(key(region, launchTemplate.getLaunchTemplateId()), launchTemplate);
         return launchTemplate;
+    }
+
+    public LaunchTemplate createLaunchTemplateVersion(String region, String id, String name,
+                                                      String sourceVersion,
+                                                      String imageId, String instanceType, String keyName,
+                                                      List<String> securityGroupIds, String userData,
+                                                      String encodedUserData,
+                                                      String iamInstanceProfileArn,
+                                                      List<Tag> instanceTags) {
+        Ec2UserData exactUserData = encodedUserData != null
+                ? Ec2UserData.fromEncoded(encodedUserData)
+                : Ec2UserData.fromText(userData);
+        return createLaunchTemplateVersion(region, id, name, sourceVersion, imageId, instanceType,
+                keyName, securityGroupIds, exactUserData, iamInstanceProfileArn, instanceTags);
     }
 
     public List<LaunchTemplate> describeLaunchTemplateVersions(String region, String id, String name,
@@ -2039,7 +2072,6 @@ public class Ec2Service implements ContainerTeardown {
         data.setImageId(launchTemplate.getImageId());
         data.setInstanceType(launchTemplate.getInstanceType());
         data.setKeyName(launchTemplate.getKeyName());
-        data.setUserData(launchTemplate.getUserData());
         data.setEncodedUserData(launchTemplate.getEncodedUserData());
         data.setIamInstanceProfileArn(launchTemplate.getIamInstanceProfileArn());
         data.setSecurityGroupIds(launchTemplate.getSecurityGroupIds());
@@ -2051,7 +2083,6 @@ public class Ec2Service implements ContainerTeardown {
         launchTemplate.setImageId(data.getImageId());
         launchTemplate.setInstanceType(data.getInstanceType());
         launchTemplate.setKeyName(data.getKeyName());
-        launchTemplate.setUserData(data.getUserData());
         launchTemplate.setEncodedUserData(data.getEncodedUserData());
         launchTemplate.setIamInstanceProfileArn(data.getIamInstanceProfileArn());
         launchTemplate.setSecurityGroupIds(new ArrayList<>(data.getSecurityGroupIds()));
@@ -3135,7 +3166,7 @@ public class Ec2Service implements ContainerTeardown {
     public List<SpotInstanceRequest> requestSpotInstances(String region, String spotPrice, Integer instanceCount,
                                                          String type, String productDescription, String imageId, String instanceType,
                                                          String keyName, String subnetId, List<String> securityGroupIds,
-                                                         String userData, String iamInstanceProfileArn,
+                                                         Ec2UserData userData, String iamInstanceProfileArn,
                                                          List<Tag> spotRequestTags, List<Tag> instanceTags) {
         ensureDefaultResources(region);
 
@@ -3147,7 +3178,7 @@ public class Ec2Service implements ContainerTeardown {
         for (int i = 0; i < count; i++) {
             String spotRequestId = "sir-" + randomHex(8);
 
-            Reservation reservation = runInstances(region, imageId, instanceType, 1, 1, keyName,
+            Reservation reservation = runInstancesWithUserData(region, imageId, instanceType, 1, 1, keyName,
                     securityGroupIds, subnetId, null, instanceTags, userData, iamInstanceProfileArn);
 
             Instance launchedInstance = reservation.getInstances().get(0);
@@ -3157,7 +3188,7 @@ public class Ec2Service implements ContainerTeardown {
             spec.setInstanceType(launchedInstance.getInstanceType());
             spec.setKeyName(launchedInstance.getKeyName());
             spec.setSubnetId(launchedInstance.getSubnetId());
-            spec.setUserData(userData);
+            spec.setEncodedUserData(userData != null ? userData.encoded() : null);
             spec.setIamInstanceProfileArn(iamInstanceProfileArn);
 
             if (launchedInstance.getSecurityGroups() != null) {

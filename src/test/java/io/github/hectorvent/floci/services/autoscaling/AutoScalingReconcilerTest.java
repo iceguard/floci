@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.Ec2UserData;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
@@ -82,6 +83,7 @@ class AutoScalingReconcilerTest {
         version.setLatestVersionNumber("1");
         version.setImageId("ami-version-1");
         version.setInstanceType("t3.micro");
+        version.setEncodedUserData("/wAJ");
         version.setIamInstanceProfileArn("arn:aws:iam::000000000000:instance-profile/app-profile");
         List<Tag> instanceTags = List.of(new Tag("app.ClusterId", "development"));
         List<Tag> propagatedTags = List.of(new Tag("app.ClusterId", "development"), new Tag("job-id", "2001"));
@@ -94,9 +96,10 @@ class AutoScalingReconcilerTest {
         ec2Instance.setInstanceId("i-launched");
         Reservation reservation = new Reservation();
         reservation.setInstances(List.of(ec2Instance));
-        when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
+        when(ec2Service.runInstancesWithUserData(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
-                anyList(), eq(null), eq("arn:aws:iam::000000000000:instance-profile/app-profile"))).thenReturn(reservation);
+                anyList(), org.mockito.ArgumentMatchers.any(Ec2UserData.class),
+                eq("arn:aws:iam::000000000000:instance-profile/app-profile"))).thenReturn(reservation);
 
         reconciler.reconcile(asg);
 
@@ -105,9 +108,12 @@ class AutoScalingReconcilerTest {
         assertEquals("lt-123", asg.getInstances().getFirst().getLaunchTemplateId());
         assertEquals("1", asg.getInstances().getFirst().getLaunchTemplateVersion());
         ArgumentCaptor<List<Tag>> tags = ArgumentCaptor.captor();
-        verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
+        ArgumentCaptor<Ec2UserData> userData = ArgumentCaptor.forClass(Ec2UserData.class);
+        verify(ec2Service).runInstancesWithUserData(eq("us-east-1"), eq("ami-version-1"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
-                tags.capture(), eq(null), eq("arn:aws:iam::000000000000:instance-profile/app-profile"));
+                tags.capture(), userData.capture(),
+                eq("arn:aws:iam::000000000000:instance-profile/app-profile"));
+        assertEquals("/wAJ", userData.getValue().encoded());
         assertEquals(propagatedTags.size(), tags.getValue().size());
         assertEquals("app.ClusterId", tags.getValue().get(0).getKey());
         assertEquals("development", tags.getValue().get(0).getValue());
@@ -142,7 +148,7 @@ class AutoScalingReconcilerTest {
         ec2Instance.setInstanceId("i-launched");
         Reservation reservation = new Reservation();
         reservation.setInstances(List.of(ec2Instance));
-        when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-7"), eq("t3.micro"),
+        when(ec2Service.runInstancesWithUserData(eq("us-east-1"), eq("ami-version-7"), eq("t3.micro"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
                 eq(List.of()), eq(null), eq(null))).thenReturn(reservation);
 
@@ -191,7 +197,7 @@ class AutoScalingReconcilerTest {
         ec2Instance.setInstanceId("i-launched");
         Reservation reservation = new Reservation();
         reservation.setInstances(List.of(ec2Instance));
-        when(ec2Service.runInstances(eq("us-east-1"), eq("ami-version-3"), eq("t3.small"),
+        when(ec2Service.runInstancesWithUserData(eq("us-east-1"), eq("ami-version-3"), eq("t3.small"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
                 eq(List.of()), eq(null), eq(null))).thenReturn(reservation);
 
@@ -202,7 +208,7 @@ class AutoScalingReconcilerTest {
         assertEquals("lt-123", asg.getInstances().getFirst().getLaunchTemplateId());
         assertEquals("3", asg.getInstances().getFirst().getLaunchTemplateVersion());
         assertEquals("t3.small", asg.getInstances().getFirst().getInstanceType());
-        verify(ec2Service).runInstances(eq("us-east-1"), eq("ami-version-3"), eq("t3.small"),
+        verify(ec2Service).runInstancesWithUserData(eq("us-east-1"), eq("ami-version-3"), eq("t3.small"),
                 eq(1), eq(1), eq(null), eq(List.of()), eq(null), eq(null),
                 eq(List.of()), eq(null), eq(null));
     }
@@ -261,7 +267,7 @@ class AutoScalingReconcilerTest {
 
         assertEquals(1, asg.getInstances().size());
         assertEquals("i-pending", asg.getInstances().getFirst().getInstanceId());
-        verify(ec2Service, never()).runInstances(
+        verify(ec2Service, never()).runInstancesWithUserData(
                 eq("us-east-1"),
                 org.mockito.ArgumentMatchers.any(),
                 org.mockito.ArgumentMatchers.any(),
