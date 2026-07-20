@@ -64,6 +64,12 @@ class IamEnforcementFilterTest {
         when(services.iam()).thenReturn(iamConfig);
         when(iamConfig.enforcementEnabled()).thenReturn(true);
         when(config.defaultRegion()).thenReturn("us-east-1");
+        when(arnBuilder.resourceAuthorizations(any(), any(), any(), any(), any()))
+                .thenReturn(List.of());
+        when(arnBuilder.additionalResources(any(), any(), any(), any()))
+                .thenReturn(List.of());
+        when(arnBuilder.additionalAuthorizations(any(), any(), any()))
+                .thenReturn(List.of());
     }
 
     @Test
@@ -94,7 +100,8 @@ class IamEnforcementFilterTest {
                 eq("arn:aws:lambda:us-east-1:222233334444:function:fn"),
                 isNull()))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
-        when(conditionContextResolver.resolve("lambda", "lambda:InvokeFunction", containerRequest))
+        when(conditionContextResolver.resolve(
+                "lambda", "lambda:InvokeFunction", containerRequest, "us-east-1"))
                 .thenReturn(null);
 
         IamEnforcementFilter filter = new IamEnforcementFilter(
@@ -110,7 +117,8 @@ class IamEnforcementFilterTest {
     @Test
     void filterPassesS3ListBucketConditionContext() {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
-        Map<String, String> conditions = Map.of("s3:prefix", "my_namespace/table/");
+        Map<String, List<String>> conditions = Map.of(
+                "s3:prefix", List.of("my_namespace/table/"));
 
         String auth = "AWS4-HMAC-SHA256 Credential=ASIASESSION/20260706/us-east-1/s3/aws4_request, "
                 + "SignedHeaders=host, Signature=abc";
@@ -127,7 +135,8 @@ class IamEnforcementFilterTest {
                         ]}""")));
         when(arnBuilder.build("s3", containerRequest, "us-east-1", "222233334444"))
                 .thenReturn("arn:aws:s3:::bucket");
-        when(conditionContextResolver.resolve("s3", "s3:ListBucket", containerRequest))
+        when(conditionContextResolver.resolve(
+                "s3", "s3:ListBucket", containerRequest, "us-east-1"))
                 .thenReturn(conditions);
         when(evaluator.evaluate(any(), isNull(), eq("s3:ListBucket"), eq("arn:aws:s3:::bucket"), eq(conditions)))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);

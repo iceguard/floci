@@ -18,6 +18,7 @@ import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.ext.Provider;
 import org.jboss.logging.Logger;
 
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Matcher;
@@ -118,9 +119,52 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         String accountId = requestContext.getAccountId() == null
                 ? accountResolver.resolve(auth)
                 : requestContext.getAccountId();
+
+        List<ResourceArnBuilder.AuthorizationRequest> resourceAuthorizations =
+                arnBuilder.resourceAuthorizations(
+                        credentialScope, action, ctx, region, accountId);
+        if (!resourceAuthorizations.isEmpty()) {
+            for (ResourceArnBuilder.AuthorizationRequest authorization : resourceAuthorizations) {
+                if (denied(caller, authorization.action(), authorization.resource(),
+                        authorization.conditionContext(), akid, ctx, region, accountId)) {
+                    ctx.abortWith(accessDeniedResponse(
+                            authorization.action(), credentialScope, ctx.getMediaType()));
+                    return;
+                }
+            }
+            return;
+        }
+
         String resource = arnBuilder.build(credentialScope, ctx, region, accountId);
 
-        Map<String, String> conditionContext = conditionContextResolver.resolve(credentialScope, action, ctx);
+        Map<String, List<String>> conditionContext =
+                conditionContextResolver.resolve(credentialScope, action, ctx, region);
+        if (denied(caller, action, resource, conditionContext, akid, ctx, region, accountId)) {
+            ctx.abortWith(accessDeniedResponse(action, credentialScope, ctx.getMediaType()));
+            return;
+        }
+        for (String additionalResource : arnBuilder.additionalResources(
+                credentialScope, ctx, region, accountId)) {
+            if (denied(caller, action, additionalResource, conditionContext,
+                    akid, ctx, region, accountId)) {
+                ctx.abortWith(accessDeniedResponse(action, credentialScope, ctx.getMediaType()));
+                return;
+            }
+        }
+        for (ResourceArnBuilder.AuthorizationRequest authorization :
+                arnBuilder.additionalAuthorizations(action, resource, conditionContext)) {
+            if (denied(caller, authorization.action(), authorization.resource(),
+                    authorization.conditionContext(), akid, ctx, region, accountId)) {
+                ctx.abortWith(accessDeniedResponse(
+                        authorization.action(), credentialScope, ctx.getMediaType()));
+                return;
+            }
+        }
+    }
+
+    private boolean denied(CallerContext caller, String action, String resource,
+                           Map<String, List<String>> conditionContext, String akid,
+                           ContainerRequestContext ctx, String region, String accountId) {
         Decision decision = evaluator.evaluate(caller, null, action, resource, conditionContext);
         if (decision == Decision.DENY) {
             LOG.infov("IAM enforcement DENY: akid={0} action={1} resource={2}", akid, action, resource);
@@ -129,8 +173,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                     + " on resource: \"" + resource + "\""
                     + " because no identity-based policy allows the " + action + " action";
             emitS3DenialIfApplicable(akid, action, resource, ctx, region, denyMessage);
-            ctx.abortWith(accessDeniedResponse(action, credentialScope, ctx.getMediaType()));
+            return true;
         }
+        return false;
     }
 
     /**
