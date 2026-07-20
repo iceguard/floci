@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.rds;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsQueryResponse;
@@ -52,22 +53,22 @@ public class RdsQueryHandler {
                 case "CreateDBInstance" -> handleCreateDbInstance(params, region);
                 case "DescribeDBInstances" -> handleDescribeDbInstances(params);
                 case "DeleteDBInstance" -> handleDeleteDbInstance(params);
-                case "ModifyDBInstance" -> handleModifyDbInstance(params);
+                case "ModifyDBInstance" -> handleModifyDbInstance(params, region);
                 case "RebootDBInstance" -> handleRebootDbInstance(params);
                 case "DescribeOrderableDBInstanceOptions" -> handleDescribeOrderableDbInstanceOptions(params);
                 case "CreateDBSubnetGroup" -> handleCreateDbSubnetGroup(params, region);
                 case "DescribeDBSubnetGroups" -> handleDescribeDbSubnetGroups(params, region);
                 case "ModifyDBSubnetGroup" -> handleModifyDbSubnetGroup(params, region);
-                case "DeleteDBSubnetGroup" -> handleDeleteDbSubnetGroup(params);
+                case "DeleteDBSubnetGroup" -> handleDeleteDbSubnetGroup(params, region);
                 case "CreateDBCluster" -> handleCreateDbCluster(params, region);
                 case "DescribeDBClusters" -> handleDescribeDbClusters(params);
                 case "DeleteDBCluster" -> handleDeleteDbCluster(params);
                 case "ModifyDBCluster" -> handleModifyDbCluster(params);
-                case "CreateDBParameterGroup" -> handleCreateDbParameterGroup(params);
-                case "DescribeDBParameterGroups" -> handleDescribeDbParameterGroups(params);
-                case "DeleteDBParameterGroup" -> handleDeleteDbParameterGroup(params);
-                case "ModifyDBParameterGroup" -> handleModifyDbParameterGroup(params);
-                case "DescribeDBParameters" -> handleDescribeDbParameters(params);
+                case "CreateDBParameterGroup" -> handleCreateDbParameterGroup(params, region);
+                case "DescribeDBParameterGroups" -> handleDescribeDbParameterGroups(params, region);
+                case "DeleteDBParameterGroup" -> handleDeleteDbParameterGroup(params, region);
+                case "ModifyDBParameterGroup" -> handleModifyDbParameterGroup(params, region);
+                case "DescribeDBParameters" -> handleDescribeDbParameters(params, region);
                 case "CreateDBClusterParameterGroup" -> handleCreateDbClusterParameterGroup(params);
                 case "DescribeDBClusterParameterGroups" -> handleDescribeDbClusterParameterGroups(params);
                 case "DeleteDBClusterParameterGroup" -> handleDeleteDbClusterParameterGroup(params);
@@ -116,6 +117,10 @@ public class RdsQueryHandler {
         Map<String, String> tags = parseTags(params);
         String availabilityZone = params.getFirst("AvailabilityZone");
         boolean multiAz = "true".equalsIgnoreCase(params.getFirst("MultiAZ"));
+        Boolean requestedAutoMinorVersionUpgrade = parseOptionalBoolean(
+                params.getFirst("AutoMinorVersionUpgrade"), "AutoMinorVersionUpgrade");
+        boolean autoMinorVersionUpgrade = requestedAutoMinorVersionUpgrade == null
+                || requestedAutoMinorVersionUpgrade;
 
         if (dbInstanceClass == null) {
             dbInstanceClass = "db.t3.micro";
@@ -129,7 +134,8 @@ public class RdsQueryHandler {
             DbInstance instance = service.createDbInstance(id, engine, engineVersion, masterUsername,
                     masterPassword, dbName, dbInstanceClass, allocatedStorage, iamEnabled,
                     paramGroupName, dbSubnetGroupName, dbClusterIdentifier, availabilityZone, multiAz,
-                    manageMasterUserPassword, masterUserSecretKmsKeyId, tags, vpcSecurityGroupIds, region);
+                    manageMasterUserPassword, masterUserSecretKmsKeyId, tags, vpcSecurityGroupIds, region,
+                    autoMinorVersionUpgrade);
             String result = dbInstanceXml(instance);
             return Response.ok(AwsQueryResponse.envelope("CreateDBInstance", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -170,7 +176,7 @@ public class RdsQueryHandler {
         }
     }
 
-    private Response handleModifyDbInstance(MultivaluedMap<String, String> params) {
+    private Response handleModifyDbInstance(MultivaluedMap<String, String> params, String region) {
         String id = params.getFirst("DBInstanceIdentifier");
         if (id == null || id.isBlank()) {
             return AwsQueryResponse.error("InvalidParameterValue", "DBInstanceIdentifier is required.", AwsNamespaces.RDS, 400);
@@ -179,10 +185,13 @@ public class RdsQueryHandler {
         String iamStr = params.getFirst("EnableIAMDatabaseAuthentication");
         Boolean iamEnabled = iamStr != null ? Boolean.parseBoolean(iamStr) : null;
         String dbSubnetGroupName = params.getFirst("DBSubnetGroupName");
+        Boolean autoMinorVersionUpgrade = parseOptionalBoolean(
+                params.getFirst("AutoMinorVersionUpgrade"), "AutoMinorVersionUpgrade");
         try {
             List<String> vpcSecurityGroupIds = vpcSecurityGroupIds(params);
             DbInstance instance = service.modifyDbInstance(
-                    id, newPassword, iamEnabled, dbSubnetGroupName, vpcSecurityGroupIds);
+                    id, newPassword, iamEnabled, dbSubnetGroupName, vpcSecurityGroupIds, region,
+                    autoMinorVersionUpgrade);
             String result = dbInstanceXml(instance);
             return Response.ok(AwsQueryResponse.envelope("ModifyDBInstance", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -254,8 +263,9 @@ public class RdsQueryHandler {
         }
         String description = params.getFirst("DBSubnetGroupDescription");
         List<String> subnetIds = memberList(params, "SubnetIds");
+        Map<String, String> tags = parseTags(params);
         try {
-            DbSubnetGroup group = service.createDbSubnetGroup(name, description, subnetIds, region);
+            DbSubnetGroup group = service.createDbSubnetGroup(name, description, subnetIds, region, tags);
             return Response.ok(AwsQueryResponse.envelope("CreateDBSubnetGroup",
                     AwsNamespaces.RDS, dbSubnetGroupXml(group))).build();
         } catch (AwsException e) {
@@ -294,14 +304,14 @@ public class RdsQueryHandler {
         }
     }
 
-    private Response handleDeleteDbSubnetGroup(MultivaluedMap<String, String> params) {
+    private Response handleDeleteDbSubnetGroup(MultivaluedMap<String, String> params, String region) {
         String name = params.getFirst("DBSubnetGroupName");
         if (name == null || name.isBlank()) {
             return AwsQueryResponse.error("InvalidParameterValue",
                     "DBSubnetGroupName is required.", AwsNamespaces.RDS, 400);
         }
         try {
-            service.deleteDbSubnetGroup(name);
+            service.deleteDbSubnetGroup(name, region);
             return Response.ok(AwsQueryResponse.envelope("DeleteDBSubnetGroup", AwsNamespaces.RDS, "")).build();
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
@@ -408,7 +418,7 @@ public class RdsQueryHandler {
 
     // ── Parameter Groups ──────────────────────────────────────────────────────
 
-    private Response handleCreateDbParameterGroup(MultivaluedMap<String, String> params) {
+    private Response handleCreateDbParameterGroup(MultivaluedMap<String, String> params, String region) {
         String name = params.getFirst("DBParameterGroupName");
         String family = params.getFirst("DBParameterGroupFamily");
         String description = params.getFirst("Description");
@@ -416,7 +426,7 @@ public class RdsQueryHandler {
             return AwsQueryResponse.error("InvalidParameterValue", "DBParameterGroupName is required.", AwsNamespaces.RDS, 400);
         }
         try {
-            DbParameterGroup group = service.createDbParameterGroup(name, family, description);
+            DbParameterGroup group = service.createDbParameterGroup(name, family, description, region, parseTags(params));
             String result = paramGroupXml(group);
             return Response.ok(AwsQueryResponse.envelope("CreateDBParameterGroup", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -424,10 +434,10 @@ public class RdsQueryHandler {
         }
     }
 
-    private Response handleDescribeDbParameterGroups(MultivaluedMap<String, String> params) {
+    private Response handleDescribeDbParameterGroups(MultivaluedMap<String, String> params, String region) {
         String filterName = params.getFirst("DBParameterGroupName");
         try {
-            Collection<DbParameterGroup> result = service.listDbParameterGroups(filterName);
+            Collection<DbParameterGroup> result = service.listDbParameterGroups(filterName, region);
             XmlBuilder xml = new XmlBuilder().start("DBParameterGroups");
             for (DbParameterGroup g : result) {
                 xml.start("DBParameterGroup").raw(paramGroupInnerXml(g)).end("DBParameterGroup");
@@ -439,20 +449,20 @@ public class RdsQueryHandler {
         }
     }
 
-    private Response handleDeleteDbParameterGroup(MultivaluedMap<String, String> params) {
+    private Response handleDeleteDbParameterGroup(MultivaluedMap<String, String> params, String region) {
         String name = params.getFirst("DBParameterGroupName");
         if (name == null || name.isBlank()) {
             return AwsQueryResponse.error("InvalidParameterValue", "DBParameterGroupName is required.", AwsNamespaces.RDS, 400);
         }
         try {
-            service.deleteDbParameterGroup(name);
+            service.deleteDbParameterGroup(name, region);
             return Response.ok(AwsQueryResponse.envelopeNoResult("DeleteDBParameterGroup", AwsNamespaces.RDS)).build();
         } catch (AwsException e) {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
         }
     }
 
-    private Response handleModifyDbParameterGroup(MultivaluedMap<String, String> params) {
+    private Response handleModifyDbParameterGroup(MultivaluedMap<String, String> params, String region) {
         String name = params.getFirst("DBParameterGroupName");
         if (name == null || name.isBlank()) {
             return AwsQueryResponse.error("InvalidParameterValue", "DBParameterGroupName is required.", AwsNamespaces.RDS, 400);
@@ -469,7 +479,7 @@ public class RdsQueryHandler {
             }
         }
         try {
-            DbParameterGroup group = service.modifyDbParameterGroup(name, parameters);
+            DbParameterGroup group = service.modifyDbParameterGroup(name, parameters, region);
             String result = new XmlBuilder()
                     .elem("DBParameterGroupName", group.getDbParameterGroupName())
                     .build();
@@ -479,13 +489,13 @@ public class RdsQueryHandler {
         }
     }
 
-    private Response handleDescribeDbParameters(MultivaluedMap<String, String> params) {
+    private Response handleDescribeDbParameters(MultivaluedMap<String, String> params, String region) {
         String name = params.getFirst("DBParameterGroupName");
         if (name == null || name.isBlank()) {
             return AwsQueryResponse.error("InvalidParameterValue", "DBParameterGroupName is required.", AwsNamespaces.RDS, 400);
         }
         try {
-            DbParameterGroup group = service.getDbParameterGroup(name);
+            DbParameterGroup group = service.getDbParameterGroup(name, region);
             XmlBuilder xml = new XmlBuilder().start("Parameters");
             for (Map.Entry<String, String> entry : group.getParameters().entrySet()) {
                 xml.start("member")
@@ -651,6 +661,7 @@ public class RdsQueryHandler {
                .end("Endpoint");
         }
         xml.elem("IAMDatabaseAuthenticationEnabled", i.isIamDatabaseAuthenticationEnabled())
+           .elem("AutoMinorVersionUpgrade", i.isAutoMinorVersionUpgrade())
            .elem("MultiAZ", i.isMultiAz())
            .elem("StorageType", "gp2")
            .elem("PubliclyAccessible", false)
@@ -753,6 +764,21 @@ public class RdsQueryHandler {
                 .end("Tag"));
     }
 
+    private static Boolean parseOptionalBoolean(String value, String parameterName) {
+        if (value == null) {
+            return null;
+        }
+        if ("true".equalsIgnoreCase(value)) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(value)) {
+            return false;
+        }
+        throw new AwsException("InvalidParameterValue",
+                "Invalid value for " + parameterName + ": " + value
+                        + ". Valid values are true or false.", 400);
+    }
+
     private String dbClusterXml(DbCluster c) {
         return new XmlBuilder().start("DBCluster").raw(dbClusterInnerXml(c)).end("DBCluster").build();
     }
@@ -840,7 +866,8 @@ public class RdsQueryHandler {
         if (groupName == null || groupName.isBlank() || "default".equalsIgnoreCase(groupName)) {
             return fallbackSubnetGroup(instance, "default", "default subnet group");
         }
-        return service.getDbSubnetGroup(groupName);
+        String region = AwsArnUtils.regionOrDefault(instance.getDbInstanceArn(), null);
+        return service.getDbSubnetGroup(groupName, region);
     }
 
     private DbSubnetGroup fallbackSubnetGroup(DbInstance instance, String name, String description) {
@@ -878,6 +905,7 @@ public class RdsQueryHandler {
                 .elem("DBParameterGroupName", g.getDbParameterGroupName())
                 .elem("DBParameterGroupFamily", g.getDbParameterGroupFamily())
                 .elem("Description", g.getDescription())
+                .elem("DBParameterGroupArn", g.getDbParameterGroupArn())
                 .build();
     }
 
@@ -969,7 +997,8 @@ public class RdsQueryHandler {
             if (key == null) {
                 break;
             }
-            tags.put(key, params.getFirst(prefix + "." + i + ".Value"));
+            tags.put(key, java.util.Objects.requireNonNullElse(
+                    params.getFirst(prefix + "." + i + ".Value"), ""));
         }
     }
 

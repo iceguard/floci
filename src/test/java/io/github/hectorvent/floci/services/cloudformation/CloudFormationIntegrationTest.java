@@ -20,6 +20,7 @@ import java.util.Base64;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
@@ -36,6 +37,10 @@ import static org.hamcrest.Matchers.startsWith;
 class CloudFormationIntegrationTest {
 
     private static final String DYNAMODB_CONTENT_TYPE = "application/x-amz-json-1.0";
+    private static final String CFN_WEST_AUTH =
+            "AWS4-HMAC-SHA256 Credential=test/20260205/us-west-2/cloudformation/aws4_request";
+    private static final String RDS_WEST_AUTH =
+            "AWS4-HMAC-SHA256 Credential=test/20260205/us-west-2/rds/aws4_request";
     private static final String SSM_CONTENT_TYPE = "application/x-amz-json-1.1";
     private static final String SM_CONTENT_TYPE = "application/x-amz-json-1.1";
     private static final String COGNITO_CONTENT_TYPE = "application/x-amz-json-1.1";
@@ -5877,6 +5882,90 @@ class CloudFormationIntegrationTest {
                 .formParam("StackName", stackName)
                 .when().post("/")
                 .then().statusCode(200);
+    }
+
+    @Test
+    void createAndDeleteStack_rdsGroupsRemainInStackRegion() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "cfn-west-rds-groups-" + suffix;
+        String parameterGroupName = "cfn-west-parameters-" + suffix;
+        String subnetGroupName = "cfn-west-subnets-" + suffix;
+        String template = """
+                {
+                  "Resources": {
+                    "DbParameters": {
+                      "Type": "AWS::RDS::DBParameterGroup",
+                      "Properties": {
+                        "DBParameterGroupName": "%s",
+                        "Family": "postgres18",
+                        "Description": "west parameters"
+                      }
+                    },
+                    "DbSubnets": {
+                      "Type": "AWS::RDS::DBSubnetGroup",
+                      "Properties": {
+                        "DBSubnetGroupName": "%s",
+                        "DBSubnetGroupDescription": "west subnets",
+                        "SubnetIds": ["subnet-default-a", "subnet-default-b"]
+                      }
+                    }
+                  }
+                }
+                """.formatted(parameterGroupName, subnetGroupName);
+
+        given()
+                .contentType("application/x-www-form-urlencoded")
+                .header("Authorization", CFN_WEST_AUTH)
+                .formParam("Action", "CreateStack")
+                .formParam("StackName", stackName)
+                .formParam("TemplateBody", template)
+                .when().post("/")
+                .then().statusCode(200);
+
+        given()
+                .contentType("application/x-www-form-urlencoded")
+                .header("Authorization", RDS_WEST_AUTH)
+                .formParam("Action", "DescribeDBParameterGroups")
+                .formParam("DBParameterGroupName", parameterGroupName)
+                .when().post("/")
+                .then().statusCode(200)
+                .body(containsString(parameterGroupName));
+
+        given()
+                .contentType("application/x-www-form-urlencoded")
+                .header("Authorization", RDS_WEST_AUTH)
+                .formParam("Action", "DescribeDBSubnetGroups")
+                .formParam("DBSubnetGroupName", subnetGroupName)
+                .when().post("/")
+                .then().statusCode(200)
+                .body(containsString(subnetGroupName));
+
+        given()
+                .contentType("application/x-www-form-urlencoded")
+                .header("Authorization", CFN_WEST_AUTH)
+                .formParam("Action", "DeleteStack")
+                .formParam("StackName", stackName)
+                .when().post("/")
+                .then().statusCode(200);
+
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+            given()
+                    .contentType("application/x-www-form-urlencoded")
+                    .header("Authorization", RDS_WEST_AUTH)
+                    .formParam("Action", "DescribeDBParameterGroups")
+                    .formParam("DBParameterGroupName", parameterGroupName)
+                    .when().post("/")
+                    .then().statusCode(200)
+                    .body(not(containsString(parameterGroupName)));
+            given()
+                    .contentType("application/x-www-form-urlencoded")
+                    .header("Authorization", RDS_WEST_AUTH)
+                    .formParam("Action", "DescribeDBSubnetGroups")
+                    .formParam("DBSubnetGroupName", subnetGroupName)
+                    .when().post("/")
+                    .then().statusCode(404)
+                    .body(containsString("DBSubnetGroupNotFoundFault"));
+        });
     }
 
     @Test
