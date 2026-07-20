@@ -46,6 +46,7 @@ public class ResourceArnBuilder {
             case "ssm"            -> buildSsmArn(ctx, region, accountId);
             case "kms"            -> buildKmsArn(path, region, accountId);
             case "iam"            -> buildIamArn(ctx, accountId);
+            case "rds"            -> buildRdsArn(ctx, region, accountId);
             default               -> "*";
         };
     }
@@ -179,6 +180,47 @@ public class ResourceArnBuilder {
             LOG.debugv("Unable to resolve IAM role resource {0}: {1}", roleName, e.getMessage());
             return AwsArnUtils.Arn.of("iam", "", accountId, "role/" + roleName).toString();
         }
+    }
+
+    // ── RDS ─────────────────────────────────────────────────────────────────────
+    private String buildRdsArn(ContainerRequestContext ctx, String region, String accountId) {
+        String action = formRequestResolver.firstParameter(ctx, "Action");
+        if (action == null) {
+            return "*";
+        }
+        if ("AddTagsToResource".equals(action)
+                || "ListTagsForResource".equals(action)
+                || "RemoveTagsFromResource".equals(action)) {
+            String resourceName = formRequestResolver.firstParameter(ctx, "ResourceName");
+            return resourceName == null || resourceName.isBlank() ? "*" : resourceName;
+        }
+        return switch (action) {
+            case "CreateDBInstance", "DeleteDBInstance", "ModifyDBInstance", "RebootDBInstance" ->
+                    requestedRdsArn(ctx, region, accountId, "db", "DBInstanceIdentifier");
+            case "CreateDBParameterGroup", "DeleteDBParameterGroup", "ModifyDBParameterGroup" ->
+                    requestedRdsArn(ctx, region, accountId, "pg", "DBParameterGroupName");
+            case "CreateDBSubnetGroup", "DeleteDBSubnetGroup", "ModifyDBSubnetGroup" ->
+                    requestedRdsArn(ctx, region, accountId, "subgrp", "DBSubnetGroupName");
+            case "CreateDBCluster", "DeleteDBCluster", "ModifyDBCluster" ->
+                    requestedRdsArn(ctx, region, accountId, "cluster", "DBClusterIdentifier");
+            case "CreateDBClusterParameterGroup", "DeleteDBClusterParameterGroup",
+                    "ModifyDBClusterParameterGroup" -> requestedRdsArn(
+                    ctx, region, accountId, "cluster-pg", "DBClusterParameterGroupName");
+            default -> "*";
+        };
+    }
+
+    private String requestedRdsArn(
+            ContainerRequestContext ctx,
+            String region,
+            String accountId,
+            String resourceType,
+            String nameParameter) {
+        String name = formRequestResolver.firstParameter(ctx, nameParameter);
+        if (name == null || name.isBlank()) {
+            return "*";
+        }
+        return AwsArnUtils.Arn.of("rds", region, accountId, resourceType + ":" + name).toString();
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────────
