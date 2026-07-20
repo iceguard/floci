@@ -68,6 +68,7 @@ public class RdsSigV4Validator {
             String dateTime = findRawParam(rawPairs, "X-Amz-Date");
             String expires = findRawParam(rawPairs, "X-Amz-Expires");
             String credential = findRawParam(rawPairs, "X-Amz-Credential");
+            String sessionToken = findRawParam(rawPairs, "X-Amz-Security-Token");
             String signedHeaders = findRawParam(rawPairs, "X-Amz-SignedHeaders");
             String signature = findRawParam(rawPairs, "X-Amz-Signature");
 
@@ -101,7 +102,11 @@ public class RdsSigV4Validator {
             String service = credParts[3];
             String credentialScope = date + "/" + region + "/" + service + "/aws4_request";
 
-            String secretKey = iamService.findSecretKey(accessKeyId).orElse(accessKeyId);
+            String secretKey = iamService.findSigningSecret(accessKeyId, sessionToken).orElse(null);
+            if (secretKey == null) {
+                LOG.debugv("RDS IAM token has invalid temporary credentials for accessKey={0}", accessKeyId);
+                return false;
+            }
 
             // Canonical query string: sorted pairs, excluding X-Amz-Signature
             String canonicalQueryString = Arrays.stream(rawPairs)

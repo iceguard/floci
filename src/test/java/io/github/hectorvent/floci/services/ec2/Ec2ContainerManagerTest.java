@@ -125,6 +125,16 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void terminateTearsDownInstanceMetadataCredentials() {
+        LaunchHarness harness = launchHarness();
+        Instance instance = instance("i-terminated");
+
+        harness.manager.terminate(instance);
+
+        verify(harness.metadataServer, timeout(1000)).unregisterInstance(instance);
+    }
+
+    @Test
     void userDataExecutionCommandRunsScriptDirectlySoShebangIsHonored() {
         assertArrayEquals(new String[]{"/tmp/user-data.sh"}, Ec2ContainerManager.userDataExecutionCommand());
     }

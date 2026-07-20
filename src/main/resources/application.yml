@@ -53,9 +53,11 @@ quarkus:
       - --initialize-at-run-time=io.github.hectorvent.floci.services.ses.SesService
       - --initialize-at-run-time=io.github.hectorvent.floci.services.route53.Route53Service
       - --initialize-at-run-time=io.github.hectorvent.floci.services.kms.KmsService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.ec2.Ec2MetadataServer
       - --initialize-at-run-time=io.github.hectorvent.floci.services.cloudfront.CloudFrontService
       - --initialize-at-run-time=io.github.hectorvent.floci.services.emr.EmrService
       - --initialize-at-run-time=io.github.hectorvent.floci.services.elasticbeanstalk.ElasticBeanstalkService
+      - --initialize-at-run-time=io.github.hectorvent.floci.services.iam.StsQueryHandler
 
 
 floci:

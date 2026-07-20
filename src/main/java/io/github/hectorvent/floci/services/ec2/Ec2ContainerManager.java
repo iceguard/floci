@@ -403,6 +403,7 @@ public class Ec2ContainerManager {
                 portAllocator.release(sshHostPort);
             }
             metadataServer.unregisterContainer(containerIp, instance);
+            metadataServer.unregisterInstance(instance);
             instance.setState(InstanceState.terminated());
             instance.setTerminatedAt(System.currentTimeMillis());
         });

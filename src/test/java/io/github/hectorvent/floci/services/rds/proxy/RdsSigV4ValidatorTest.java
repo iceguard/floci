@@ -118,7 +118,7 @@ class RdsSigV4ValidatorTest {
                 5432,
                 "admin",
                 "AKIDUNKNOWN",
-                "wrong-secret",
+                "AKIDUNKNOWN",
                 Instant.now().minusSeconds(60),
                 900
         );
@@ -246,7 +246,9 @@ class RdsSigV4ValidatorTest {
     void validateAcceptsTokenSignedWithStsSessionCredentials() throws Exception {
         String accessKeyId = "ASIAIOSFODNN7EXAMPLE";
         String secretAccessKey = "sts-generated-secret-key";
-        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(accessKeyId, secretAccessKey);
+        String sessionToken = "sts-session-token";
+        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(
+                accessKeyId, secretAccessKey, sessionToken);
 
         RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
         String token = SigV4TokenTestHelper.createRdsToken(
@@ -255,6 +257,7 @@ class RdsSigV4ValidatorTest {
                 "admin",
                 accessKeyId,
                 secretAccessKey,
+                sessionToken,
                 Instant.now().minusSeconds(60),
                 900
         );
@@ -266,7 +269,9 @@ class RdsSigV4ValidatorTest {
     @Test
     void validateRejectsStsTokenWithWrongSecret() throws Exception {
         String accessKeyId = "ASIAIOSFODNN7EXAMPLE";
-        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(accessKeyId, "correct-secret");
+        String sessionToken = "sts-session-token";
+        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(
+                accessKeyId, "correct-secret", sessionToken);
 
         RdsSigV4Validator validator = new RdsSigV4Validator(iamService);
         String token = SigV4TokenTestHelper.createRdsToken(
@@ -275,11 +280,67 @@ class RdsSigV4ValidatorTest {
                 "admin",
                 accessKeyId,
                 "wrong-secret",
+                sessionToken,
                 Instant.now().minusSeconds(60),
                 900
         );
 
         assertFalse(validator.validate(token, "admin"),
                 "Validator must reject STS token signed with wrong secret");
+    }
+
+    @Test
+    void validateRejectsStsTokenWithoutSessionToken() throws Exception {
+        String accessKeyId = "ASIAMISSINGTOKEN";
+        String secretAccessKey = "temporary-secret";
+        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(
+                accessKeyId, secretAccessKey, "required-token");
+
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "admin", accessKeyId, secretAccessKey,
+                Instant.now().minusSeconds(60), 900);
+
+        assertFalse(new RdsSigV4Validator(iamService).validate(token, "admin"));
+    }
+
+    @Test
+    void validateRejectsStsTokenWithWrongSessionToken() throws Exception {
+        String accessKeyId = "ASIAWRONGTOKEN";
+        String secretAccessKey = "temporary-secret";
+        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(
+                accessKeyId, secretAccessKey, "required-token");
+
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "admin", accessKeyId, secretAccessKey,
+                "wrong-token", Instant.now().minusSeconds(60), 900);
+
+        assertFalse(new RdsSigV4Validator(iamService).validate(token, "admin"));
+    }
+
+    @Test
+    void validateRejectsExpiredStsCredential() throws Exception {
+        String accessKeyId = "ASIAEXPIREDTOKEN";
+        String secretAccessKey = "temporary-secret";
+        String sessionToken = "expired-token";
+        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(
+                accessKeyId, secretAccessKey, sessionToken, Instant.now().minusSeconds(1));
+
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "admin", accessKeyId, secretAccessKey,
+                sessionToken, Instant.now().minusSeconds(60), 900);
+
+        assertFalse(new RdsSigV4Validator(iamService).validate(token, "admin"));
+    }
+
+    @Test
+    void validateRejectsUnknownStsCredentialWithoutCompatibilityFallback() throws Exception {
+        String accessKeyId = "ASIAUNKNOWNRAWKEY";
+        IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDRDS", "secret-rds");
+
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "admin", accessKeyId, accessKeyId,
+                "unknown-token", Instant.now().minusSeconds(60), 900);
+
+        assertFalse(new RdsSigV4Validator(iamService).validate(token, "admin"));
     }
 }

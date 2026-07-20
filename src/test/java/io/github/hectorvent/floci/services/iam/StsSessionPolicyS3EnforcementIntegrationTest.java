@@ -18,6 +18,8 @@ class StsSessionPolicyS3EnforcementIntegrationTest {
 
     private static final String CALLER_ACCOUNT_ID = "111122223333";
     private static final String ROLE_ACCOUNT_ID = "222233334444";
+    private static final String TARGET_ACCOUNT_ID = "333344445555";
+    private static final String DEFAULT_ACCOUNT_ID = "000000000000";
     private static final String REGION = "us-east-1";
 
     @Test
@@ -30,10 +32,11 @@ class StsSessionPolicyS3EnforcementIntegrationTest {
         createRole(roleName);
         putBroadS3RolePolicy(roleName, bucket);
 
-        String accessKeyId = assumeRoleWithS3SessionPolicy(roleName, bucket);
+        SessionCredentials credentials = assumeRoleWithS3SessionPolicy(roleName, bucket);
 
         given()
-                .header("Authorization", auth(accessKeyId, "s3"))
+                .header("Authorization", auth(credentials.accessKeyId(), "s3"))
+                .header("X-Amz-Security-Token", credentials.sessionToken())
                 .contentType("text/plain")
                 .body("allowed")
         .when()
@@ -42,7 +45,8 @@ class StsSessionPolicyS3EnforcementIntegrationTest {
                 .statusCode(200);
 
         given()
-                .header("Authorization", auth(accessKeyId, "s3"))
+                .header("Authorization", auth(credentials.accessKeyId(), "s3"))
+                .header("X-Amz-Security-Token", credentials.sessionToken())
                 .contentType("text/plain")
                 .body("denied")
         .when()
@@ -65,10 +69,11 @@ class StsSessionPolicyS3EnforcementIntegrationTest {
         putObject(bucket, allowedPrefix + "metadata.json");
         putObject(bucket, "other_namespace/table_" + suffix + "/metadata.json");
 
-        String accessKeyId = assumeRoleWithS3ListPrefixSessionPolicy(roleName, bucket, allowedPrefix);
+        SessionCredentials credentials = assumeRoleWithS3ListPrefixSessionPolicy(roleName, bucket, allowedPrefix);
 
         given()
-                .header("Authorization", auth(accessKeyId, "s3"))
+                .header("Authorization", auth(credentials.accessKeyId(), "s3"))
+                .header("X-Amz-Security-Token", credentials.sessionToken())
                 .queryParam("list-type", "2")
                 .queryParam("prefix", allowedPrefix)
         .when()
@@ -78,7 +83,8 @@ class StsSessionPolicyS3EnforcementIntegrationTest {
                 .body(containsString("<Key>" + allowedPrefix + "metadata.json</Key>"));
 
         given()
-                .header("Authorization", auth(accessKeyId, "s3"))
+                .header("Authorization", auth(credentials.accessKeyId(), "s3"))
+                .header("X-Amz-Security-Token", credentials.sessionToken())
                 .queryParam("list-type", "2")
                 .queryParam("prefix", "other_namespace/table_" + suffix + "/")
         .when()
@@ -86,6 +92,187 @@ class StsSessionPolicyS3EnforcementIntegrationTest {
         .then()
                 .statusCode(403)
                 .body(containsString("<Code>AccessDenied</Code>"));
+    }
+
+    @Test
+    void getSessionTokenRetainsIssuingUserPolicyForRuntimeEnforcement() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String userName = "session-user-" + suffix;
+        String bucket = "session-user-policy-" + suffix;
+        createBucket(bucket);
+
+        given()
+                .formParam("Action", "CreateUser")
+                .formParam("UserName", userName)
+                .header("Authorization", auth(DEFAULT_ACCOUNT_ID, "iam"))
+            .when().post("/").then().statusCode(200);
+        given()
+                .formParam("Action", "PutUserPolicy")
+                .formParam("UserName", userName)
+                .formParam("PolicyName", "ListBucketsOnly")
+                .formParam("PolicyDocument", """
+                    {"Version":"2012-10-17","Statement":[
+                      {"Effect":"Deny","Action":["sts:GetSessionToken","sts:GetCallerIdentity"],
+                       "Resource":"*"},
+                      {"Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"*"}
+                    ]}
+                    """)
+                .header("Authorization", auth(DEFAULT_ACCOUNT_ID, "iam"))
+            .when().post("/").then().statusCode(200);
+        io.restassured.path.xml.XmlPath accessKey = given()
+                .formParam("Action", "CreateAccessKey")
+                .formParam("UserName", userName)
+                .header("Authorization", auth(DEFAULT_ACCOUNT_ID, "iam"))
+            .when().post("/").then().statusCode(200).extract().xmlPath();
+        String sourceAccessKeyId = accessKey.getString(
+                "CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId");
+
+        io.restassured.path.xml.XmlPath token = given()
+                .formParam("Action", "GetSessionToken")
+                .header("Authorization", auth(sourceAccessKeyId, "sts"))
+            .when().post("/").then().statusCode(200).extract().xmlPath();
+        String prefix = "GetSessionTokenResponse.GetSessionTokenResult.Credentials.";
+        SessionCredentials credentials = new SessionCredentials(
+                token.getString(prefix + "AccessKeyId"), token.getString(prefix + "SessionToken"));
+
+        given()
+                .formParam("Action", "GetCallerIdentity")
+                .header("Authorization", auth(credentials.accessKeyId(), "sts"))
+                .header("X-Amz-Security-Token", credentials.sessionToken())
+            .when().post("/")
+            .then().statusCode(200);
+
+        given()
+                .header("Authorization", auth(credentials.accessKeyId(), "s3"))
+                .header("X-Amz-Security-Token", credentials.sessionToken())
+            .when().get("/")
+            .then().statusCode(200);
+
+        given()
+                .header("Authorization", auth(credentials.accessKeyId(), "s3"))
+                .header("X-Amz-Security-Token", credentials.sessionToken())
+                .contentType("text/plain").body("denied")
+            .when().put("/" + bucket + "/denied.txt")
+            .then().statusCode(403).body(containsString("<Code>AccessDenied</Code>"));
+    }
+
+    @Test
+    void getSessionTokenCredentialsApplyMfaAndStsIntrinsicRestrictions() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String userName = "session-restrictions-" + suffix;
+
+        given()
+                .formParam("Action", "CreateUser")
+                .formParam("UserName", userName)
+                .header("Authorization", auth(DEFAULT_ACCOUNT_ID, "iam"))
+            .when().post("/").then().statusCode(200);
+        given()
+                .formParam("Action", "PutUserPolicy")
+                .formParam("UserName", userName)
+                .formParam("PolicyName", "BroadIamAndSts")
+                .formParam("PolicyDocument", """
+                    {"Version":"2012-10-17","Statement":[
+                      {"Effect":"Allow","Action":["iam:ListUsers","sts:*"],"Resource":"*"}
+                    ]}
+                    """)
+                .header("Authorization", auth(DEFAULT_ACCOUNT_ID, "iam"))
+            .when().post("/").then().statusCode(200);
+        io.restassured.path.xml.XmlPath accessKey = given()
+                .formParam("Action", "CreateAccessKey")
+                .formParam("UserName", userName)
+                .header("Authorization", auth(DEFAULT_ACCOUNT_ID, "iam"))
+            .when().post("/").then().statusCode(200).extract().xmlPath();
+        String sourceAccessKeyId = accessKey.getString(
+                "CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId");
+
+        io.restassured.path.xml.XmlPath withoutMfaResponse = given()
+                .formParam("Action", "GetSessionToken")
+                .header("Authorization", auth(sourceAccessKeyId, "sts"))
+            .when().post("/").then().statusCode(200).extract().xmlPath();
+        SessionCredentials withoutMfa = getSessionTokenCredentials(withoutMfaResponse);
+
+        given()
+                .formParam("Action", "ListUsers")
+                .header("Authorization", auth(withoutMfa.accessKeyId(), "iam"))
+                .header("X-Amz-Security-Token", withoutMfa.sessionToken())
+            .when().post("/")
+            .then().statusCode(403).body(containsString("<Code>AccessDenied</Code>"));
+        given()
+                .formParam("Action", "DecodeAuthorizationMessage")
+                .formParam("EncodedMessage", "message")
+                .header("Authorization", auth(withoutMfa.accessKeyId(), "sts"))
+                .header("X-Amz-Security-Token", withoutMfa.sessionToken())
+            .when().post("/")
+            .then().statusCode(403).body(containsString("<Code>AccessDenied</Code>"));
+        given()
+                .formParam("Action", "GetCallerIdentity")
+                .header("Authorization", auth(withoutMfa.accessKeyId(), "sts"))
+                .header("X-Amz-Security-Token", withoutMfa.sessionToken())
+            .when().post("/")
+            .then().statusCode(200);
+
+        given()
+                .formParam("Action", "GetSessionToken")
+                .formParam("SerialNumber", "arn:aws:iam::" + DEFAULT_ACCOUNT_ID + ":mfa/" + userName)
+                .formParam("TokenCode", "123456")
+                .header("Authorization", auth(sourceAccessKeyId, "sts"))
+            .when().post("/")
+            .then().statusCode(403)
+                .body(containsString("<Code>AccessDenied</Code>"))
+                .body(containsString("MultiFactorAuthentication failed"));
+    }
+
+    @Test
+    void assumedRoleSessionUsesAuthenticatedCallerAccountForChainedTrust() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String sourceRoleName = "SourceRole" + suffix;
+        String targetRoleName = "TargetRole" + suffix;
+        String targetRoleArn = "arn:aws:iam::" + TARGET_ACCOUNT_ID + ":role/" + targetRoleName;
+
+        createRole(sourceRoleName);
+        given()
+                .formParam("Action", "PutRolePolicy")
+                .formParam("RoleName", sourceRoleName)
+                .formParam("PolicyName", "AssumeTarget")
+                .formParam("PolicyDocument", """
+                    {"Version":"2012-10-17","Statement":[
+                      {"Effect":"Allow","Action":"sts:AssumeRole","Resource":"*"}
+                    ]}
+                    """)
+                .header("Authorization", auth(ROLE_ACCOUNT_ID, "iam"))
+            .when().post("/").then().statusCode(200);
+
+        given()
+                .formParam("Action", "CreateRole")
+                .formParam("RoleName", targetRoleName)
+                .formParam("Path", "/")
+                .formParam("AssumeRolePolicyDocument", """
+                    {"Version":"2012-10-17","Statement":[
+                      {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::%s:root"},
+                       "Action":"sts:AssumeRole"}
+                    ]}
+                    """.formatted(ROLE_ACCOUNT_ID))
+                .header("Authorization", auth(TARGET_ACCOUNT_ID, "iam"))
+            .when().post("/").then().statusCode(200);
+
+        io.restassured.path.xml.XmlPath first = given()
+                .formParam("Action", "AssumeRole")
+                .formParam("RoleArn", "arn:aws:iam::" + ROLE_ACCOUNT_ID + ":role/" + sourceRoleName)
+                .formParam("RoleSessionName", "source-session")
+                .header("Authorization", auth(CALLER_ACCOUNT_ID, "sts"))
+            .when().post("/").then().statusCode(200).extract().xmlPath();
+        SessionCredentials source = sessionCredentials(first);
+
+        io.restassured.path.xml.XmlPath second = given()
+                .formParam("Action", "AssumeRole")
+                .formParam("RoleArn", targetRoleArn)
+                .formParam("RoleSessionName", "target-session")
+                .header("Authorization", auth(source.accessKeyId(), "sts"))
+                .header("X-Amz-Security-Token", source.sessionToken())
+            .when().post("/").then().statusCode(200).extract().xmlPath();
+        org.junit.jupiter.api.Assertions.assertEquals(
+                "arn:aws:sts::" + TARGET_ACCOUNT_ID + ":assumed-role/" + targetRoleName + "/target-session",
+                second.getString("AssumeRoleResponse.AssumeRoleResult.AssumedRoleUser.Arn"));
     }
 
     private static void createBucket(String bucket) {
@@ -159,8 +346,8 @@ class StsSessionPolicyS3EnforcementIntegrationTest {
                 .statusCode(200);
     }
 
-    private static String assumeRoleWithS3SessionPolicy(String roleName, String bucket) {
-        return given()
+    private static SessionCredentials assumeRoleWithS3SessionPolicy(String roleName, String bucket) {
+        io.restassured.path.xml.XmlPath response = given()
                 .formParam("Action", "AssumeRole")
                 .formParam("RoleArn", "arn:aws:iam::" + ROLE_ACCOUNT_ID + ":role/" + roleName)
                 .formParam("RoleSessionName", "session-policy-test")
@@ -190,12 +377,13 @@ class StsSessionPolicyS3EnforcementIntegrationTest {
         .then()
                 .statusCode(200)
                 .body("AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId", startsWith("ASIA"))
-                .extract()
-                .path("AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId");
+                .extract().xmlPath();
+        return sessionCredentials(response);
     }
 
-    private static String assumeRoleWithS3ListPrefixSessionPolicy(String roleName, String bucket, String allowedPrefix) {
-        return given()
+    private static SessionCredentials assumeRoleWithS3ListPrefixSessionPolicy(
+            String roleName, String bucket, String allowedPrefix) {
+        io.restassured.path.xml.XmlPath response = given()
                 .formParam("Action", "AssumeRole")
                 .formParam("RoleArn", "arn:aws:iam::" + ROLE_ACCOUNT_ID + ":role/" + roleName)
                 .formParam("RoleSessionName", "session-policy-prefix-test")
@@ -234,9 +422,24 @@ class StsSessionPolicyS3EnforcementIntegrationTest {
         .then()
                 .statusCode(200)
                 .body("AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId", startsWith("ASIA"))
-                .extract()
-                .path("AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId");
+                .extract().xmlPath();
+        return sessionCredentials(response);
     }
+
+    private static SessionCredentials sessionCredentials(io.restassured.path.xml.XmlPath response) {
+        String prefix = "AssumeRoleResponse.AssumeRoleResult.Credentials.";
+        return new SessionCredentials(response.getString(prefix + "AccessKeyId"),
+                response.getString(prefix + "SessionToken"));
+    }
+
+    private static SessionCredentials getSessionTokenCredentials(
+            io.restassured.path.xml.XmlPath response) {
+        String prefix = "GetSessionTokenResponse.GetSessionTokenResult.Credentials.";
+        return new SessionCredentials(response.getString(prefix + "AccessKeyId"),
+                response.getString(prefix + "SessionToken"));
+    }
+
+    private record SessionCredentials(String accessKeyId, String sessionToken) {}
 
     private static String auth(String accessKeyId, String service) {
         return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260629/" + REGION + "/" + service
