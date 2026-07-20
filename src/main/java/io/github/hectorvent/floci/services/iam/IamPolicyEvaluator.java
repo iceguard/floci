@@ -12,6 +12,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -72,15 +73,15 @@ public class IamPolicyEvaluator {
      * @param resourcePolicies resource-based policy documents (Phase 2); may be null or empty
      * @param action        IAM action, e.g. "s3:GetObject"
      * @param resource      resource ARN, e.g. "arn:aws:s3:::my-bucket/key"
-     * @param conditionCtx  condition context key-value pairs; may be null or empty
+     * @param conditionCtx  condition context values, either scalar or iterable; may be null or empty
      * @return {@link Decision#ALLOW} or {@link Decision#DENY}
      */
     public Decision evaluate(CallerContext caller,
                              List<String> resourcePolicies,
                              String action,
                              String resource,
-                             Map<String, String> conditionCtx) {
-        Map<String, String> ctx = normalizeConditionContext(conditionCtx);
+                             Map<String, ?> conditionCtx) {
+        Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
 
         List<PolicyStatement> identityStmts = parseAll(caller.identityPolicies());
         List<PolicyStatement> resourceStmts = resourcePolicies == null ? List.of() : parseAll(resourcePolicies);
@@ -131,15 +132,15 @@ public class IamPolicyEvaluator {
     public Decision simulateCustomPolicy(List<String> policyDocuments,
                                           String action,
                                           String resource,
-                                          Map<String, String> conditionCtx) {
+                                          Map<String, ?> conditionCtx) {
         return evaluate(CallerContext.of(policyDocuments), null, action, resource, conditionCtx);
     }
 
     public SimulationDecision simulatePrincipalPolicy(CallerContext caller,
                                                       String action,
                                                       String resource,
-                                                      Map<String, String> conditionCtx) {
-        Map<String, String> ctx = normalizeConditionContext(conditionCtx);
+                                                      Map<String, ?> conditionCtx) {
+        Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
         List<PolicyStatement> identityStmts = parseAll(caller.identityPolicies());
         List<PolicyStatement> sessionStmts = caller.sessionPolicyDocument() == null
                 ? null : parseAll(List.of(caller.sessionPolicyDocument()));
@@ -167,20 +168,33 @@ public class IamPolicyEvaluator {
     // Statement matching
     // -----------------------------------------------------------------------
 
-    private Map<String, String> normalizeConditionContext(Map<String, String> conditionCtx) {
+    private Map<String, List<String>> normalizeConditionContext(Map<String, ?> conditionCtx) {
         if (conditionCtx == null || conditionCtx.isEmpty()) {
             return Map.of();
         }
-        return conditionCtx.entrySet().stream()
-                .filter(entry -> entry.getKey() != null && entry.getValue() != null)
-                .collect(java.util.stream.Collectors.toMap(
-                        entry -> entry.getKey().toLowerCase(java.util.Locale.ROOT),
-                        Map.Entry::getValue,
-                        (first, ignored) -> first));
+        Map<String, List<String>> normalized = new LinkedHashMap<>();
+        conditionCtx.forEach((key, value) -> {
+            if (key == null || value == null) {
+                return;
+            }
+            List<String> values;
+            if (value instanceof Iterable<?> iterable) {
+                values = new ArrayList<>();
+                iterable.forEach(item -> {
+                    if (item != null) {
+                        values.add(item.toString());
+                    }
+                });
+            } else {
+                values = List.of(value.toString());
+            }
+            normalized.putIfAbsent(key.toLowerCase(Locale.ROOT), List.copyOf(values));
+        });
+        return normalized;
     }
 
     private boolean anyExplicitDeny(List<PolicyStatement> stmts, String action, String resource,
-                                     Map<String, String> ctx) {
+                                     Map<String, List<String>> ctx) {
         for (PolicyStatement stmt : stmts) {
             if (stmt.isDeny() && matchesStatement(stmt, action, resource, ctx)) {
                 return true;
@@ -190,7 +204,7 @@ public class IamPolicyEvaluator {
     }
 
     private boolean anyExplicitAllow(List<PolicyStatement> stmts, String action, String resource,
-                                      Map<String, String> ctx) {
+                                      Map<String, List<String>> ctx) {
         for (PolicyStatement stmt : stmts) {
             if (stmt.isAllow() && matchesStatement(stmt, action, resource, ctx)) {
                 return true;
@@ -200,7 +214,7 @@ public class IamPolicyEvaluator {
     }
 
     private boolean matchesStatement(PolicyStatement stmt, String action, String resource,
-                                      Map<String, String> ctx) {
+                                      Map<String, List<String>> ctx) {
         return matchesAction(stmt, action)
                 && matchesResource(stmt, resource)
                 && matchesConditions(stmt.getConditions(), ctx);
@@ -249,7 +263,7 @@ public class IamPolicyEvaluator {
      * Returns true if ALL blocks pass (or there are no conditions).
      */
     private boolean matchesConditions(Map<String, Map<String, List<String>>> conditions,
-                                       Map<String, String> ctx) {
+                                       Map<String, List<String>> ctx) {
         if (conditions == null || conditions.isEmpty()) {
             return true;
         }
@@ -263,16 +277,25 @@ public class IamPolicyEvaluator {
 
     private boolean evaluateConditionBlock(String operator,
                                             Map<String, List<String>> keyValueMap,
-                                            Map<String, String> ctx) {
-        boolean ifExists = operator.endsWith("IfExists");
-        String baseOp = ifExists ? operator.substring(0, operator.length() - "IfExists".length()) : operator;
+                                            Map<String, List<String>> ctx) {
+        String setQualifier = null;
+        String qualifiedOperator = operator;
+        int qualifierSeparator = operator.indexOf(':');
+        if (qualifierSeparator >= 0) {
+            setQualifier = operator.substring(0, qualifierSeparator);
+            qualifiedOperator = operator.substring(qualifierSeparator + 1);
+        }
+        boolean ifExists = qualifiedOperator.endsWith("IfExists");
+        String baseOp = ifExists
+                ? qualifiedOperator.substring(0, qualifiedOperator.length() - "IfExists".length())
+                : qualifiedOperator;
 
         for (Map.Entry<String, List<String>> entry : keyValueMap.entrySet()) {
-            String condKey = entry.getKey().toLowerCase();
+            String condKey = entry.getKey().toLowerCase(Locale.ROOT);
             List<String> condValues = entry.getValue();
-            String ctxValue = ctx.get(condKey);
+            List<String> ctxValues = ctx.get(condKey);
 
-            if (ctxValue == null) {
+            if (ctxValues == null || ctxValues.isEmpty()) {
                 if ("Null".equalsIgnoreCase(baseOp)) {
                     // Null: {key: "true"} → key must be absent → pass when any condValue is "true"
                     boolean expectAbsent = condValues.stream().anyMatch("true"::equalsIgnoreCase);
@@ -283,6 +306,9 @@ public class IamPolicyEvaluator {
                 }
                 if (ifExists) {
                     continue; // key missing + IfExists → pass this key
+                }
+                if ("ForAllValues".equals(setQualifier)) {
+                    continue;
                 }
                 return false; // key missing, no IfExists → fail entire block
             }
@@ -296,19 +322,32 @@ public class IamPolicyEvaluator {
                 continue;
             }
 
-            // OR across condValues for this key
-            boolean keyMatch = false;
-            for (String condValue : condValues) {
-                if (evaluateSingleCondition(baseOp, ctxValue, condValue)) {
-                    keyMatch = true;
-                    break;
+            boolean keyMatch = switch (setQualifier == null ? "" : setQualifier) {
+                case "ForAllValues" -> ctxValues.stream()
+                        .allMatch(ctxValue -> matchesPolicyValues(baseOp, ctxValue, condValues));
+                case "ForAnyValue" -> ctxValues.stream()
+                        .anyMatch(ctxValue -> matchesPolicyValues(baseOp, ctxValue, condValues));
+                case "" -> ctxValues.stream()
+                        .anyMatch(ctxValue -> matchesPolicyValues(baseOp, ctxValue, condValues));
+                default -> {
+                    LOG.warnv("Unsupported condition set qualifier: {0} — treating as no-match", setQualifier);
+                    yield false;
                 }
-            }
+            };
             if (!keyMatch) {
                 return false;
             }
         }
         return true;
+    }
+
+    private boolean matchesPolicyValues(String operator, String ctxValue, List<String> condValues) {
+        if (operator.contains("Not")) {
+            return condValues.stream()
+                    .allMatch(condValue -> evaluateSingleCondition(operator, ctxValue, condValue));
+        }
+        return condValues.stream()
+                .anyMatch(condValue -> evaluateSingleCondition(operator, ctxValue, condValue));
     }
 
     private boolean evaluateSingleCondition(String operator, String ctxValue, String condValue) {
