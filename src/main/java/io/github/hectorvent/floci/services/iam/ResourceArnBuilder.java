@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsFormRequestResolver;
+import io.github.hectorvent.floci.core.common.AwsJsonRequestResolver;
+import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -33,14 +35,19 @@ public class ResourceArnBuilder {
     private final AwsFormRequestResolver formRequestResolver;
     private final ObjectMapper objectMapper;
     private final SecretsManagerService secretsManagerService;
+    private final AwsJsonRequestResolver jsonRequestResolver;
+    private final KmsService kmsService;
 
     @Inject
     public ResourceArnBuilder(IamService iamService, AwsFormRequestResolver formRequestResolver,
-                              ObjectMapper objectMapper, SecretsManagerService secretsManagerService) {
+                              ObjectMapper objectMapper, SecretsManagerService secretsManagerService,
+                              AwsJsonRequestResolver jsonRequestResolver, KmsService kmsService) {
         this.iamService = iamService;
         this.formRequestResolver = formRequestResolver;
         this.objectMapper = objectMapper;
         this.secretsManagerService = secretsManagerService;
+        this.jsonRequestResolver = jsonRequestResolver;
+        this.kmsService = kmsService;
     }
 
     public String build(String credentialScope, ContainerRequestContext ctx,
@@ -55,7 +62,7 @@ public class ResourceArnBuilder {
             case "kinesis"        -> buildKinesisArn(ctx, region, accountId);
             case "secretsmanager" -> buildSecretsManagerArn(ctx, region, accountId);
             case "ssm"            -> buildSsmArn(ctx, region, accountId);
-            case "kms"            -> buildKmsArn(path, region, accountId);
+            case "kms"            -> buildKmsArn(ctx, path, region, accountId);
             case "iam"            -> buildIamArn(ctx, accountId);
             case "rds"            -> buildRdsArn(ctx, region, accountId);
             default               -> "*";
@@ -77,7 +84,13 @@ public class ResourceArnBuilder {
 
     public List<String> additionalResources(String credentialScope, ContainerRequestContext ctx,
                                             String region, String accountId) {
-        return List.of();
+        if (!"kms".equals(credentialScope) || !isKmsAction(ctx, "CreateAlias")) {
+            return List.of();
+        }
+        String targetKeyId = jsonRequestResolver.firstTextField(ctx, "TargetKeyId");
+        return targetKeyId == null || targetKeyId.isBlank()
+                ? List.of()
+                : List.of(resolveKmsKeyArn(targetKeyId, region, accountId));
     }
 
     public List<AuthorizationRequest> additionalAuthorizations(
@@ -175,10 +188,40 @@ public class ResourceArnBuilder {
     }
 
     // ── KMS ──────────────────────────────────────────────────────────────────────
-    private String buildKmsArn(String path, String region, String accountId) {
+    private String buildKmsArn(ContainerRequestContext ctx, String path, String region, String accountId) {
+        if (isKmsAction(ctx, "CreateKey")) {
+            return "*";
+        }
+        if (isKmsAction(ctx, "CreateAlias")) {
+            String aliasName = jsonRequestResolver.firstTextField(ctx, "AliasName");
+            return aliasName == null || aliasName.isBlank()
+                    ? AwsArnUtils.Arn.of("kms", region, accountId, "alias/*").toString()
+                    : AwsArnUtils.Arn.of("kms", region, accountId, aliasName).toString();
+        }
+        String requestedKeyId = jsonRequestResolver.firstTextField(ctx, "KeyId");
+        if (requestedKeyId != null && !requestedKeyId.isBlank()) {
+            return resolveKmsKeyArn(requestedKeyId, region, accountId);
+        }
         String keyId = extractSegmentAfter(path, "keys");
         if (keyId == null) return AwsArnUtils.Arn.of("kms", region, accountId, "key/*").toString();
         return AwsArnUtils.Arn.of("kms", region, accountId, "key/" + keyId).toString();
+    }
+
+    private boolean isKmsAction(ContainerRequestContext ctx, String action) {
+        String target = ctx.getHeaderString("X-Amz-Target");
+        return target != null && target.endsWith("." + action);
+    }
+
+    private String resolveKmsKeyArn(String keyId, String region, String accountId) {
+        try {
+            return kmsService.describeKey(keyId, region).getArn();
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve KMS key resource {0}: {1}", keyId, e.getMessage());
+            if (keyId.startsWith("arn:")) {
+                return keyId;
+            }
+            return AwsArnUtils.Arn.of("kms", region, accountId, "key/" + keyId).toString();
+        }
     }
 
     // ── IAM ─────────────────────────────────────────────────────────────────────
