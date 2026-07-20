@@ -28,15 +28,18 @@ import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.zip.GZIPOutputStream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -187,6 +190,89 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void userDataExecutionTextDecompressesValidGzipShellScript() throws Exception {
+        String script = "#!/bin/bash\nset -euo pipefail\necho ready\n";
+        byte[] compressed = gzip(script);
+        Ec2UserData userData = Ec2UserData.fromBytes(compressed);
+
+        String materialized = Ec2ContainerManager.userDataExecutionText(userData);
+
+        assertEquals(script, materialized);
+        assertArrayEquals(compressed, userData.bytes());
+        assertEquals(Base64.getEncoder().encodeToString(compressed), userData.encoded());
+        assertEquals(List.of(script), Ec2ContainerManager.userDataShellScripts(materialized));
+    }
+
+    @Test
+    void userDataExecutionTextPreservesPlainUtf8Text() {
+        String script = "#!/bin/bash\r\nprintf 'ready \u03bb\\n'\r\n";
+
+        assertEquals(script, Ec2ContainerManager.userDataExecutionText(Ec2UserData.fromText(script)));
+    }
+
+    @Test
+    void userDataExecutionTextDoesNotApplyAdmissionLimitToExpandedGzip() throws Exception {
+        String script = "#!/bin/bash\n# " + "a".repeat(Ec2UserData.MAX_DECODED_BYTES * 4) + "\necho ready\n";
+        byte[] compressed = gzip(script);
+
+        assertTrue(compressed.length <= Ec2UserData.MAX_DECODED_BYTES);
+        assertTrue(script.getBytes(StandardCharsets.UTF_8).length > Ec2UserData.MAX_DECODED_BYTES);
+        assertEquals(script, Ec2ContainerManager.userDataExecutionText(Ec2UserData.fromBytes(compressed)));
+    }
+
+    @Test
+    void userDataExecutionTextDecompressesValidGzipMultipartBeforeExtraction() throws Exception {
+        String multipart = """
+                Content-Type: multipart/mixed; boundary=gzip-cloud-init
+                MIME-Version: 1.0
+
+                --gzip-cloud-init
+                Content-Type: text/x-shellscript
+
+                #!/bin/bash
+                echo first
+
+                --gzip-cloud-init
+                Content-Type: text/x-shellscript
+
+                #!/bin/sh
+                echo second
+
+                --gzip-cloud-init--
+                """;
+
+        String materialized = Ec2ContainerManager.userDataExecutionText(
+                Ec2UserData.fromBytes(gzip(multipart)));
+
+        assertEquals(multipart, materialized);
+        assertEquals(
+                List.of("#!/bin/bash\necho first\n", "#!/bin/sh\necho second\n"),
+                Ec2ContainerManager.userDataShellScripts(materialized));
+    }
+
+    @Test
+    void userDataExecutionTextPreservesPriorHandlingForInvalidGzip() {
+        Ec2UserData userData = Ec2UserData.fromBytes(
+                new byte[]{0x1f, (byte) 0x8b, 0x00, (byte) 0xff});
+
+        assertEquals(userData.utf8Text(), Ec2ContainerManager.userDataExecutionText(userData));
+        assertTrue(Ec2ContainerManager.userDataShellScripts(
+                Ec2ContainerManager.userDataExecutionText(userData)).isEmpty());
+    }
+
+    @Test
+    void userDataExecutionTextPreservesPriorHandlingForTrailingGarbage() throws Exception {
+        byte[] gzip = gzip("#!/bin/bash\necho must-not-run\n");
+        byte[] invalid = Arrays.copyOf(gzip, gzip.length + 1);
+        invalid[invalid.length - 1] = 0x7f;
+        Ec2UserData userData = Ec2UserData.fromBytes(invalid);
+
+        assertEquals(userData.utf8Text(), Ec2ContainerManager.userDataExecutionText(userData));
+        assertTrue(Ec2ContainerManager.userDataShellScripts(
+                Ec2ContainerManager.userDataExecutionText(userData)).isEmpty());
+    }
+
+    @Test
     void launchInstanceUserDataStreamToCloudWatch() throws Exception {
         LaunchHarness harness = launchHarness();
         harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
@@ -209,6 +295,27 @@ class Ec2ContainerManagerTest {
         verify(harness.logStreamer, timeout(2000)).streamToCloudWatchLogs(
             any(String.class), any(String.class), eq("us-west-2"), eq(TEST_USER_DATA_OUTPUT)
         );
+    }
+
+    @Test
+    void launchInstanceExecutesGzipUserData() throws Exception {
+        LaunchHarness harness = launchHarness();
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse response = inspectResponse("192.168.215.43");
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(response);
+
+        Instance instance = instance("i-gzip-userdata");
+        instance.setEncodedUserData(Ec2UserData.fromBytes(gzip("""
+                #!/bin/bash
+                echo test
+                """)).encoded());
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        verify(harness.logStreamer, timeout(2000)).streamToCloudWatchLogs(
+                any(String.class), any(String.class), eq("us-west-2"), eq(TEST_USER_DATA_OUTPUT));
     }
 
     @Test
@@ -437,6 +544,14 @@ class Ec2ContainerManagerTest {
             Thread.sleep(10);
         }
         assertTrue(condition.getAsBoolean(), "condition was not met before timeout");
+    }
+
+    private static byte[] gzip(String value) throws Exception {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        try (GZIPOutputStream gzip = new GZIPOutputStream(output)) {
+            gzip.write(value.getBytes(StandardCharsets.UTF_8));
+        }
+        return output.toByteArray();
     }
 
     private record LaunchHarness(Ec2ContainerManager manager,
