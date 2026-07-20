@@ -2,8 +2,10 @@ package io.github.hectorvent.floci.services.ec2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
@@ -16,9 +18,13 @@ import org.jboss.logging.Logger;
 
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -40,6 +46,9 @@ public class Ec2MetadataServer {
     private static final DateTimeFormatter ISO = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'")
             .withZone(ZoneOffset.UTC);
     private static final String INSTANCE_TAGS_PREFIX = "/latest/meta-data/tags/instance/";
+    private static final Duration CREDENTIAL_LIFETIME = Duration.ofHours(1);
+    private static final Duration CREDENTIAL_ROTATION_WINDOW = Duration.ofMinutes(5);
+    private static final SecureRandom RANDOM = new SecureRandom();
 
     private final Vertx vertx;
     private final EmulatorConfig config;
@@ -49,6 +58,8 @@ public class Ec2MetadataServer {
     private final Map<String, Instance> tokenToInstance = new ConcurrentHashMap<>();
     /** IMDSv1 fallback: container bridge IP → Instance */
     private final Map<String, Instance> containerIpToInstance = new ConcurrentHashMap<>();
+    /** Instance ID → current credential plus every still-overlapping issued credential. */
+    private final Map<String, InstanceCredentialState> instanceCredentials = new ConcurrentHashMap<>();
 
     private volatile HttpServer httpServer;
 
@@ -71,6 +82,20 @@ public class Ec2MetadataServer {
     public void unregisterContainer(String containerIp, Instance instance) {
         if (containerIp != null && instance != null) {
             containerIpToInstance.remove(containerIp, instance);
+            tokenToInstance.entrySet().removeIf(entry -> entry.getValue() == instance);
+        }
+    }
+
+    /** Called by Ec2ContainerManager after an instance is permanently terminated. */
+    public void unregisterInstance(Instance instance) {
+        if (instance == null) {
+            return;
+        }
+        containerIpToInstance.entrySet().removeIf(entry -> entry.getValue() == instance);
+        tokenToInstance.entrySet().removeIf(entry -> entry.getValue() == instance);
+        InstanceCredentialState state = instanceCredentials.remove(instance.getInstanceId());
+        if (state != null && iamService != null) {
+            state.issuedCredentials().keySet().forEach(iamService::unregisterSession);
         }
     }
 
@@ -128,6 +153,9 @@ public class Ec2MetadataServer {
         if (httpServer != null) {
             httpServer.close();
         }
+        tokenToInstance.clear();
+        containerIpToInstance.clear();
+        instanceCredentials.clear();
     }
 
     // ── Token (IMDSv2) ────────────────────────────────────────────────────────
@@ -248,14 +276,7 @@ public class Ec2MetadataServer {
             return;
         }
 
-        String expiration = ISO.format(Instant.now().plusSeconds(3600));
-        String body = "{\"Code\":\"Success\","
-                + "\"LastUpdated\":\"" + now() + "\","
-                + "\"Type\":\"AWS-HMAC\","
-                + "\"AccessKeyId\":\"test\","
-                + "\"SecretAccessKey\":\"test\","
-                + "\"Token\":\"test-session-token\","
-                + "\"Expiration\":\"" + expiration + "\"}";
+        String body = issueInstanceProfileCredentials(inst, Instant.now()).toJson();
         ctx.response().setStatusCode(200)
                 .putHeader("content-type", "application/json")
                 .end(body);
@@ -403,6 +424,129 @@ public class Ec2MetadataServer {
 
     private static String nvl(String s) {
         return s != null ? s : "";
+    }
+
+    InstanceProfileCredentials issueInstanceProfileCredentials(Instance instance, Instant now) {
+        if (instance == null || instance.getInstanceId() == null) {
+            throw new IllegalArgumentException("instance ID is required");
+        }
+        return instanceCredentials.compute(instance.getInstanceId(), (instanceId, previous) -> {
+            previous = pruneExpiredCredentials(previous, now);
+            String profileArn = nvl(instance.getIamInstanceProfileArn());
+            if (previous != null
+                    && previous.profileArn().equals(profileArn)
+                    && now.isBefore(previous.current().expiration().minus(CREDENTIAL_ROTATION_WINDOW))) {
+                return previous;
+            }
+
+            InstanceProfileCredentials current = newInstanceProfileCredentials(now);
+            registerInstanceProfileCredentials(instance, current);
+            Map<String, Instant> issuedCredentials = previous == null
+                    ? new LinkedHashMap<>()
+                    : new LinkedHashMap<>(previous.issuedCredentials());
+            issuedCredentials.put(current.accessKeyId(), current.expiration());
+            return new InstanceCredentialState(profileArn, current, Map.copyOf(issuedCredentials));
+        }).current();
+    }
+
+    private InstanceCredentialState pruneExpiredCredentials(
+            InstanceCredentialState previous,
+            Instant now) {
+        if (previous == null) {
+            return null;
+        }
+        Map<String, Instant> active = new LinkedHashMap<>(previous.issuedCredentials());
+        active.entrySet().removeIf(entry -> {
+            if (entry.getValue().isAfter(now)) {
+                return false;
+            }
+            if (iamService != null) {
+                iamService.unregisterSession(entry.getKey());
+            }
+            return true;
+        });
+        return active.size() == previous.issuedCredentials().size()
+                ? previous
+                : new InstanceCredentialState(previous.profileArn(), previous.current(), Map.copyOf(active));
+    }
+
+    Optional<InstanceProfileCredentials> cachedInstanceProfileCredentials(String instanceId) {
+        return Optional.ofNullable(instanceCredentials.get(instanceId))
+                .map(InstanceCredentialState::current);
+    }
+
+    private void registerInstanceProfileCredentials(
+            Instance instance,
+            InstanceProfileCredentials credentials) {
+        if (iamService == null) {
+            return;
+        }
+        String profileArn = instance.getIamInstanceProfileArn();
+        String roleName = resolveRoleName(profileArn);
+        IamRole role;
+        try {
+            role = iamService.getRole(roleName);
+        } catch (AwsException e) {
+            LOG.debugf(e, "IMDS: role %s unavailable while registering instance profile credentials", roleName);
+            return;
+        }
+        String accountId = AwsArnUtils.accountOrDefault(profileArn, null);
+        iamService.registerSession(
+                credentials.accessKeyId(),
+                credentials.secretAccessKey(),
+                credentials.token(),
+                role.getArn(),
+                instance.getInstanceId(),
+                accountId,
+                role.getRoleId(),
+                credentials.expiration(),
+                null,
+                accountId);
+    }
+
+    private static InstanceProfileCredentials newInstanceProfileCredentials(Instant issuedAt) {
+        return new InstanceProfileCredentials(
+                "ASIA" + randomUppercaseHex(8),
+                randomBase64(30),
+                randomBase64(64),
+                issuedAt,
+                issuedAt.plus(CREDENTIAL_LIFETIME));
+    }
+
+    private static String randomUppercaseHex(int byteCount) {
+        byte[] bytes = new byte[byteCount];
+        RANDOM.nextBytes(bytes);
+        return java.util.HexFormat.of().withUpperCase().formatHex(bytes);
+    }
+
+    private static String randomBase64(int byteCount) {
+        byte[] bytes = new byte[byteCount];
+        RANDOM.nextBytes(bytes);
+        return Base64.getEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    record InstanceCredentialState(
+            String profileArn,
+            InstanceProfileCredentials current,
+            Map<String, Instant> issuedCredentials) {
+    }
+
+    record InstanceProfileCredentials(
+            String accessKeyId,
+            String secretAccessKey,
+            String token,
+            Instant lastUpdated,
+            Instant expiration) {
+
+        String toJson() {
+            return "{\"Code\":\"Success\","
+                    + "\"LastUpdated\":\"" + ISO.format(lastUpdated) + "\","
+                    + "\"Type\":\"AWS-HMAC\","
+                    + "\"AccessKeyId\":\"" + accessKeyId + "\","
+                    + "\"SecretAccessKey\":\"" + secretAccessKey + "\","
+                    + "\"Token\":\"" + token + "\","
+                    + "\"Expiration\":\"" + ISO.format(expiration) + "\"}";
+        }
     }
 
     static String instanceTagKeys(Instance instance) {

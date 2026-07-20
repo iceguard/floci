@@ -14,8 +14,8 @@ import static org.hamcrest.Matchers.startsWith;
 
 /**
  * Verifies that, with {@code iam.enforcement-enabled=true}, STS AssumeRole honors the target role's
- * trust policy: a caller the trust policy permits succeeds; one it does not is denied; and a role
- * Floci does not know about stays permissive (backward-compatible).
+ * trust policy: a caller the trust policy permits succeeds, one it does not is denied, and an
+ * unknown target role fails closed without issuing credentials.
  */
 @QuarkusTest
 @TestProfile(AssumeRoleTrustPolicyIntegrationTest.EnforcementProfile.class)
@@ -89,8 +89,7 @@ class AssumeRoleTrustPolicyIntegrationTest {
     }
 
     @Test
-    void unknownRoleStaysPermissive() {
-        // No role created — enforcement must not block roles Floci has never seen.
+    void unknownRoleFailsClosed() {
         given()
             .contentType("application/x-www-form-urlencoded")
             .formParam("Action", "AssumeRole")
@@ -99,7 +98,7 @@ class AssumeRoleTrustPolicyIntegrationTest {
             .formParam("RoleSessionName", "s")
             .header("Authorization", auth(ACCOUNT_C, "sts"))
         .when().post("/")
-        .then().statusCode(200)
-            .body("AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId", startsWith("ASIA"));
+        .then().statusCode(403)
+            .body(containsString("<Code>AccessDenied</Code>"));
     }
 }

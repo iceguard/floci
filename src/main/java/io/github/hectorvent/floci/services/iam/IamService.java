@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.PolicyVersion;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
+import io.github.hectorvent.floci.services.iam.model.SessionCredential.SessionType;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.quarkus.runtime.Startup;
 import jakarta.annotation.PostConstruct;
@@ -25,7 +26,11 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Optional;
+import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -962,7 +967,25 @@ public class IamService implements SessionAccountLookup {
         if (fromAccessKey.isPresent()) {
             return fromAccessKey;
         }
-        return findSessionAnyAccount(accessKeyId).map(SessionCredential::getSecretAccessKey);
+        return findUnexpiredSession(accessKeyId).map(SessionCredential::getSecretAccessKey);
+    }
+
+    /**
+     * Resolves the signing secret used by presigned data-plane authentication.
+     * Temporary credentials are usable only when their session token is present,
+     * matches the stored credential, and has not expired. Long-term credentials
+     * must resolve to a persisted IAM access key.
+     */
+    public Optional<String> findSigningSecret(String accessKeyId, String sessionToken) {
+        if (isTemporaryAccessKey(accessKeyId)) {
+            return findActiveSession(accessKeyId, sessionToken)
+                    .map(SessionCredential::getSecretAccessKey);
+        }
+        return findSecretKey(accessKeyId);
+    }
+
+    public Optional<String> findSessionToken(String accessKeyId) {
+        return findUnexpiredSession(accessKeyId).map(SessionCredential::getSessionToken);
     }
 
     public Optional<AccessKey> findAccessKey(String accessKeyId) {
@@ -1005,15 +1028,47 @@ public class IamService implements SessionAccountLookup {
 
     /**
      * Stores an assumed-role session and records {@code originAccountId} — the account of the
-     * caller that minted it. The origin lets {@link #resolveAccountId(String)} route temporary
+     * caller that minted it. The origin lets {@link #resolveAccountId(String, String)} route temporary
      * credentials that carry no role ARN (e.g. GetSessionToken) back to the caller's account.
      */
     public void registerSession(String sessionAccessKeyId, String secretAccessKey, String roleArn,
                                 java.time.Instant expiration, String sessionPolicyDocument,
                                 String originAccountId) {
-        sessions.put(sessionAccessKeyId,
-                new SessionCredential(sessionAccessKeyId, secretAccessKey, roleArn, expiration,
-                        sessionPolicyDocument, originAccountId));
+        registerSession(sessionAccessKeyId, secretAccessKey, null, roleArn, null, null, null,
+                expiration, sessionPolicyDocument, originAccountId, null, null);
+    }
+
+    public void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                                String roleArn, String roleSessionName, String targetAccountId,
+                                String assumedRolePrincipalId, java.time.Instant expiration,
+                                String sessionPolicyDocument, String originAccountId) {
+        registerSession(sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, roleSessionName,
+                targetAccountId, assumedRolePrincipalId, expiration, sessionPolicyDocument,
+                originAccountId, null, null);
+    }
+
+    public void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                                String roleArn, String roleSessionName, String targetAccountId,
+                                String assumedRolePrincipalId, java.time.Instant expiration,
+                                String sessionPolicyDocument, String originAccountId,
+                                String sourcePrincipalArn, String sourcePrincipalId) {
+        registerSession(sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, roleSessionName,
+                targetAccountId, assumedRolePrincipalId, expiration, sessionPolicyDocument,
+                originAccountId, sourcePrincipalArn, sourcePrincipalId, null, false, false);
+    }
+
+    public void registerSession(String sessionAccessKeyId, String secretAccessKey, String sessionToken,
+                                String roleArn, String roleSessionName, String targetAccountId,
+                                String assumedRolePrincipalId, java.time.Instant expiration,
+                                String sessionPolicyDocument, String originAccountId,
+                                String sourcePrincipalArn, String sourcePrincipalId,
+                                SessionType sessionType, boolean mfaAuthenticated,
+                                boolean principalBindingRequired) {
+        sessions.put(sessionAccessKeyId, new SessionCredential(
+                sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, roleSessionName,
+                targetAccountId, assumedRolePrincipalId, expiration, sessionPolicyDocument,
+                originAccountId, sourcePrincipalArn, sourcePrincipalId, sessionType,
+                mfaAuthenticated, principalBindingRequired));
     }
 
     /**
@@ -1023,20 +1078,9 @@ public class IamService implements SessionAccountLookup {
      * default account.
      */
     @Override
-    public Optional<String> resolveAccountId(String accessKeyId) {
-        if (!isTemporaryAccessKey(accessKeyId)) {
-            return Optional.empty();
-        }
-        Optional<SessionCredential> sessionOpt = findSessionAnyAccount(accessKeyId);
-        if (sessionOpt.isEmpty()) {
-            return Optional.empty();
-        }
-        SessionCredential session = sessionOpt.get();
-        if (session.getExpiration() != null && session.getExpiration().isBefore(Instant.now())) {
-            return Optional.empty();
-        }
-        String account = AwsArnUtils.accountOrDefault(session.getRoleArn(), session.getOriginAccountId());
-        return account == null || account.isBlank() ? Optional.empty() : Optional.of(account);
+    public Optional<String> resolveAccountId(String accessKeyId, String sessionToken) {
+        return Optional.of(requireActiveSession(accessKeyId, sessionToken))
+                .flatMap(this::resolveTargetAccountId);
     }
 
     /**
@@ -1055,6 +1099,193 @@ public class IamService implements SessionAccountLookup {
             return Optional.ofNullable(aware.scanAllAccountsAsMap().get(accessKeyId));
         }
         return sessions.get(accessKeyId);
+    }
+
+    private Optional<SessionCredential> findUnexpiredSession(String accessKeyId) {
+        Optional<SessionCredential> session = findSessionAnyAccount(accessKeyId);
+        if (session.isPresent() && isExpired(session.get())) {
+            deleteSession(accessKeyId, session.get());
+            return Optional.empty();
+        }
+        return session;
+    }
+
+    Optional<SessionCredential> findActiveSession(String accessKeyId, String sessionToken) {
+        try {
+            return Optional.of(requireActiveSession(accessKeyId, sessionToken));
+        } catch (AwsException e) {
+            return Optional.empty();
+        }
+    }
+
+    SessionCredential requireActiveSession(String accessKeyId, String sessionToken) {
+        if (!isTemporaryAccessKey(accessKeyId)) {
+            throw invalidSessionToken();
+        }
+        Optional<SessionCredential> session = findSessionAnyAccount(accessKeyId);
+        if (session.isEmpty()) {
+            throw invalidSessionToken();
+        }
+        if (isExpired(session.get())) {
+            deleteSession(accessKeyId, session.get());
+            throw new AwsException("ExpiredToken",
+                    "The security token included in the request is expired", 403);
+        }
+        if (sessionToken == null || sessionToken.isBlank()
+                || session.get().getSessionToken() == null
+                || !session.get().getSessionToken().equals(sessionToken)) {
+            throw invalidSessionToken();
+        }
+        validatePrincipalBinding(session.get());
+        return session.get();
+    }
+
+    /**
+     * Applies restrictions intrinsic to credentials issued by {@code GetSessionToken}.
+     * These restrictions are evaluated in addition to the issuing principal's policies.
+     */
+    public boolean isSessionActionAllowed(String accessKeyId, String sessionToken, String action) {
+        if (!isTemporaryAccessKey(accessKeyId)) {
+            return true;
+        }
+        SessionCredential session = requireActiveSession(accessKeyId, sessionToken);
+        if (session.getSessionType() != SessionType.GET_SESSION_TOKEN) {
+            return true;
+        }
+        if (action.startsWith("iam:")) {
+            return false;
+        }
+        if (action.startsWith("sts:")) {
+            return "sts:AssumeRole".equals(action) || "sts:GetCallerIdentity".equals(action);
+        }
+        return true;
+    }
+
+    public SessionIdentity resolveSessionIdentity(String accessKeyId, String sessionToken) {
+        SessionCredential session = requireActiveSession(accessKeyId, sessionToken);
+        String accountId = resolveTargetAccountId(session)
+                .orElseThrow(IamService::invalidSessionToken);
+        String roleArn = session.getRoleArn();
+        if (roleArn == null || roleArn.isBlank()) {
+            String principalArn = session.getSourcePrincipalArn();
+            String principalId = session.getSourcePrincipalId();
+            return new SessionIdentity(accountId,
+                    principalArn == null || principalArn.isBlank()
+                            ? AwsArnUtils.Arn.of("iam", "", accountId, "root").toString()
+                            : principalArn,
+                    principalId == null || principalId.isBlank() ? accountId : principalId);
+        }
+        if (roleArn.contains(":federated-user/")) {
+            String principalId = session.getAssumedRolePrincipalId();
+            return new SessionIdentity(accountId, roleArn,
+                    principalId == null || principalId.isBlank() ? accountId : principalId);
+        }
+
+        String roleName = roleArn.contains("/")
+                ? roleArn.substring(roleArn.lastIndexOf('/') + 1) : "UnknownRole";
+        String sessionName = session.getRoleSessionName();
+        if (sessionName == null || sessionName.isBlank()) {
+            // Sessions persisted before roleSessionName was added used this stable suffix.
+            sessionName = "floci-session";
+        }
+        String principalId = session.getAssumedRolePrincipalId();
+        if (principalId == null || principalId.isBlank()) {
+            // Legacy persisted sessions have no principal id. Derive a stable AROA-shaped value
+            // from the role ARN so restart behavior remains deterministic without rewriting data.
+            principalId = legacyRolePrincipalId(roleArn);
+        }
+        String arn = AwsArnUtils.Arn.of("sts", "", accountId,
+                "assumed-role/" + roleName + "/" + sessionName).toString();
+        return new SessionIdentity(accountId, arn, principalId + ":" + sessionName);
+    }
+
+    public record SessionIdentity(String accountId, String arn, String userId) {}
+
+    private Optional<String> resolveTargetAccountId(SessionCredential session) {
+        String account = session.getTargetAccountId();
+        if (account == null || account.isBlank()) {
+            account = AwsArnUtils.accountOrDefault(session.getRoleArn(), session.getOriginAccountId());
+        }
+        return account == null || account.isBlank() ? Optional.empty() : Optional.of(account);
+    }
+
+    private static boolean isExpired(SessionCredential session) {
+        return session.getExpiration() != null && !session.getExpiration().isAfter(Instant.now());
+    }
+
+    private static AwsException invalidSessionToken() {
+        return new AwsException("InvalidClientTokenId",
+                "The security token included in the request is invalid", 403);
+    }
+
+    private void validatePrincipalBinding(SessionCredential session) {
+        boolean issuedRoleSession = session.getSessionType() == SessionType.ASSUME_ROLE
+                || session.getSessionType() == SessionType.WEB_IDENTITY
+                || session.getSessionType() == SessionType.SAML;
+        if (!session.isPrincipalBindingRequired() && !issuedRoleSession) {
+            return;
+        }
+        if (session.getSessionType() == SessionType.GET_SESSION_TOKEN) {
+            validateSourcePrincipalBinding(session);
+            return;
+        }
+        String roleArn = session.getRoleArn();
+        String principalId = session.getAssumedRolePrincipalId();
+        if (roleArn == null || roleArn.isBlank() || principalId == null || principalId.isBlank()
+                || roleArn.contains(":federated-user/")) {
+            throw invalidSessionToken();
+        }
+        String accountId = AwsArnUtils.accountOrDefault(roleArn, session.getTargetAccountId());
+        String roleName = roleArn.substring(roleArn.lastIndexOf('/') + 1);
+        IamRole role = findRole(accountId, roleName).orElseThrow(IamService::invalidSessionToken);
+        if (!Objects.equals(principalId, role.getRoleId())) {
+            throw invalidSessionToken();
+        }
+    }
+
+    private void validateSourcePrincipalBinding(SessionCredential session) {
+        String principalArn = session.getSourcePrincipalArn();
+        String principalId = session.getSourcePrincipalId();
+        if (principalArn == null || principalArn.isBlank() || principalId == null || principalId.isBlank()) {
+            throw invalidSessionToken();
+        }
+        if (principalArn.endsWith(":root")) {
+            String accountId = AwsArnUtils.accountOrDefault(principalArn, session.getOriginAccountId());
+            if (!Objects.equals(accountId, principalId)) {
+                throw invalidSessionToken();
+            }
+            return;
+        }
+        if (!principalArn.contains(":user/")) {
+            throw invalidSessionToken();
+        }
+        String accountId = AwsArnUtils.accountOrDefault(principalArn, session.getOriginAccountId());
+        String userName = principalArn.substring(principalArn.lastIndexOf('/') + 1);
+        IamUser user = findUser(accountId, userName).orElseThrow(IamService::invalidSessionToken);
+        if (!Objects.equals(principalId, user.getUserId())) {
+            throw invalidSessionToken();
+        }
+    }
+
+    private Optional<IamUser> findUser(String accountId, String userName) {
+        if (users instanceof AccountAwareStorageBackend<IamUser> aware) {
+            return aware.getForAccount(accountId, userName);
+        }
+        return users.get(userName);
+    }
+
+    private static String legacyRolePrincipalId(String roleArn) {
+        try {
+            byte[] hash = MessageDigest.getInstance("SHA-256")
+                    .digest(roleArn.getBytes(StandardCharsets.UTF_8));
+            StringBuilder value = new StringBuilder("AROA");
+            for (int i = 0; i < 8; i++) {
+                value.append(String.format("%02X", hash[i]));
+            }
+            return value.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
     }
 
     /**
@@ -1082,9 +1313,10 @@ public class IamService implements SessionAccountLookup {
                 deleteSession(accessKeyId, session);
                 return null; // expired — unknown key → bypass
             }
+            validatePrincipalBinding(session);
 
             if (session.getRoleArn() == null) {
-                return null; // identity session without mapped caller context — preserve historical bypass
+                return resolveSourcePrincipalContext(session.getSourcePrincipalArn());
             }
             List<String> identityPolicies = collectRolePolicies(session.getRoleArn());
             String boundaryDoc = resolveRoleBoundaryDocument(session.getRoleArn());
@@ -1093,6 +1325,27 @@ public class IamService implements SessionAccountLookup {
 
         // Unknown key — bypass
         return null;
+    }
+
+    public CallerContext resolveCallerContext(String accessKeyId, String sessionToken) {
+        if (!isTemporaryAccessKey(accessKeyId)) {
+            return resolveCallerContext(accessKeyId);
+        }
+        SessionCredential session = requireActiveSession(accessKeyId, sessionToken);
+        if (session.getRoleArn() == null) {
+            return resolveSourcePrincipalContext(session.getSourcePrincipalArn());
+        }
+        List<String> identityPolicies = collectRolePolicies(session.getRoleArn());
+        String boundaryDoc = resolveRoleBoundaryDocument(session.getRoleArn());
+        return new CallerContext(identityPolicies, session.getSessionPolicyDocument(), boundaryDoc);
+    }
+
+    private CallerContext resolveSourcePrincipalContext(String sourcePrincipalArn) {
+        if (sourcePrincipalArn == null || sourcePrincipalArn.isBlank()
+                || sourcePrincipalArn.endsWith(":root")) {
+            return null;
+        }
+        return resolvePrincipalContext(sourcePrincipalArn);
     }
 
     private Optional<SessionCredential> findSessionForCallerContext(String accessKeyId) {
@@ -1150,7 +1403,25 @@ public class IamService implements SessionAccountLookup {
         return Optional.empty();
     }
 
-    private static boolean isTemporaryAccessKey(String accessKeyId) {
+    public Optional<String> resolveCallerArn(String accessKeyId, String sessionToken) {
+        if (isTemporaryAccessKey(accessKeyId)) {
+            return Optional.of(resolveSessionIdentity(accessKeyId, sessionToken).arn());
+        }
+        return resolveCallerArn(accessKeyId);
+    }
+
+    public Optional<String> resolveCallerPrincipalId(String accessKeyId) {
+        if (accessKeyId == null || accessKeyId.isBlank()) {
+            return Optional.empty();
+        }
+        Optional<AccessKey> accessKey = accessKeys.get(accessKeyId);
+        if (accessKey.isPresent()) {
+            return users.get(accessKey.get().getUserName()).map(IamUser::getUserId);
+        }
+        return Optional.empty();
+    }
+
+    static boolean isTemporaryAccessKey(String accessKeyId) {
         return accessKeyId != null && accessKeyId.startsWith(TEMPORARY_ACCESS_KEY_PREFIX);
     }
 
@@ -1162,6 +1433,12 @@ public class IamService implements SessionAccountLookup {
             return;
         }
         sessions.delete(accessKeyId);
+    }
+
+    /** Removes a temporary credential when its provider-owned lifecycle ends. */
+    public void unregisterSession(String accessKeyId) {
+        findSessionAnyAccount(accessKeyId)
+                .ifPresent(session -> deleteSession(accessKeyId, session));
     }
 
     public CallerContext resolvePrincipalContext(String principalArn) {

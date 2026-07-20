@@ -17,5 +17,5 @@ public interface SessionAccountLookup {
      * Returns the account ID associated with the given temporary access key ID,
      * or {@link Optional#empty()} if it is not a known, live session.
      */
-    Optional<String> resolveAccountId(String accessKeyId);
+    Optional<String> resolveAccountId(String accessKeyId, String sessionToken);
 }

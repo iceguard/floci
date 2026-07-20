@@ -18,8 +18,11 @@ import java.util.Optional;
  *
  * <p>Account resolution precedence: a 12-digit access key ID is used directly as
  * the account; otherwise temporary credentials (e.g. assumed-role {@code ASIA...}
- * keys) are looked up in the session store via {@link SessionAccountLookup}; if
- * neither matches, the configured default account applies.
+ * keys) must authenticate against the session store via {@link SessionAccountLookup}.
+ * Other credential shapes retain the configured default-account fallback.
+ *
+ * <p>This authenticates the stored temporary access-key/session-token tuple. General
+ * control-plane verification of the secret-derived SigV4 signature is a separate capability.
  */
 @Provider
 @ApplicationScoped
@@ -47,14 +50,17 @@ public class AccountContextFilter implements ContainerRequestFilter {
         String auth = ctx.getHeaderString("Authorization");
         if (auth != null && !auth.isEmpty()) {
             String akid = accountResolver.extractAccessKeyId(auth);
-            requestContext.setAccountId(resolveAccount(akid, accountResolver.resolve(auth)));
+            requestContext.setAccountId(resolveAccount(
+                    ctx, akid, securityToken(ctx), accountResolver.resolve(auth), credentialScope(auth)));
             requestContext.setRegion(regionResolver.resolveRegionFromAuth(auth));
         } else {
             String credential = ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Credential");
             if (credential != null && !credential.isEmpty()) {
                 String akid = accountResolver.extractPresignedAccessKeyId(credential);
-                requestContext.setAccountId(
-                        resolveAccount(akid, accountResolver.resolveFromPresignedCredential(credential)));
+                requestContext.setAccountId(resolveAccount(
+                        ctx, akid, querySecurityToken(ctx),
+                        accountResolver.resolveFromPresignedCredential(credential),
+                        credentialScope(credential)));
                 requestContext.setRegion(regionResolver.resolveRegionFromPresignedCredential(credential));
             } else {
                 requestContext.setAccountId(accountResolver.resolve(null));
@@ -68,13 +74,47 @@ public class AccountContextFilter implements ContainerRequestFilter {
      * {@code resolvedDefault} (the account or default returned by {@link AccountResolver});
      * for any other key shape, a live session lookup takes precedence before falling back.
      */
-    private String resolveAccount(String akid, String resolvedDefault) {
-        if (akid != null && !akid.matches("\\d{12}")) {
-            Optional<String> sessionAccount = sessionAccountLookup.resolveAccountId(akid);
-            if (sessionAccount.isPresent()) {
-                return sessionAccount.get();
+    private String resolveAccount(ContainerRequestContext ctx, String akid, String sessionToken,
+                                  String resolvedDefault, String credentialScope) {
+        if (isTemporaryAccessKey(akid)) {
+            try {
+                return sessionAccountLookup.resolveAccountId(akid, sessionToken)
+                        .orElseThrow(() -> invalidSessionToken());
+            } catch (AwsException e) {
+                ctx.abortWith(IamEnforcementFilter.awsErrorResponse(
+                        e.getErrorCode(), e.getMessage(), credentialScope, ctx.getMediaType()));
+                return resolvedDefault;
             }
         }
         return resolvedDefault;
+    }
+
+    private static boolean isTemporaryAccessKey(String accessKeyId) {
+        return accessKeyId != null && accessKeyId.startsWith("ASIA");
+    }
+
+    private static AwsException invalidSessionToken() {
+        return new AwsException("InvalidClientTokenId",
+                "The security token included in the request is invalid", 403);
+    }
+
+    private static String securityToken(ContainerRequestContext ctx) {
+        return ctx.getHeaderString("X-Amz-Security-Token");
+    }
+
+    private static String querySecurityToken(ContainerRequestContext ctx) {
+        return ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Security-Token");
+    }
+
+    private static String credentialScope(String credential) {
+        if (credential == null) {
+            return null;
+        }
+        int requestIndex = credential.indexOf("/aws4_request");
+        if (requestIndex < 0) {
+            return null;
+        }
+        int serviceStart = credential.lastIndexOf('/', requestIndex - 1) + 1;
+        return serviceStart > 0 ? credential.substring(serviceStart, requestIndex) : null;
     }
 }
