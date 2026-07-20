@@ -77,9 +77,11 @@ class IamIntegrationTest {
     @Test
     @Order(3)
     void stsAssumeRole() {
+        String roleName = "StsTestRoleDefault";
+        createStsRole("000000000000", roleName);
         given()
             .formParam("Action", "AssumeRole")
-            .formParam("RoleArn", "arn:aws:iam::000000000000:role/TestRole")
+            .formParam("RoleArn", "arn:aws:iam::000000000000:role/" + roleName)
             .formParam("RoleSessionName", "test-session")
             .formParam("DurationSeconds", "3600")
             .header("Authorization",
@@ -94,15 +96,17 @@ class IamIntegrationTest {
             .body("AssumeRoleResponse.AssumeRoleResult.Credentials.SessionToken", notNullValue())
             .body("AssumeRoleResponse.AssumeRoleResult.Credentials.Expiration", notNullValue())
             .body("AssumeRoleResponse.AssumeRoleResult.AssumedRoleUser.Arn",
-                    containsString("assumed-role/TestRole/test-session"));
+                    containsString("assumed-role/" + roleName + "/test-session"));
     }
 
     @Test
     @Order(4)
     void stsAssumeRoleHonoursTwelveDigitAccessKey() {
+        String roleName = "StsTestRoleTenant";
+        createStsRole("123456789012", roleName);
         given()
             .formParam("Action", "AssumeRole")
-            .formParam("RoleArn", "arn:aws:iam::123456789012:role/TestRole")
+            .formParam("RoleArn", "arn:aws:iam::123456789012:role/" + roleName)
             .formParam("RoleSessionName", "tenant-session")
             .formParam("DurationSeconds", "3600")
             .header("Authorization",
@@ -112,15 +116,17 @@ class IamIntegrationTest {
         .then()
             .statusCode(200)
             .body("AssumeRoleResponse.AssumeRoleResult.AssumedRoleUser.Arn",
-                    equalTo("arn:aws:sts::123456789012:assumed-role/TestRole/tenant-session"));
+                    equalTo("arn:aws:sts::123456789012:assumed-role/" + roleName + "/tenant-session"));
     }
 
     @Test
     @Order(6)
     void stsAssumeRoleUsesAccountFromRoleArnForCrossAccount() {
+        String roleName = "CrossAccountRole";
+        createStsRole("222222222222", roleName);
         given()
             .formParam("Action", "AssumeRole")
-            .formParam("RoleArn", "arn:aws:iam::222222222222:role/CrossAccountRole")
+            .formParam("RoleArn", "arn:aws:iam::222222222222:role/" + roleName)
             .formParam("RoleSessionName", "cross-session")
             .formParam("DurationSeconds", "3600")
             .header("Authorization",
@@ -130,7 +136,21 @@ class IamIntegrationTest {
         .then()
             .statusCode(200)
             .body("AssumeRoleResponse.AssumeRoleResult.AssumedRoleUser.Arn",
-                    equalTo("arn:aws:sts::222222222222:assumed-role/CrossAccountRole/cross-session"));
+                    equalTo("arn:aws:sts::222222222222:assumed-role/" + roleName + "/cross-session"));
+    }
+
+    private static void createStsRole(String accountId, String roleName) {
+        given()
+            .formParam("Action", "CreateRole")
+            .formParam("RoleName", roleName)
+            .formParam("AssumeRolePolicyDocument", "{}")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=" + accountId
+                            + "/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
     }
 
     // =========================================================================

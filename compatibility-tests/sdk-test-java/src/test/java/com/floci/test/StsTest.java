@@ -1,10 +1,19 @@
 package com.floci.test;
 
 import org.junit.jupiter.api.*;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.iam.IamClient;
+import software.amazon.awssdk.services.iam.model.CreateRoleRequest;
+import software.amazon.awssdk.services.iam.model.DeleteRoleRequest;
+import software.amazon.awssdk.services.iam.model.GetRoleRequest;
+import software.amazon.awssdk.services.iam.model.NoSuchEntityException;
 import software.amazon.awssdk.services.sts.StsClient;
 import software.amazon.awssdk.services.sts.model.*;
 
 import java.time.Instant;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -12,14 +21,50 @@ import static org.assertj.core.api.Assertions.*;
 class StsTest {
 
     private static StsClient sts;
+    private static IamClient iam;
+    private static final List<String> ROLE_NAMES = List.of(
+            "sdk-test-assumed-role",
+            "my-role",
+            "sdk-issued-role",
+            "short-lived-role",
+            "web-identity-role",
+            "saml-role",
+            "my-saml-role");
+    private static final String TRUST_POLICY = """
+            {"Version":"2012-10-17","Statement":[
+              {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole"}
+            ]}
+            """;
 
     @BeforeAll
     static void setup() {
         sts = TestFixtures.stsClient();
+        iam = TestFixtures.iamClient();
+        for (String roleName : ROLE_NAMES) {
+            try {
+                iam.getRole(GetRoleRequest.builder().roleName(roleName).build());
+            } catch (NoSuchEntityException e) {
+                iam.createRole(CreateRoleRequest.builder()
+                        .roleName(roleName)
+                        .assumeRolePolicyDocument(TRUST_POLICY)
+                        .build());
+            }
+        }
     }
 
     @AfterAll
     static void cleanup() {
+        if (iam != null) {
+            for (String roleName : ROLE_NAMES) {
+                try {
+                    iam.deleteRole(DeleteRoleRequest.builder().roleName(roleName).build());
+                } catch (Exception e) {
+                    System.err.println("Unable to delete STS SDK fixture role " + roleName
+                            + ": " + e.getMessage());
+                }
+            }
+            iam.close();
+        }
         if (sts != null) {
             sts.close();
         }
@@ -70,6 +115,31 @@ class StsTest {
     }
 
     @Test
+    void issuedSessionCredentialsReturnExactCallerIdentity() {
+        String accountId = "000000000000";
+        String sessionName = "sdk-issued-session";
+        AssumeRoleResponse assumed = sts.assumeRole(AssumeRoleRequest.builder()
+                .roleArn("arn:aws:iam::" + accountId + ":role/sdk-issued-role")
+                .roleSessionName(sessionName)
+                .build());
+        Credentials credentials = assumed.credentials();
+
+        try (StsClient sessionSts = StsClient.builder()
+                .endpointOverride(TestFixtures.endpoint())
+                .region(Region.US_EAST_1)
+                .credentialsProvider(StaticCredentialsProvider.create(AwsSessionCredentials.create(
+                        credentials.accessKeyId(), credentials.secretAccessKey(), credentials.sessionToken())))
+                .build()) {
+            GetCallerIdentityResponse identity = sessionSts.getCallerIdentity();
+
+            assertThat(identity.account()).isEqualTo(accountId);
+            assertThat(identity.arn()).isEqualTo("arn:aws:sts::" + accountId
+                    + ":assumed-role/sdk-issued-role/" + sessionName);
+            assertThat(identity.userId()).isEqualTo(assumed.assumedRoleUser().assumedRoleId());
+        }
+    }
+
+    @Test
     void assumeRoleWithCustomDuration() {
         AssumeRoleResponse response = sts.assumeRole(AssumeRoleRequest.builder()
                 .roleArn("arn:aws:iam::000000000000:role/short-lived-role")
@@ -90,6 +160,26 @@ class StsTest {
         assertThat(response.credentials().accessKeyId()).startsWith("ASIA");
         assertThat(response.credentials().sessionToken()).isNotNull();
         assertThat(response.credentials().expiration()).isAfter(Instant.now());
+    }
+
+    @Test
+    void getSessionTokenCredentialsCannotRequestAnotherSessionToken() {
+        Credentials credentials = sts.getSessionToken().credentials();
+
+        try (StsClient sessionSts = StsClient.builder()
+                .endpointOverride(TestFixtures.endpoint())
+                .region(Region.US_EAST_1)
+                .credentialsProvider(StaticCredentialsProvider.create(AwsSessionCredentials.create(
+                        credentials.accessKeyId(), credentials.secretAccessKey(), credentials.sessionToken())))
+                .build()) {
+            assertThatThrownBy(sessionSts::getSessionToken)
+                    .isInstanceOf(StsException.class)
+                    .satisfies(error -> {
+                        StsException stsError = (StsException) error;
+                        assertThat(stsError.statusCode()).isEqualTo(403);
+                        assertThat(stsError.awsErrorDetails().errorCode()).isEqualTo("AccessDenied");
+                    });
+        }
     }
 
     @Test
@@ -138,6 +228,20 @@ class StsTest {
                 .isInstanceOf(StsException.class)
                 .extracting(e -> ((StsException) e).statusCode())
                 .isEqualTo(400);
+    }
+
+    @Test
+    void assumeRoleRejectsUnknownRole() {
+        assertThatThrownBy(() -> sts.assumeRole(AssumeRoleRequest.builder()
+                .roleArn("arn:aws:iam::000000000000:role/sdk-test-missing-role")
+                .roleSessionName("missing-session")
+                .build()))
+                .isInstanceOf(StsException.class)
+                .satisfies(error -> {
+                    StsException stsError = (StsException) error;
+                    assertThat(stsError.statusCode()).isEqualTo(403);
+                    assertThat(stsError.awsErrorDetails().errorCode()).isEqualTo("AccessDenied");
+                });
     }
 
     @Test

@@ -43,7 +43,7 @@ public class SigV4Validator {
      * @param token the presigned URL token
      * @param expectedGroupId the replication group ID to match against the token's host
      * @param expectedUsername the Redis username from the AUTH command;
-     *                         must match the {@code User} in the token. May be null to skip.
+     *                         must match the required {@code User} in the token
      * @return true if the token is valid, identities match, and the token is not expired
      */
     public boolean validate(String token, String expectedGroupId, String expectedUsername) {
@@ -68,16 +68,18 @@ public class SigV4Validator {
             String dateTime = findRawParam(rawPairs, "X-Amz-Date");
             String expires = findRawParam(rawPairs, "X-Amz-Expires");
             String credential = findRawParam(rawPairs, "X-Amz-Credential");
+            String sessionToken = findRawParam(rawPairs, "X-Amz-Security-Token");
             String signedHeaders = findRawParam(rawPairs, "X-Amz-SignedHeaders");
             String signature = findRawParam(rawPairs, "X-Amz-Signature");
 
-            if (!"connect".equals(action) || dateTime == null || expires == null
+            if (!"connect".equals(action) || user == null || expectedUsername == null
+                    || dateTime == null || expires == null
                     || credential == null || signedHeaders == null || signature == null) {
                 LOG.debugv("IAM token missing required SigV4 parameters");
                 return false;
             }
 
-            if (expectedUsername != null && user != null && !expectedUsername.equals(user)) {
+            if (!expectedUsername.equals(user)) {
                 LOG.debugv("IAM token user mismatch: expected={0}, got={1}",
                         expectedUsername, user);
                 return false;
@@ -101,7 +103,11 @@ public class SigV4Validator {
             String service = credParts[3];
             String credentialScope = date + "/" + region + "/" + service + "/aws4_request";
 
-            String secretKey = iamService.findSecretKey(accessKeyId).orElse(accessKeyId);
+            String secretKey = iamService.findSigningSecret(accessKeyId, sessionToken).orElse(null);
+            if (secretKey == null) {
+                LOG.debugv("IAM token has invalid temporary credentials for accessKey={0}", accessKeyId);
+                return false;
+            }
 
             String canonicalQueryString = Arrays.stream(rawPairs)
                     .filter(p -> !rawParamName(p).equals("X-Amz-Signature"))
