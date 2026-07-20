@@ -1,8 +1,15 @@
 package io.github.hectorvent.floci.services.iam;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsFormRequestResolver;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
+import org.jboss.logging.Logger;
+
+import java.util.List;
+import java.util.Map;
 
 /**
  * Constructs the target resource ARN for a request so the policy evaluator
@@ -13,6 +20,17 @@ import jakarta.ws.rs.container.ContainerRequestContext;
  */
 @ApplicationScoped
 public class ResourceArnBuilder {
+
+    private static final Logger LOG = Logger.getLogger(ResourceArnBuilder.class);
+
+    private final IamService iamService;
+    private final AwsFormRequestResolver formRequestResolver;
+
+    @Inject
+    public ResourceArnBuilder(IamService iamService, AwsFormRequestResolver formRequestResolver) {
+        this.iamService = iamService;
+        this.formRequestResolver = formRequestResolver;
+    }
 
     public String build(String credentialScope, ContainerRequestContext ctx,
                         String region, String accountId) {
@@ -27,9 +45,29 @@ public class ResourceArnBuilder {
             case "secretsmanager" -> buildSecretsManagerArn(ctx, region, accountId);
             case "ssm"            -> buildSsmArn(ctx, region, accountId);
             case "kms"            -> buildKmsArn(path, region, accountId);
+            case "iam"            -> buildIamArn(ctx, accountId);
             default               -> "*";
         };
     }
+
+    public List<AuthorizationRequest> resourceAuthorizations(
+            String credentialScope, String action, ContainerRequestContext ctx,
+            String region, String accountId) {
+        return List.of();
+    }
+
+    public List<String> additionalResources(String credentialScope, ContainerRequestContext ctx,
+                                            String region, String accountId) {
+        return List.of();
+    }
+
+    public List<AuthorizationRequest> additionalAuthorizations(
+            String action, String primaryResource, Map<String, List<String>> conditionContext) {
+        return List.of();
+    }
+
+    public record AuthorizationRequest(
+            String action, String resource, Map<String, List<String>> conditionContext) {}
 
     // ── S3 ──────────────────────────────────────────────────────────────────────
     private String buildS3Arn(String path) {
@@ -102,6 +140,45 @@ public class ResourceArnBuilder {
         String keyId = extractSegmentAfter(path, "keys");
         if (keyId == null) return AwsArnUtils.Arn.of("kms", region, accountId, "key/*").toString();
         return AwsArnUtils.Arn.of("kms", region, accountId, "key/" + keyId).toString();
+    }
+
+    // ── IAM ─────────────────────────────────────────────────────────────────────
+    private String buildIamArn(ContainerRequestContext ctx, String accountId) {
+        String action = formRequestResolver.firstParameter(ctx, "Action");
+        return switch (action == null ? "" : action) {
+            case "CreateRole" -> requestedRoleArn(ctx, accountId);
+            case "AttachRolePolicy", "DetachRolePolicy" -> existingRoleArn(ctx, accountId);
+            default -> "*";
+        };
+    }
+
+    private String requestedRoleArn(ContainerRequestContext ctx, String accountId) {
+        String roleName = formRequestResolver.firstParameter(ctx, "RoleName");
+        if (roleName == null || roleName.isBlank()) {
+            return "*";
+        }
+        String path = formRequestResolver.firstParameter(ctx, "Path");
+        String normalizedPath = path == null || path.isBlank() ? "/" : path;
+        if (!normalizedPath.startsWith("/")) {
+            normalizedPath = "/" + normalizedPath;
+        }
+        if (!normalizedPath.endsWith("/")) {
+            normalizedPath += "/";
+        }
+        return AwsArnUtils.Arn.of("iam", "", accountId, "role" + normalizedPath + roleName).toString();
+    }
+
+    private String existingRoleArn(ContainerRequestContext ctx, String accountId) {
+        String roleName = formRequestResolver.firstParameter(ctx, "RoleName");
+        if (roleName == null || roleName.isBlank()) {
+            return "*";
+        }
+        try {
+            return iamService.getRole(roleName).getArn();
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve IAM role resource {0}: {1}", roleName, e.getMessage());
+            return AwsArnUtils.Arn.of("iam", "", accountId, "role/" + roleName).toString();
+        }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────────
