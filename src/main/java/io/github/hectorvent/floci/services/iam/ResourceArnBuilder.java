@@ -1,13 +1,19 @@
 package io.github.hectorvent.floci.services.iam;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsFormRequestResolver;
+import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import org.jboss.logging.Logger;
 
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
 
@@ -25,11 +31,16 @@ public class ResourceArnBuilder {
 
     private final IamService iamService;
     private final AwsFormRequestResolver formRequestResolver;
+    private final ObjectMapper objectMapper;
+    private final SecretsManagerService secretsManagerService;
 
     @Inject
-    public ResourceArnBuilder(IamService iamService, AwsFormRequestResolver formRequestResolver) {
+    public ResourceArnBuilder(IamService iamService, AwsFormRequestResolver formRequestResolver,
+                              ObjectMapper objectMapper, SecretsManagerService secretsManagerService) {
         this.iamService = iamService;
         this.formRequestResolver = formRequestResolver;
+        this.objectMapper = objectMapper;
+        this.secretsManagerService = secretsManagerService;
     }
 
     public String build(String credentialScope, ContainerRequestContext ctx,
@@ -127,6 +138,26 @@ public class ResourceArnBuilder {
 
     // ── Secrets Manager ──────────────────────────────────────────────────────────
     private String buildSecretsManagerArn(ContainerRequestContext ctx, String region, String accountId) {
+        JsonNode request = readJsonRequest(ctx);
+        String secretName = textField(request, "Name");
+        if (secretName != null && !secretName.isBlank()) {
+            return AwsArnUtils.Arn.of(
+                    "secretsmanager", region, accountId, "secret:" + secretName + "-000000").toString();
+        }
+
+        String secretId = textField(request, "SecretId");
+        if (secretId != null && !secretId.isBlank()) {
+            try {
+                return secretsManagerService.describeSecret(secretId, region).getArn();
+            } catch (AwsException e) {
+                LOG.debugv("Unable to resolve Secrets Manager resource {0}: {1}", secretId, e.getMessage());
+                if (secretId.startsWith("arn:")) {
+                    return secretId;
+                }
+                return AwsArnUtils.Arn.of(
+                        "secretsmanager", region, accountId, "secret:" + secretId).toString();
+            }
+        }
         return AwsArnUtils.Arn.of("secretsmanager", region, accountId, "secret:*").toString();
     }
 
@@ -197,5 +228,39 @@ public class ResourceArnBuilder {
         // Form params are typically available as query params in REST-Assured / JAX-RS
         String v = ctx.getUriInfo().getQueryParameters().getFirst(name);
         return v;
+    }
+
+    private JsonNode readJsonRequest(ContainerRequestContext ctx) {
+        InputStream input = ctx.getEntityStream();
+        if (input == null) {
+            return null;
+        }
+
+        byte[] body;
+        try {
+            body = input.readAllBytes();
+        } catch (IOException e) {
+            LOG.debugv(e, "Unable to read JSON request body while resolving IAM resource");
+            return null;
+        }
+        ctx.setEntityStream(new ByteArrayInputStream(body));
+        if (body.length == 0) {
+            return null;
+        }
+
+        try {
+            return objectMapper.readTree(body);
+        } catch (IOException e) {
+            LOG.debugv(e, "Unable to parse JSON request body while resolving IAM resource");
+            return null;
+        }
+    }
+
+    private String textField(JsonNode request, String name) {
+        if (request == null) {
+            return null;
+        }
+        JsonNode value = request.path(name);
+        return value.isTextual() ? value.asText() : null;
     }
 }
