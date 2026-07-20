@@ -33,6 +33,14 @@ class IamIntegrationTest {
             "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\","
             + "\"Action\":\"ec2:RunInstances\",\"Resource\":\"*\"}]}";
 
+    private static final String CONTEXT_POLICY_DOCUMENT =
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+            + "\"Action\":\"example:UpdateResource\","
+            + "\"Resource\":\"arn:aws:example:us-east-1:000000000000:resource/*\","
+            + "\"Condition\":{\"StringEquals\":{"
+            + "\"aws:ResourceTag/managed-by\":\"floci\","
+            + "\"aws:RequestedRegion\":\"us-east-1\"}}}]}";
+
     private static String createdPolicyArn;
 
     // =========================================================================
@@ -355,6 +363,80 @@ class IamIntegrationTest {
                     equalTo("explicitDeny"))
             .body("SimulatePrincipalPolicyResponse.SimulatePrincipalPolicyResult.EvaluationResults.member.find { it.EvalActionName == 'ssm:GetParameter' }.EvalDecision",
                     equalTo("implicitDeny"));
+    }
+
+    @Test
+    @Order(34)
+    void simulatePrincipalPolicyDecodesEveryContextValue() {
+        String roleName = "simulate-context-role-" + Long.toUnsignedString(System.nanoTime(), 36);
+        String roleArn = "arn:aws:iam::000000000000:role/" + roleName;
+        String resourceArn = "arn:aws:example:us-east-1:000000000000:resource/example";
+
+        given()
+            .formParam("Action", "CreateRole")
+            .formParam("RoleName", roleName)
+            .formParam("AssumeRolePolicyDocument", TRUST_POLICY)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "PutRolePolicy")
+            .formParam("RoleName", roleName)
+            .formParam("PolicyName", "context-policy")
+            .formParam("PolicyDocument", CONTEXT_POLICY_DOCUMENT)
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        simulateWithContext(roleArn, resourceArn, "not-floci", "floci", true)
+                .statusCode(200)
+                .body("SimulatePrincipalPolicyResponse.SimulatePrincipalPolicyResult"
+                                + ".EvaluationResults.member.EvalDecision",
+                        equalTo("allowed"));
+
+        simulateWithContext(roleArn, resourceArn, "not-floci", "still-not-floci", true)
+                .statusCode(200)
+                .body("SimulatePrincipalPolicyResponse.SimulatePrincipalPolicyResult"
+                                + ".EvaluationResults.member.EvalDecision",
+                        equalTo("implicitDeny"));
+
+        simulateWithContext(roleArn, resourceArn, "not-floci", "floci", false)
+                .statusCode(200)
+                .body("SimulatePrincipalPolicyResponse.SimulatePrincipalPolicyResult"
+                                + ".EvaluationResults.member.EvalDecision",
+                        equalTo("implicitDeny"));
+    }
+
+    private io.restassured.response.ValidatableResponse simulateWithContext(
+            String roleArn, String resourceArn, String firstValue, String secondValue,
+            boolean includeRegion) {
+        var request = given()
+                .formParam("Action", "SimulatePrincipalPolicy")
+                .formParam("PolicySourceArn", roleArn)
+                .formParam("ActionNames.member.1", "example:UpdateResource")
+                .formParam("ResourceArns.member.1", resourceArn)
+                .formParam("ContextEntries.member.1.ContextKeyName", "aws:ResourceTag/managed-by")
+                .formParam("ContextEntries.member.1.ContextKeyValues.member.1", firstValue)
+                .formParam("ContextEntries.member.1.ContextKeyType", "string")
+                .formParam("ContextEntries.member.2.ContextKeyName", "aws:ResourceTag/managed-by")
+                .formParam("ContextEntries.member.2.ContextKeyValues.member.1", secondValue)
+                .formParam("ContextEntries.member.2.ContextKeyType", "string")
+                .header("Authorization",
+                        "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request");
+        if (includeRegion) {
+            request
+                    .formParam("ContextEntries.member.3.ContextKeyName", "aws:RequestedRegion")
+                    .formParam("ContextEntries.member.3.ContextKeyValues.member.1", "us-east-1")
+                    .formParam("ContextEntries.member.3.ContextKeyType", "string");
+        }
+        return request.when().post("/").then();
     }
 
     @Test
