@@ -1,19 +1,27 @@
 package io.github.hectorvent.floci.services.autoscaling;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.PersistentStorage;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefresh;
+import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration;
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.Ec2UserData;
 import io.github.hectorvent.floci.services.ec2.model.GroupIdentifier;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.doThrow;
@@ -175,7 +183,7 @@ class AutoScalingServiceTest {
         source.setInstanceType("m7g.large");
         source.setKeyName("source-key");
         source.setSecurityGroups(List.of(new GroupIdentifier("sg-source", "default")));
-        source.setUserData("source-user-data");
+        source.setEncodedUserData("/wAJ");
         source.setIamInstanceProfileArn("arn:aws:iam::000000000000:instance-profile/source");
         Reservation reservation = new Reservation();
         reservation.getInstances().add(source);
@@ -197,11 +205,46 @@ class AutoScalingServiceTest {
         assertEquals("m7g.large", launchConfiguration.getInstanceType());
         assertEquals("source-key", launchConfiguration.getKeyName());
         assertEquals(List.of("sg-source"), launchConfiguration.getSecurityGroups());
-        assertEquals("source-user-data", launchConfiguration.getUserData());
+        assertEquals("/wAJ", launchConfiguration.getUserData());
         assertEquals("arn:aws:iam::000000000000:instance-profile/source",
                 launchConfiguration.getIamInstanceProfile());
         assertEquals(launchConfiguration,
                 service.describeLaunchConfigurations(REGION, List.of("lc-from-instance")).getFirst());
+    }
+
+    @Test
+    void launchConfigurationValidatesAndPreservesPresentEmptyUserData() {
+        var launchConfiguration = service.createLaunchConfiguration(REGION,
+                "lc-empty-user-data", null, "ami-12345678", "t3.micro", null,
+                List.of(), "", null, false);
+
+        assertEquals("", launchConfiguration.getUserData());
+
+        String oversized = java.util.Base64.getEncoder().encodeToString(
+                new byte[Ec2UserData.MAX_DECODED_BYTES + 1]);
+        AwsException error = assertThrows(AwsException.class, () -> service.createLaunchConfiguration(REGION,
+                "lc-oversized-user-data", null, "ami-12345678", "t3.micro", null,
+                List.of(), oversized, null, false));
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+        assertEquals("User data is limited to 16384 bytes", error.getMessage());
+    }
+
+    @Test
+    void launchConfigurationExactUserDataSurvivesPersistence(@TempDir Path dir) {
+        Path file = dir.resolve("autoscaling-launch-configurations.json");
+        TypeReference<Map<String, LaunchConfiguration>> type = new TypeReference<>() {};
+        LaunchConfiguration launchConfiguration = new LaunchConfiguration();
+        launchConfiguration.setLaunchConfigurationName("lc-binary-user-data");
+        launchConfiguration.setUserData("/wAJ");
+
+        StorageBackend<String, LaunchConfiguration> first = new PersistentStorage<>(file, type);
+        first.put("us-east-1::lc-binary-user-data", launchConfiguration);
+
+        StorageBackend<String, LaunchConfiguration> restarted = new PersistentStorage<>(file, type);
+        restarted.load();
+        assertEquals("/wAJ", restarted.get("us-east-1::lc-binary-user-data")
+                .orElseThrow()
+                .getUserData());
     }
 
     @Test

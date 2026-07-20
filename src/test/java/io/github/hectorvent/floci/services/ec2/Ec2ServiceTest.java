@@ -322,13 +322,45 @@ class Ec2ServiceTest {
         assertEquals("t3.small", version.getInstanceType());
         assertEquals("app-key", version.getKeyName());
         assertEquals(List.of("sg-source"), version.getSecurityGroupIds());
-        assertEquals("source-user-data", version.getUserData());
         assertEquals("c291cmNlLXVzZXItZGF0YQ==", version.getEncodedUserData());
         assertEquals("arn:aws:iam::000000000000:instance-profile/app-profile", version.getIamInstanceProfileArn());
         assertEquals("2", version.getLatestVersionNumber());
         assertEquals(1, version.getInstanceTags().size());
         assertEquals("Role", version.getInstanceTags().getFirst().getKey());
         assertEquals("source", version.getInstanceTags().getFirst().getValue());
+    }
+
+    @Test
+    void launchTemplateVersionOverridesSourceWithPresentEmptyUserData() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        LaunchTemplate template = service.createLaunchTemplate("us-east-1", "empty-override-template",
+                "ami-source", "t3.micro", null, List.of(),
+                "source-user-data", "c291cmNlLXVzZXItZGF0YQ==", null, List.of(), List.of());
+
+        service.createLaunchTemplateVersion("us-east-1", template.getLaunchTemplateId(), null,
+                "1", null, null, null, List.of(), "", "", null, List.of());
+
+        LaunchTemplate version = service.describeLaunchTemplateVersions(
+                "us-east-1", template.getLaunchTemplateId(), null, List.of("2")).getFirst();
+        assertEquals("", version.getEncodedUserData());
+    }
+
+    @Test
+    void runInstancesStoresExactEncodedUserDataWithoutTextConversion() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        byte[] bytes = new byte[]{(byte) 0xff, 0x00, 0x09};
+        Ec2UserData userData = Ec2UserData.fromBytes(bytes);
+
+        Reservation reservation = service.runInstancesWithUserData("us-east-1", "ami-source", "t3.micro",
+                1, 1, null, List.of(), null, null, List.of(), userData, null);
+
+        assertEquals(userData.encoded(), reservation.getInstances().getFirst().getEncodedUserData());
     }
 
     @Test
