@@ -538,9 +538,7 @@ class AutoScalingIntegrationTest {
                 .formParam("Preferences.MaxHealthyPercentage", "120")
                 .formParam("Preferences.InstanceWarmup", "200")
                 .formParam("Preferences.SkipMatching", "true")
-                .formParam("Preferences.AutoRollback", "true")
-                .formParam("Preferences.CheckpointPercentages.member.1", "50")
-                .formParam("Preferences.CheckpointPercentages.member.2", "100")
+                .formParam("Preferences.AutoRollback", "false")
                 .header("Authorization", AUTH)
             .when()
                 .post("/")
@@ -581,8 +579,7 @@ class AutoScalingIntegrationTest {
         assertThat(body, containsString("<MaxHealthyPercentage>120</MaxHealthyPercentage>"));
         assertThat(body, containsString("<InstanceWarmup>200</InstanceWarmup>"));
         assertThat(body, containsString("<SkipMatching>true</SkipMatching>"));
-        assertThat(body, containsString("<AutoRollback>true</AutoRollback>"));
-        assertThat(body, containsString("<CheckpointPercentages>"));
+        assertThat(body, containsString("<AutoRollback>false</AutoRollback>"));
 
         given()
                 .formParam("Action", "DescribeAutoScalingGroups")

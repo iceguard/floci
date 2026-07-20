@@ -49,6 +49,7 @@ public class AutoScalingService {
     private Map<String, ScalingPolicy> policies = new ConcurrentHashMap<>();
     private Map<String, ScalingActivity> activities = new ConcurrentHashMap<>();
     private Map<String, InstanceRefresh> instanceRefreshes = new ConcurrentHashMap<>();
+    private final Map<String, Object> instanceRefreshLocks = new ConcurrentHashMap<>();
 
     @PostConstruct
     void initializeStorage()
@@ -432,73 +433,91 @@ public class AutoScalingService {
     // ── Instance refreshes ────────────────────────────────────────────────────
 
     public InstanceRefresh startInstanceRefresh(String region, String asgName, InstanceRefresh requestedRefresh) {
-        AutoScalingGroup asg = requireGroup(region, asgName);
-        boolean activeRefresh = instanceRefreshes.values().stream()
-                .filter(r -> region.equals(r.getRegion()))
-                .filter(r -> asgName.equals(r.getAutoScalingGroupName()))
-                .anyMatch(r -> isActiveRefreshStatus(r.getStatus()));
-        if (activeRefresh) {
-            throw new AwsException("InstanceRefreshInProgress",
-                    "An active instance refresh already exists for Auto Scaling group '" + asgName + "'.", 400);
-        }
+        String groupKey = asgKey(region, asgName);
+        synchronized (instanceRefreshLocks.computeIfAbsent(groupKey, ignored -> new Object())) {
+            AutoScalingGroup asg = requireGroup(region, asgName);
+            if (activeInstanceRefresh(region, asgName).isPresent()) {
+                throw new AwsException("InstanceRefreshInProgress",
+                        "An active instance refresh already exists for Auto Scaling group '" + asgName + "'.", 400);
+            }
 
-        Instant now = Instant.now();
-        InstanceRefresh refresh = new InstanceRefresh();
-        refresh.setInstanceRefreshId(UUID.randomUUID().toString());
-        refresh.setAutoScalingGroupName(asgName);
-        refresh.setStrategy(normalizeRefreshStrategy(requestedRefresh.getStrategy()));
-        refresh.setStartTime(now);
-        refresh.setRegion(region);
-        copyDesiredConfiguration(requestedRefresh, refresh);
-        copyPreferences(requestedRefresh, refresh);
+            validateRefreshRequest(requestedRefresh);
+            Instant now = Instant.now();
+            InstanceRefresh refresh = new InstanceRefresh();
+            refresh.setInstanceRefreshId(UUID.randomUUID().toString());
+            refresh.setAutoScalingGroupName(asgName);
+            refresh.setStrategy(normalizeRefreshStrategy(requestedRefresh.getStrategy()));
+            refresh.setStartTime(now);
+            refresh.setRegion(region);
+            copyDesiredConfiguration(requestedRefresh, refresh);
+            copyPreferences(requestedRefresh, refresh);
+            applyRefreshDefaults(refresh);
+            snapshotSourceConfiguration(asg, refresh);
 
-        applyDesiredConfiguration(asg, refresh);
-        List<String> instanceIds = markInstancesForRefresh(asg, refresh);
-        if (instanceIds.isEmpty()) {
-            refresh.setStatus("Successful");
-            refresh.setStatusReason("Instance refresh completed.");
-            refresh.setPercentageComplete(100);
-            refresh.setInstancesToUpdate(0);
-            refresh.setEndTime(now);
-        } else {
-            refresh.setStatus("InProgress");
-            refresh.setStatusReason("Instance refresh in progress.");
-            refresh.setPercentageComplete(0);
-            refresh.setInstancesToUpdate(instanceIds.size());
-        }
-        instanceRefreshes.put(instanceRefreshKey(region, asgName, refresh.getInstanceRefreshId()), refresh);
-        groups.put(asgKey(region, asgName), asg);
-        if (!instanceIds.isEmpty()) {
+            List<String> candidates = selectRefreshCandidates(asg, refresh);
+            refresh.setCandidateInstanceIds(candidates);
+            refresh.setReplacements(candidates.stream().map(instanceId -> {
+                InstanceRefreshReplacement replacement = new InstanceRefreshReplacement();
+                replacement.setOriginalInstanceId(instanceId);
+                replacement.setPhase("Pending");
+                return replacement;
+            }).toList());
+            refresh.setInstancesToUpdate(candidates.size());
+            if (candidates.isEmpty()) {
+                applyDesiredConfiguration(asg, refresh);
+                refresh.setStatus("Successful");
+                refresh.setPhase("Completed");
+                refresh.setStatusReason("Instance refresh completed.");
+                refresh.setPercentageComplete(100);
+                refresh.setEndTime(now);
+                groups.put(groupKey, asg);
+            } else {
+                refresh.setStatus("InProgress");
+                refresh.setPhase("Pending");
+                refresh.setStatusReason("Instance refresh in progress.");
+            }
+            saveInstanceRefresh(refresh);
             recordActivity(region, asgName,
-                    "Marked EC2 instance(s) for refresh: " + instanceIds,
-                    "At " + now + " an instance refresh selected active instances for replacement.",
+                    "Started instance refresh " + refresh.getInstanceRefreshId() + ".",
+                    "At " + now + " an instance refresh was started for " + candidates.size()
+                            + " instance(s).",
                     "Successful");
+            return refresh;
         }
-        recordActivity(region, asgName,
-                "Started instance refresh " + refresh.getInstanceRefreshId() + ".",
-                "At " + now + " an instance refresh was started.",
-                "Successful");
-        return refresh;
     }
 
-    public void completeInstanceRefreshIfSettled(String region, String asgName) {
-        AutoScalingGroup asg = requireGroup(region, asgName);
-        List<InstanceRefresh> activeRefreshes = instanceRefreshes.values().stream()
+    public Optional<InstanceRefresh> activeInstanceRefresh(String region, String asgName) {
+        return instanceRefreshes.values().stream()
                 .filter(r -> region.equals(r.getRegion()))
                 .filter(r -> asgName.equals(r.getAutoScalingGroupName()))
                 .filter(r -> isActiveRefreshStatus(r.getStatus()))
-                .collect(Collectors.toList());
-        for (InstanceRefresh refresh : activeRefreshes) {
-            int remaining = remainingInstancesToUpdate(asg);
-            refresh.setInstancesToUpdate(remaining);
-            refresh.setPercentageComplete(remaining == 0 ? 100 : 0);
-            if (remaining == 0) {
-                refresh.setStatus("Successful");
-                refresh.setStatusReason("Instance refresh completed.");
-                refresh.setEndTime(Instant.now());
-            }
-            instanceRefreshes.put(instanceRefreshKey(region, asgName, refresh.getInstanceRefreshId()), refresh);
-        }
+                .min(Comparator.comparing(InstanceRefresh::getStartTime));
+    }
+
+    public void saveInstanceRefresh(InstanceRefresh refresh) {
+        instanceRefreshes.put(instanceRefreshKey(
+                refresh.getRegion(), refresh.getAutoScalingGroupName(), refresh.getInstanceRefreshId()), refresh);
+    }
+
+    public void completeInstanceRefresh(AutoScalingGroup asg, InstanceRefresh refresh, Instant now) {
+        applyDesiredConfiguration(asg, refresh);
+        refresh.setStatus("Successful");
+        refresh.setPhase("Completed");
+        refresh.setStatusReason("Instance refresh completed.");
+        refresh.setPercentageComplete(100);
+        refresh.setInstancesToUpdate(0);
+        refresh.setEndTime(now);
+        saveAutoScalingGroup(asg);
+        saveInstanceRefresh(refresh);
+    }
+
+    public void failInstanceRefresh(InstanceRefresh refresh, String reason, Instant now) {
+        refresh.setStatus("Failed");
+        refresh.setPhase("Failed");
+        refresh.setFailureReason(reason);
+        refresh.setStatusReason(reason);
+        refresh.setEndTime(now);
+        saveInstanceRefresh(refresh);
     }
 
     public InstanceRefreshPage describeInstanceRefreshes(String region, String asgName, List<String> refreshIds,
@@ -925,6 +944,7 @@ public class AutoScalingService {
         target.setDesiredLaunchTemplateId(source.getDesiredLaunchTemplateId());
         target.setDesiredLaunchTemplateName(source.getDesiredLaunchTemplateName());
         target.setDesiredLaunchTemplateVersion(source.getDesiredLaunchTemplateVersion());
+        target.setDesiredMixedInstancesPolicy(copyMixedInstancesPolicy(source.getDesiredMixedInstancesPolicy()));
     }
 
     private static void copyPreferences(InstanceRefresh source, InstanceRefresh target) {
@@ -944,30 +964,39 @@ public class AutoScalingService {
         if (!refresh.hasDesiredConfiguration()) {
             return;
         }
+        if (refresh.getDesiredMixedInstancesPolicy() != null) {
+            asg.setLaunchConfigurationName(null);
+            asg.setLaunchTemplateId(null);
+            asg.setLaunchTemplateName(null);
+            asg.setLaunchTemplateVersion(null);
+            asg.setMixedInstancesPolicy(copyMixedInstancesPolicy(refresh.getDesiredMixedInstancesPolicy()));
+            return;
+        }
         if (refresh.getDesiredLaunchTemplateId() != null || refresh.getDesiredLaunchTemplateName() != null) {
             asg.setLaunchTemplateId(refresh.getDesiredLaunchTemplateId());
             asg.setLaunchTemplateName(refresh.getDesiredLaunchTemplateName());
             asg.setLaunchConfigurationName(null);
+            asg.setMixedInstancesPolicy(null);
         }
         if (refresh.getDesiredLaunchTemplateVersion() != null) {
             asg.setLaunchTemplateVersion(refresh.getDesiredLaunchTemplateVersion());
         }
     }
 
-    private static List<String> markInstancesForRefresh(AutoScalingGroup asg, InstanceRefresh refresh) {
+    private static List<String> selectRefreshCandidates(AutoScalingGroup asg, InstanceRefresh refresh) {
         boolean skipMatching = Boolean.TRUE.equals(refresh.getSkipMatching());
         List<String> instanceIds = new ArrayList<>();
         for (AsgInstance instance : asg.getInstances()) {
-            if (!isRefreshCandidate(instance, asg, skipMatching)) {
+            if (!isRefreshCandidate(instance, asg, refresh, skipMatching)) {
                 continue;
             }
-            instance.setLifecycleState("Terminating");
             instanceIds.add(instance.getInstanceId());
         }
         return instanceIds;
     }
 
-    private static boolean isRefreshCandidate(AsgInstance instance, AutoScalingGroup asg, boolean skipMatching) {
+    private static boolean isRefreshCandidate(AsgInstance instance, AutoScalingGroup asg,
+                                              InstanceRefresh refresh, boolean skipMatching) {
         String state = instance.getLifecycleState();
         if (!"Pending".equals(state) && !"InService".equals(state)) {
             return false;
@@ -975,47 +1004,138 @@ public class AutoScalingService {
         if (!skipMatching) {
             return true;
         }
-        if (isDynamicLaunchTemplateVersion(asg.getLaunchTemplateVersion())
-                && (asg.getLaunchTemplateId() != null || asg.getLaunchTemplateName() != null)) {
-            return true;
-        }
-        return !Objects.equals(instance.getLaunchConfigurationName(), asg.getLaunchConfigurationName())
-                || !Objects.equals(instance.getLaunchTemplateId(), asg.getLaunchTemplateId())
-                || !Objects.equals(instance.getLaunchTemplateName(), asg.getLaunchTemplateName())
-                || !Objects.equals(instance.getLaunchTemplateVersion(), asg.getLaunchTemplateVersion());
-    }
-
-    private static int remainingInstancesToUpdate(AutoScalingGroup asg) {
-        int remaining = 0;
-        int matchingInService = 0;
-        for (AsgInstance instance : asg.getInstances()) {
-            String state = instance.getLifecycleState();
-            if ("Terminating".equals(state) || "Pending".equals(state)) {
-                remaining++;
-                continue;
-            }
-            if ("InService".equals(state)) {
-                if (matchesCurrentLaunchSource(instance, asg)) {
-                    matchingInService++;
-                } else {
-                    remaining++;
-                }
+        String launchTemplateId = refresh.hasDesiredConfiguration()
+                ? refresh.getDesiredLaunchTemplateId() : asg.getLaunchTemplateId();
+        String launchTemplateName = refresh.hasDesiredConfiguration()
+                ? refresh.getDesiredLaunchTemplateName() : asg.getLaunchTemplateName();
+        String launchTemplateVersion = refresh.hasDesiredConfiguration()
+                ? refresh.getDesiredLaunchTemplateVersion() : asg.getLaunchTemplateVersion();
+        MixedInstancesPolicy mixedPolicy = refresh.getDesiredMixedInstancesPolicy() != null
+                ? refresh.getDesiredMixedInstancesPolicy() : asg.getMixedInstancesPolicy();
+        MixedInstancesPolicy.LaunchTemplateSpecification mixedSpecification =
+                mixedInstancesLaunchTemplateSpecification(mixedPolicy);
+        if (mixedSpecification != null) {
+            launchTemplateId = mixedSpecification.getLaunchTemplateId();
+            launchTemplateName = mixedSpecification.getLaunchTemplateName();
+            launchTemplateVersion = mixedSpecification.getVersion();
+            Set<String> overrideTypes = mixedPolicy.getLaunchTemplate().getOverrides().stream()
+                    .map(MixedInstancesPolicy.LaunchTemplateOverride::getInstanceType)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toSet());
+            if (!overrideTypes.isEmpty() && !overrideTypes.contains(instance.getInstanceType())) {
+                return true;
             }
         }
-        remaining += Math.max(0, asg.getDesiredCapacity() - matchingInService);
-        return remaining;
-    }
-
-    private static boolean matchesCurrentLaunchSource(AsgInstance instance, AutoScalingGroup asg) {
-        if (isDynamicLaunchTemplateVersion(asg.getLaunchTemplateVersion())
-                && Objects.equals(instance.getLaunchTemplateId(), asg.getLaunchTemplateId())
-                && Objects.equals(instance.getLaunchTemplateName(), asg.getLaunchTemplateName())) {
+        if (isDynamicLaunchTemplateVersion(launchTemplateVersion)
+                && (launchTemplateId != null || launchTemplateName != null)) {
             return true;
         }
-        return Objects.equals(instance.getLaunchConfigurationName(), asg.getLaunchConfigurationName())
-                && Objects.equals(instance.getLaunchTemplateId(), asg.getLaunchTemplateId())
-                && Objects.equals(instance.getLaunchTemplateName(), asg.getLaunchTemplateName())
-                && Objects.equals(instance.getLaunchTemplateVersion(), asg.getLaunchTemplateVersion());
+        String launchConfigurationName = refresh.hasDesiredConfiguration()
+                ? null : asg.getLaunchConfigurationName();
+        return !Objects.equals(instance.getLaunchConfigurationName(), launchConfigurationName)
+                || !Objects.equals(instance.getLaunchTemplateId(), launchTemplateId)
+                || !Objects.equals(instance.getLaunchTemplateName(), launchTemplateName)
+                || !Objects.equals(instance.getLaunchTemplateVersion(), launchTemplateVersion);
+    }
+
+    private static void validateRefreshRequest(InstanceRefresh refresh) {
+        int minHealthy = refresh.getMinHealthyPercentage() != null ? refresh.getMinHealthyPercentage() : 90;
+        int maxHealthy = refresh.getMaxHealthyPercentage() != null ? refresh.getMaxHealthyPercentage() : 100;
+        if (minHealthy < 0 || minHealthy > 100 || maxHealthy < 100 || maxHealthy > 200
+                || minHealthy > maxHealthy || maxHealthy - minHealthy > 100) {
+            throw new AwsException("ValidationError",
+                    "Instance refresh healthy percentages are not valid.", 400);
+        }
+        if (refresh.getInstanceWarmup() != null && refresh.getInstanceWarmup() < 0) {
+            throw new AwsException("ValidationError", "InstanceWarmup must not be negative.", 400);
+        }
+        if (Boolean.TRUE.equals(refresh.getAutoRollback())) {
+            throw new AwsException("ValidationError",
+                    "AutoRollback is not supported for this instance refresh implementation.", 400);
+        }
+        if (!"Rolling".equals(normalizeRefreshStrategy(refresh.getStrategy()))) {
+            throw new AwsException("ValidationError",
+                    "Only the Rolling instance refresh strategy is supported.", 400);
+        }
+        if (refresh.getCheckpointDelay() != null || refresh.getBakeTime() != null
+                || !refresh.getCheckpointPercentages().isEmpty()) {
+            throw new AwsException("ValidationError",
+                    "Checkpoint and bake preferences are not supported for this instance refresh implementation.", 400);
+        }
+        if (refresh.getScaleInProtectedInstances() != null || refresh.getStandbyInstances() != null) {
+            throw new AwsException("ValidationError",
+                    "Protected and standby instance preferences are not supported for this instance refresh implementation.", 400);
+        }
+        if (refresh.getDesiredMixedInstancesPolicy() != null
+                && (refresh.getDesiredLaunchTemplateId() != null
+                || refresh.getDesiredLaunchTemplateName() != null
+                || refresh.getDesiredLaunchTemplateVersion() != null)) {
+            throw new AwsException("ValidationError",
+                    "DesiredConfiguration cannot contain both LaunchTemplate and MixedInstancesPolicy.", 400);
+        }
+    }
+
+    private static void applyRefreshDefaults(InstanceRefresh refresh) {
+        if (refresh.getMinHealthyPercentage() == null) { refresh.setMinHealthyPercentage(90); }
+        if (refresh.getMaxHealthyPercentage() == null) { refresh.setMaxHealthyPercentage(100); }
+        if (refresh.getInstanceWarmup() == null) { refresh.setInstanceWarmup(0); }
+        if (refresh.getSkipMatching() == null) { refresh.setSkipMatching(false); }
+    }
+
+    private static void snapshotSourceConfiguration(AutoScalingGroup asg, InstanceRefresh refresh) {
+        refresh.setSourceLaunchConfigurationName(asg.getLaunchConfigurationName());
+        refresh.setSourceLaunchTemplateId(asg.getLaunchTemplateId());
+        refresh.setSourceLaunchTemplateName(asg.getLaunchTemplateName());
+        refresh.setSourceLaunchTemplateVersion(asg.getLaunchTemplateVersion());
+        refresh.setSourceMixedInstancesPolicy(copyMixedInstancesPolicy(asg.getMixedInstancesPolicy()));
+    }
+
+    static AutoScalingGroup desiredLaunchSource(AutoScalingGroup asg, InstanceRefresh refresh) {
+        AutoScalingGroup source = new AutoScalingGroup();
+        source.setRegion(asg.getRegion());
+        source.setAutoScalingGroupName(asg.getAutoScalingGroupName());
+        source.setLaunchConfigurationName(asg.getLaunchConfigurationName());
+        source.setLaunchTemplateId(asg.getLaunchTemplateId());
+        source.setLaunchTemplateName(asg.getLaunchTemplateName());
+        source.setLaunchTemplateVersion(asg.getLaunchTemplateVersion());
+        source.setMixedInstancesPolicy(copyMixedInstancesPolicy(asg.getMixedInstancesPolicy()));
+        applyDesiredConfiguration(source, refresh);
+        return source;
+    }
+
+    private static MixedInstancesPolicy copyMixedInstancesPolicy(MixedInstancesPolicy source) {
+        if (source == null) { return null; }
+        MixedInstancesPolicy copy = new MixedInstancesPolicy();
+        if (source.getLaunchTemplate() != null) {
+            MixedInstancesPolicy.LaunchTemplate launchCopy = new MixedInstancesPolicy.LaunchTemplate();
+            if (source.getLaunchTemplate().getLaunchTemplateSpecification() != null) {
+                MixedInstancesPolicy.LaunchTemplateSpecification specificationCopy =
+                        new MixedInstancesPolicy.LaunchTemplateSpecification();
+                MixedInstancesPolicy.LaunchTemplateSpecification specification =
+                        source.getLaunchTemplate().getLaunchTemplateSpecification();
+                specificationCopy.setLaunchTemplateId(specification.getLaunchTemplateId());
+                specificationCopy.setLaunchTemplateName(specification.getLaunchTemplateName());
+                specificationCopy.setVersion(specification.getVersion());
+                launchCopy.setLaunchTemplateSpecification(specificationCopy);
+            }
+            launchCopy.setOverrides(source.getLaunchTemplate().getOverrides().stream().map(override -> {
+                MixedInstancesPolicy.LaunchTemplateOverride overrideCopy =
+                        new MixedInstancesPolicy.LaunchTemplateOverride();
+                overrideCopy.setInstanceType(override.getInstanceType());
+                return overrideCopy;
+            }).toList());
+            copy.setLaunchTemplate(launchCopy);
+        }
+        if (source.getInstancesDistribution() != null) {
+            MixedInstancesPolicy.InstancesDistribution distributionCopy =
+                    new MixedInstancesPolicy.InstancesDistribution();
+            distributionCopy.setOnDemandBaseCapacity(source.getInstancesDistribution().getOnDemandBaseCapacity());
+            distributionCopy.setOnDemandPercentageAboveBaseCapacity(
+                    source.getInstancesDistribution().getOnDemandPercentageAboveBaseCapacity());
+            distributionCopy.setSpotAllocationStrategy(source.getInstancesDistribution().getSpotAllocationStrategy());
+            copy.setInstancesDistribution(distributionCopy);
+        }
+        return copy;
     }
 
     private static boolean isLaunchTemplateVersionAlias(String version) {

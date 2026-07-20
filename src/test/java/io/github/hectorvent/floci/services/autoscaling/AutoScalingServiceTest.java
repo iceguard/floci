@@ -22,6 +22,10 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.doThrow;
@@ -69,8 +73,7 @@ class AutoScalingServiceTest {
         request.setMaxHealthyPercentage(120);
         request.setInstanceWarmup(200);
         request.setSkipMatching(true);
-        request.setAutoRollback(true);
-        request.setCheckpointPercentages(List.of(50, 100));
+        request.setAutoRollback(false);
 
         InstanceRefresh refresh = service.startInstanceRefresh(REGION, "test-asg", request);
 
@@ -86,8 +89,8 @@ class AutoScalingServiceTest {
         assertEquals(120, refresh.getMaxHealthyPercentage());
         assertEquals(200, refresh.getInstanceWarmup());
         assertEquals(Boolean.TRUE, refresh.getSkipMatching());
-        assertEquals(Boolean.TRUE, refresh.getAutoRollback());
-        assertEquals(List.of(50, 100), refresh.getCheckpointPercentages());
+        assertEquals(Boolean.FALSE, refresh.getAutoRollback());
+        assertEquals(List.of(), refresh.getCheckpointPercentages());
 
         AutoScalingService.InstanceRefreshPage page =
                 service.describeInstanceRefreshes(REGION, "test-asg", List.of(refresh.getInstanceRefreshId()), null, null);
@@ -397,8 +400,8 @@ class AutoScalingServiceTest {
         assertEquals(AutoScalingService.ACTIVE_INSTANCE_REFRESH_DESIRED_CONFIGURATION_MESSAGE, error.getMessage());
         assertEquals(400, error.getHttpStatus());
         var group = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
-        assertEquals("lt-refresh", group.getLaunchTemplateId());
-        assertEquals("2", group.getLaunchTemplateVersion());
+        assertEquals("lt-original", group.getLaunchTemplateId());
+        assertEquals("1", group.getLaunchTemplateVersion());
         assertEquals(3, group.getMaxSize());
     }
 
@@ -421,7 +424,7 @@ class AutoScalingServiceTest {
     }
 
     @Test
-    void startInstanceRefreshMarksActiveInstancesForReplacement() {
+    void startInstanceRefreshSnapshotsCandidatesWithoutDrainingTheGroup() {
         AutoScalingGroupFixture.addInstance(service, REGION, "test-asg", "i-original", "InService", "lt-original", "1");
 
         InstanceRefresh refresh = service.startInstanceRefresh(REGION, "test-asg", new InstanceRefresh());
@@ -430,13 +433,16 @@ class AutoScalingServiceTest {
         assertEquals("Instance refresh in progress.", refresh.getStatusReason());
         assertEquals(0, refresh.getPercentageComplete());
         assertEquals(1, refresh.getInstancesToUpdate());
+        assertEquals(List.of("i-original"), refresh.getCandidateInstanceIds());
+        assertEquals("i-original", refresh.getReplacements().getFirst().getOriginalInstanceId());
+        assertEquals("Pending", refresh.getReplacements().getFirst().getPhase());
         assertNull(refresh.getEndTime());
 
         AsgInstance instance = service.describeAutoScalingGroups(REGION, List.of("test-asg"))
                 .getFirst()
                 .getInstances()
                 .getFirst();
-        assertEquals("Terminating", instance.getLifecycleState());
+        assertEquals("InService", instance.getLifecycleState());
     }
 
     @Test
@@ -449,6 +455,70 @@ class AutoScalingServiceTest {
 
         assertEquals("InstanceRefreshInProgress", error.getErrorCode());
         assertEquals(400, error.getHttpStatus());
+    }
+
+    @Test
+    void concurrentStartsCreateExactlyOneActiveRefresh() throws Exception {
+        AutoScalingGroupFixture.addInstance(service, REGION, "test-asg", "i-original", "InService", "lt-original", "1");
+        CountDownLatch ready = new CountDownLatch(2);
+        CountDownLatch start = new CountDownLatch(1);
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            Future<Object> first = executor.submit(() -> startRefreshAfterBarrier(ready, start));
+            Future<Object> second = executor.submit(() -> startRefreshAfterBarrier(ready, start));
+            ready.await();
+            start.countDown();
+
+            List<Object> results = List.of(first.get(), second.get());
+            assertEquals(1, results.stream().filter(InstanceRefresh.class::isInstance).count());
+            assertEquals(1, results.stream()
+                    .filter(AwsException.class::isInstance)
+                    .map(AwsException.class::cast)
+                    .filter(error -> "InstanceRefreshInProgress".equals(error.getErrorCode()))
+                    .count());
+            assertEquals(1, service.describeInstanceRefreshes(REGION, "test-asg", List.of(), null, null)
+                    .instanceRefreshes().stream()
+                    .filter(refresh -> "InProgress".equals(refresh.getStatus()))
+                    .count());
+        }
+    }
+
+    @Test
+    void mixedOverrideChangeIsNotSkipped() {
+        MixedInstancesPolicy source = mixedInstancesPolicy("lt-mixed", "1", "t3.small");
+        createWithMixedInstancesPolicy("mixed-refresh", source);
+        AutoScalingGroupFixture.addInstance(service, REGION, "mixed-refresh", "i-original",
+                "InService", "lt-mixed", "1", "t3.small");
+        InstanceRefresh request = new InstanceRefresh();
+        request.setSkipMatching(true);
+        request.setDesiredMixedInstancesPolicy(mixedInstancesPolicy("lt-mixed", "1", "t3.medium"));
+
+        InstanceRefresh refresh = service.startInstanceRefresh(REGION, "mixed-refresh", request);
+
+        assertEquals(List.of("i-original"), refresh.getCandidateInstanceIds());
+        assertEquals("t3.small", source.getLaunchTemplate().getOverrides().getFirst().getInstanceType());
+    }
+
+    @Test
+    void rejectsInvalidHealthyPercentageRange() {
+        InstanceRefresh request = new InstanceRefresh();
+        request.setMinHealthyPercentage(101);
+        request.setMaxHealthyPercentage(100);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.startInstanceRefresh(REGION, "test-asg", request));
+
+        assertEquals("ValidationError", error.getErrorCode());
+    }
+
+    @Test
+    void rejectsAutoRollbackUntilRollbackCanBeCompletedSafely() {
+        InstanceRefresh request = new InstanceRefresh();
+        request.setAutoRollback(true);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.startInstanceRefresh(REGION, "test-asg", request));
+
+        assertEquals("ValidationError", error.getErrorCode());
     }
 
     @Test
@@ -478,19 +548,7 @@ class AutoScalingServiceTest {
 
         assertEquals("InProgress", refresh.getStatus());
         assertEquals(1, refresh.getInstancesToUpdate());
-        AsgInstance original = group.getInstances().getFirst();
-        assertEquals("Terminating", original.getLifecycleState());
-
-        group.getInstances().clear();
-        AutoScalingGroupFixture.addInstance(service, REGION, "test-asg", "i-replacement", "InService", "lt-original", "2");
-        service.completeInstanceRefreshIfSettled(REGION, "test-asg");
-
-        InstanceRefresh completed = service.describeInstanceRefreshes(
-                        REGION, "test-asg", List.of(refresh.getInstanceRefreshId()), null, null)
-                .instanceRefreshes()
-                .getFirst();
-        assertEquals("Successful", completed.getStatus());
-        assertEquals(0, completed.getInstancesToUpdate());
+        assertEquals("InService", group.getInstances().getFirst().getLifecycleState());
     }
 
     @Test
@@ -505,19 +563,7 @@ class AutoScalingServiceTest {
 
         assertEquals("InProgress", refresh.getStatus());
         assertEquals(1, refresh.getInstancesToUpdate());
-        AsgInstance original = group.getInstances().getFirst();
-        assertEquals("Terminating", original.getLifecycleState());
-
-        group.getInstances().clear();
-        AutoScalingGroupFixture.addInstance(service, REGION, "test-asg", "i-replacement", "InService", "lt-original", "2");
-        service.completeInstanceRefreshIfSettled(REGION, "test-asg");
-
-        InstanceRefresh completed = service.describeInstanceRefreshes(
-                        REGION, "test-asg", List.of(refresh.getInstanceRefreshId()), null, null)
-                .instanceRefreshes()
-                .getFirst();
-        assertEquals("Successful", completed.getStatus());
-        assertEquals(0, completed.getInstancesToUpdate());
+        assertEquals("InService", group.getInstances().getFirst().getLifecycleState());
     }
 
     @Test
@@ -532,8 +578,7 @@ class AutoScalingServiceTest {
 
         assertEquals("InProgress", refresh.getStatus());
         assertEquals(1, refresh.getInstancesToUpdate());
-        AsgInstance original = group.getInstances().getFirst();
-        assertEquals("Terminating", original.getLifecycleState());
+        assertEquals("InService", group.getInstances().getFirst().getLifecycleState());
     }
 
     @Test
@@ -548,50 +593,7 @@ class AutoScalingServiceTest {
 
         assertEquals("InProgress", refresh.getStatus());
         assertEquals(1, refresh.getInstancesToUpdate());
-        AsgInstance original = group.getInstances().getFirst();
-        assertEquals("Terminating", original.getLifecycleState());
-    }
-
-    @Test
-    void completeInstanceRefreshMarksSettledReplacementSuccessful() {
-        AutoScalingGroupFixture.addInstance(service, REGION, "test-asg", "i-original", "InService", "lt-original", "1");
-        InstanceRefresh request = new InstanceRefresh();
-        request.setDesiredLaunchTemplateId("lt-updated");
-        request.setDesiredLaunchTemplateVersion("2");
-        InstanceRefresh refresh = service.startInstanceRefresh(REGION, "test-asg", request);
-        var group = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
-        group.getInstances().clear();
-        AutoScalingGroupFixture.addInstance(service, REGION, "test-asg", "i-replacement", "InService", "lt-updated", "2");
-
-        service.completeInstanceRefreshIfSettled(REGION, "test-asg");
-
-        InstanceRefresh completed = service.describeInstanceRefreshes(
-                        REGION, "test-asg", List.of(refresh.getInstanceRefreshId()), null, null)
-                .instanceRefreshes()
-                .getFirst();
-        assertEquals("Successful", completed.getStatus());
-        assertEquals(100, completed.getPercentageComplete());
-        assertEquals(0, completed.getInstancesToUpdate());
-        assertNotNull(completed.getEndTime());
-    }
-
-    @Test
-    void completeInstanceRefreshWaitsForReplacementCapacity() {
-        AutoScalingGroupFixture.addInstance(service, REGION, "test-asg", "i-original", "InService", "lt-original", "1");
-        InstanceRefresh refresh = service.startInstanceRefresh(REGION, "test-asg", new InstanceRefresh());
-        var group = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
-        group.getInstances().clear();
-
-        service.completeInstanceRefreshIfSettled(REGION, "test-asg");
-
-        InstanceRefresh inProgress = service.describeInstanceRefreshes(
-                        REGION, "test-asg", List.of(refresh.getInstanceRefreshId()), null, null)
-                .instanceRefreshes()
-                .getFirst();
-        assertEquals("InProgress", inProgress.getStatus());
-        assertEquals(0, inProgress.getPercentageComplete());
-        assertEquals(1, inProgress.getInstancesToUpdate());
-        assertNull(inProgress.getEndTime());
+        assertEquals("InService", group.getInstances().getFirst().getLifecycleState());
     }
 
     @Test
@@ -705,15 +707,49 @@ class AutoScalingServiceTest {
                 java.util.Map.of(), java.util.Map.of());
     }
 
+    private Object startRefreshAfterBarrier(CountDownLatch ready, CountDownLatch start) throws InterruptedException {
+        ready.countDown();
+        start.await();
+        try {
+            return service.startInstanceRefresh(REGION, "test-asg", new InstanceRefresh());
+        } catch (AwsException error) {
+            return error;
+        }
+    }
+
+    private static MixedInstancesPolicy mixedInstancesPolicy(String launchTemplateId, String version,
+                                                              String instanceType) {
+        MixedInstancesPolicy policy = new MixedInstancesPolicy();
+        MixedInstancesPolicy.LaunchTemplate launchTemplate = new MixedInstancesPolicy.LaunchTemplate();
+        MixedInstancesPolicy.LaunchTemplateSpecification specification =
+                new MixedInstancesPolicy.LaunchTemplateSpecification();
+        specification.setLaunchTemplateId(launchTemplateId);
+        specification.setVersion(version);
+        launchTemplate.setLaunchTemplateSpecification(specification);
+        MixedInstancesPolicy.LaunchTemplateOverride override =
+                new MixedInstancesPolicy.LaunchTemplateOverride();
+        override.setInstanceType(instanceType);
+        launchTemplate.setOverrides(List.of(override));
+        policy.setLaunchTemplate(launchTemplate);
+        return policy;
+    }
+
     private static final class AutoScalingGroupFixture {
         private static void addInstance(AutoScalingService service, String region, String name, String instanceId,
                 String lifecycleState, String launchTemplateId, String launchTemplateVersion) {
+            addInstance(service, region, name, instanceId, lifecycleState,
+                    launchTemplateId, launchTemplateVersion, null);
+        }
+
+        private static void addInstance(AutoScalingService service, String region, String name, String instanceId,
+                String lifecycleState, String launchTemplateId, String launchTemplateVersion, String instanceType) {
             AsgInstance instance = new AsgInstance();
             instance.setInstanceId(instanceId);
             instance.setLifecycleState(lifecycleState);
             instance.setHealthStatus("Healthy");
             instance.setLaunchTemplateId(launchTemplateId);
             instance.setLaunchTemplateVersion(launchTemplateVersion);
+            instance.setInstanceType(instanceType);
             service.describeAutoScalingGroups(region, List.of(name))
                     .getFirst()
                     .getInstances()
