@@ -71,6 +71,7 @@ import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.ec2.model.VpcCidrBlockAssociation;
 import io.github.hectorvent.floci.services.ec2.model.VpcEndpoint;
+import io.github.hectorvent.floci.services.servicequotas.ServiceQuotaCatalog;
 import jakarta.annotation.PostConstruct;
 import io.github.hectorvent.floci.services.ec2.model.LaunchSpecification;
 import io.github.hectorvent.floci.services.ec2.model.SpotInstanceRequest;
@@ -606,6 +607,17 @@ public class Ec2Service implements ContainerTeardown {
                                     List<String> securityGroupIds, String subnetId,
                                     String clientToken, List<Tag> instanceTags,
                                     String userData, String iamInstanceProfileArn) {
+        synchronized (standardOnDemandQuotaLock(region)) {
+            return runInstancesUnderQuota(region, imageId, instanceType, minCount, maxCount, keyName,
+                    securityGroupIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn);
+        }
+    }
+
+    private Reservation runInstancesUnderQuota(String region, String imageId, String instanceType,
+                                                int minCount, int maxCount, String keyName,
+                                                List<String> securityGroupIds, String subnetId,
+                                                String clientToken, List<Tag> instanceTags,
+                                                String userData, String iamInstanceProfileArn) {
         if (imageId == null || imageId.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter ImageId", 400);
         }
@@ -649,7 +661,7 @@ public class Ec2Service implements ContainerTeardown {
 
         String effectiveInstanceType = instanceType != null ? instanceType : "t2.micro";
         validateArchitectureCompatibility(imageId, effectiveInstanceType);
-        int count = Math.min(maxCount, Math.max(minCount, 1));
+        int count = admittedInstanceCount(region, effectiveInstanceType, minCount, maxCount);
         String architecture = architectureFor(imageId, effectiveInstanceType);
         for (int i = 0; i < count; i++) {
             String instanceId = "i-" + randomHex(17);
@@ -872,6 +884,12 @@ public class Ec2Service implements ContainerTeardown {
     }
 
     public List<Map<String, String>> terminateInstances(String region, List<String> instanceIds) {
+        synchronized (standardOnDemandQuotaLock(region)) {
+            return terminateInstancesUnderQuota(region, instanceIds);
+        }
+    }
+
+    private List<Map<String, String>> terminateInstancesUnderQuota(String region, List<String> instanceIds) {
         ensureDefaultResources(region);
         List<Map<String, String>> result = new ArrayList<>();
         for (String id : instanceIds) {
@@ -932,6 +950,12 @@ public class Ec2Service implements ContainerTeardown {
     }
 
     public List<Map<String, String>> stopInstances(String region, List<String> instanceIds) {
+        synchronized (standardOnDemandQuotaLock(region)) {
+            return stopInstancesUnderQuota(region, instanceIds);
+        }
+    }
+
+    private List<Map<String, String>> stopInstancesUnderQuota(String region, List<String> instanceIds) {
         ensureDefaultResources(region);
         List<Map<String, String>> result = new ArrayList<>();
         for (String id : instanceIds) {
@@ -959,15 +983,33 @@ public class Ec2Service implements ContainerTeardown {
     }
 
     public List<Map<String, String>> startInstances(String region, List<String> instanceIds) {
-        ensureDefaultResources(region);
-        List<Map<String, String>> result = new ArrayList<>();
-        for (String id : instanceIds) {
-           Instance inst = getRequiredInstance(region, id);
+        synchronized (standardOnDemandQuotaLock(region)) {
+            return startInstancesUnderQuota(region, instanceIds);
+        }
+    }
 
-            if ("terminated".equals(inst.getState().getName())) {
+    private List<Map<String, String>> startInstancesUnderQuota(String region, List<String> instanceIds) {
+        ensureDefaultResources(region);
+        List<Instance> requestedInstances = instanceIds.stream()
+                .map(id -> getRequiredInstance(region, id))
+                .toList();
+        for (Instance instance : requestedInstances) {
+            if ("terminated".equals(instance.getState().getName())) {
                 throw new AwsException("IncorrectInstanceState",
-                        "The instance '" + id + "' is not in a state from which it can be started.", 400);
+                        "The instance '" + instance.getInstanceId()
+                                + "' is not in a state from which it can be started.",
+                        400);
             }
+        }
+        int requestedVcpus = requestedInstances.stream()
+                .filter(instance -> !consumesStandardOnDemandVcpus(instance))
+                .mapToInt(instance -> standardOnDemandVcpus(instance.getInstanceType()))
+                .sum();
+        enforceStandardOnDemandVcpuQuota(region, requestedVcpus, appliedStandardOnDemandVcpuLimit());
+
+        List<Map<String, String>> result = new ArrayList<>();
+        for (Instance inst : requestedInstances) {
+            String id = inst.getInstanceId();
             InstanceState prev = inst.getState();
             if (config.services().ec2().mock()) {
                 inst.setState(InstanceState.running());
@@ -984,6 +1026,84 @@ public class Ec2Service implements ContainerTeardown {
             result.add(entry);
         }
         return result;
+    }
+
+    private Object standardOnDemandQuotaLock(String region) {
+        return lockFor("ec2-standard-on-demand-vcpu-quota::" + region);
+    }
+
+    private int admittedInstanceCount(String region, String instanceType, int minCount, int maxCount) {
+        int minimum = Math.max(minCount, 1);
+        int requested = Math.max(maxCount, minimum);
+        int vcpusPerInstance = standardOnDemandVcpus(instanceType);
+        if (vcpusPerInstance == 0) {
+            return requested;
+        }
+        double limit = appliedStandardOnDemandVcpuLimit();
+        int availableVcpus = Math.max(0, (int) Math.floor(limit - consumedStandardOnDemandVcpus(region)));
+        int admitted = Math.min(requested, availableVcpus / vcpusPerInstance);
+        if (admitted < minimum) {
+            throw vcpuLimitExceeded(limit);
+        }
+        return admitted;
+    }
+
+    private void enforceStandardOnDemandVcpuQuota(String region, int requestedVcpus, double limit) {
+        if (requestedVcpus <= 0) {
+            return;
+        }
+        if (consumedStandardOnDemandVcpus(region) + requestedVcpus > limit) {
+            throw vcpuLimitExceeded(limit);
+        }
+    }
+
+    private int consumedStandardOnDemandVcpus(String region) {
+        return instances.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(this::consumesStandardOnDemandVcpus)
+                .mapToInt(instance -> standardOnDemandVcpus(instance.getInstanceType()))
+                .sum();
+    }
+
+    private double appliedStandardOnDemandVcpuLimit() {
+        return ServiceQuotaCatalog.appliedValue(
+                        config.services().servicequotas(),
+                        ServiceQuotaCatalog.EC2_SERVICE_CODE,
+                        ServiceQuotaCatalog.STANDARD_ON_DEMAND_VCPUS)
+                .orElseThrow();
+    }
+
+    private static AwsException vcpuLimitExceeded(double limit) {
+        String formattedLimit = limit == Math.rint(limit)
+                ? Long.toString((long) limit)
+                : Double.toString(limit);
+        return new AwsException(
+                "VcpuLimitExceeded",
+                "You have requested more vCPU capacity than your current vCPU limit of "
+                        + formattedLimit
+                        + " allows for the instance bucket that the specified instance type belongs to.",
+                400);
+    }
+
+    private boolean consumesStandardOnDemandVcpus(Instance instance) {
+        String state = instance.getState() != null ? instance.getState().getName() : null;
+        return !"stopped".equals(state) && !"terminated".equals(state);
+    }
+
+    private int standardOnDemandVcpus(String instanceType) {
+        return instanceTypeCatalog.find(instanceType)
+                .filter(type -> isStandardOnDemandFamily(type.instanceType))
+                .map(type -> type.vcpu)
+                .orElse(0);
+    }
+
+    private static boolean isStandardOnDemandFamily(String instanceType) {
+        if (instanceType == null || instanceType.isBlank() || instanceType.startsWith("mac")) {
+            return false;
+        }
+        return switch (Character.toLowerCase(instanceType.charAt(0))) {
+            case 'a', 'c', 'd', 'h', 'i', 'm', 'r', 't', 'z' -> true;
+            default -> false;
+        };
     }
 
     public void rebootInstances(String region, List<String> instanceIds) {
