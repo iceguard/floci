@@ -17,8 +17,10 @@ import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 public final class AmiImageTool {
     public static final Path DEFAULT_METADATA = Path.of("docker/ec2/ami-images/image-build-metadata.yaml");
@@ -79,6 +81,10 @@ public final class AmiImageTool {
             provenance.rootfsSha256 = image.canonical.rootfsSha256;
             provenance.manifestUrl = image.canonical.manifestUrl();
             provenance.manifestSha256 = sha256(manifest);
+            if (!image.canonical.manifestSha256.equalsIgnoreCase(provenance.manifestSha256)) {
+                throw new IllegalStateException("Manifest checksum mismatch for " + image.id
+                        + ": expected " + image.canonical.manifestSha256 + " but got " + provenance.manifestSha256);
+            }
             provenance.generatedAt = Instant.now().toString();
             if (write) {
                 YAML.writerWithDefaultPrettyPrinter().writeValue(context.resolve("provenance.yaml").toFile(), provenance);
@@ -115,14 +121,18 @@ public final class AmiImageTool {
         validateImage(image);
         try {
             Catalog catalog = YAML.readValue(catalogPath.toFile(), Catalog.class);
+            Set<String> catalogIds = new LinkedHashSet<>();
+            catalogIds.add(image.catalogImageId);
+            catalogIds.addAll(image.catalogAliases == null ? List.of() : image.catalogAliases);
             CatalogImage staged = catalog.images.stream()
-                    .filter(entry -> image.catalogImageId.equals(entry.imageId))
+                    .filter(entry -> catalogIds.contains(entry.imageId))
                     .findFirst()
                     .orElseGet(() -> {
                         CatalogImage entry = new CatalogImage();
                         catalog.images.add(entry);
                         return entry;
                     });
+            catalog.images.removeIf(entry -> entry != staged && catalogIds.contains(entry.imageId));
             staged.imageId = image.catalogImageId;
             staged.aliases = image.catalogAliases == null ? List.of() : List.copyOf(image.catalogAliases);
             staged.dockerImage = image.docker.image;
@@ -147,22 +157,38 @@ public final class AmiImageTool {
 
     public static void build(ImageSpec image, Path outputRoot) {
         Path context = generate(image, outputRoot, true);
-        run(List.of("docker", "build", "--platform", platform(image.architecture), "-t", image.docker.image, context.toString()));
+        runForPlatform(buildCommand(image, context), image, "build");
     }
 
     public static void smoke(ImageSpec image) {
-        List<String> args = new ArrayList<>();
-        args.addAll(List.of("docker", "run", "--rm", "--entrypoint", "/usr/bin/dpkg-query", image.docker.image, "-W"));
-        args.addAll(image.guest.smokePackages == null ? List.of() : image.guest.smokePackages);
-        run(args);
+        runForPlatform(smokeCommand(image), image, "run");
+    }
+
+    static List<String> buildCommand(ImageSpec image, Path context) {
+        return List.of("docker", "build", "--platform", platform(image.architecture), "-t", image.docker.image,
+                context.toString());
+    }
+
+    static List<String> smokeCommand(ImageSpec image) {
+        String packages = String.join(" ", image.guest.smokePackages == null ? List.of() : image.guest.smokePackages);
+        return List.of("docker", "run", "--rm", "--platform", platform(image.architecture),
+                "--entrypoint", "/bin/sh", image.docker.image, "-c",
+                "set -eu; dpkg-query -W " + packages
+                        + "; cloud-init --version | grep -F '" + image.guest.cloudInitVersion + "'");
     }
 
     static String dockerfile(ImageSpec image) {
         return """
                 FROM scratch
                 LABEL org.opencontainers.image.source="%s"
+                LABEL org.opencontainers.image.version="%s-%s"
+                LABEL org.opencontainers.image.created="%s"
                 LABEL io.floci.ami.catalog-image-id="%s"
                 LABEL io.floci.ami.architecture="%s"
+                LABEL io.floci.ami.canonical.release="%s"
+                LABEL io.floci.ami.rootfs.sha256="%s"
+                LABEL io.floci.ami.manifest.sha256="%s"
+                LABEL io.floci.ami.cloud-init.version="%s"
                 ADD %s /
                 COPY %s /etc/systemd/system/systemd-networkd-wait-online.service.d/floci.conf
                 RUN set -eux; \\
@@ -172,7 +198,18 @@ public final class AmiImageTool {
                 ENV container=docker
                 STOPSIGNAL SIGRTMIN+3
                 CMD ["/sbin/init"]
-                """.formatted(image.canonical.rootfsUrl(), image.catalogImageId, image.architecture, image.canonical.rootfs,
+                """.formatted(
+                image.canonical.rootfsUrl(),
+                image.version,
+                image.canonical.releaseSerial,
+                image.aws.creationDate,
+                image.catalogImageId,
+                image.architecture,
+                image.canonical.releaseSerial,
+                image.canonical.rootfsSha256,
+                image.canonical.manifestSha256,
+                image.guest.cloudInitVersion,
+                image.canonical.rootfs,
                 NETWORKD_WAIT_ONLINE_DROP_IN);
     }
 
@@ -236,13 +273,31 @@ public final class AmiImageTool {
         required(image.aws.virtualizationType, "aws.virtualizationType");
         required(image.aws.rootDeviceType, "aws.rootDeviceType");
         required(image.canonical.baseUrl, "canonical.baseUrl");
+        required(image.canonical.releaseSerial, "canonical.releaseSerial");
         required(image.canonical.rootfs, "canonical.rootfs");
         required(image.canonical.rootfsSha256, "canonical.rootfsSha256");
         required(image.canonical.manifest, "canonical.manifest");
+        required(image.canonical.manifestSha256, "canonical.manifestSha256");
+        requireSha256(image.canonical.rootfsSha256, "canonical.rootfsSha256");
+        requireSha256(image.canonical.manifestSha256, "canonical.manifestSha256");
         required(image.docker.image, "docker.image");
         required(image.guest.runtime, "guest.runtime");
+        if (image.guest.cloudInit) {
+            required(image.guest.cloudInitVersion, "guest.cloudInitVersion");
+        }
+        String immutableReleasePath = "/release-" + image.canonical.releaseSerial;
+        String sourcePath = URI.create(image.canonical.baseUrl).getPath().replaceFirst("/+$", "");
+        if (!sourcePath.endsWith(immutableReleasePath)) {
+            throw new IllegalArgumentException(
+                    "Canonical base URL must use immutable release path " + immutableReleasePath);
+        }
         if (image.canonical.rootfs.contains(":") || isDockerLibraryUbuntu2404(image.docker.image)) {
             throw new IllegalArgumentException("AMI guest images must not use Docker-library ubuntu:24.04 as source");
+        }
+        String contentAddressedTag = "sha256-" + image.canonical.rootfsSha256.toLowerCase();
+        if (!image.docker.image.endsWith("-" + contentAddressedTag)) {
+            throw new IllegalArgumentException(
+                    "AMI guest image tag must end with the full rootfs content address: " + contentAddressedTag);
         }
     }
 
@@ -272,6 +327,12 @@ public final class AmiImageTool {
     private static void required(String value, String field) {
         if (value == null || value.isBlank()) {
             throw new IllegalArgumentException("Missing required AMI image metadata field: " + field);
+        }
+    }
+
+    private static void requireSha256(String value, String field) {
+        if (!value.matches("[0-9a-fA-F]{64}")) {
+            throw new IllegalArgumentException("AMI image metadata field must be a SHA-256 digest: " + field);
         }
     }
 
@@ -335,6 +396,15 @@ public final class AmiImageTool {
         }
     }
 
+    private static void runForPlatform(List<String> command, ImageSpec image, String operation) {
+        try {
+            run(command);
+        } catch (IllegalStateException e) {
+            throw new IllegalStateException("Could not " + operation + " AMI guest for " + platform(image.architecture)
+                    + "; use a matching host or enable Docker binfmt/QEMU support for that platform", e);
+        }
+    }
+
     private record Options(String command, Path metadata, Path output, Path catalog, String imageId) {
         static Options parse(String[] args) {
             if (args.length == 0) {
@@ -393,10 +463,12 @@ public final class AmiImageTool {
 
     @JsonIgnoreProperties(ignoreUnknown = true)
     public static final class Canonical {
+        public String releaseSerial;
         public String baseUrl;
         public String rootfs;
         public String rootfsSha256;
         public String manifest;
+        public String manifestSha256;
 
         String rootfsUrl() {
             return joinUrl(baseUrl, rootfs);
@@ -420,6 +492,7 @@ public final class AmiImageTool {
     public static final class Guest {
         public String runtime;
         public boolean cloudInit;
+        public String cloudInitVersion;
         public List<String> smokePackages = List.of();
     }
 
