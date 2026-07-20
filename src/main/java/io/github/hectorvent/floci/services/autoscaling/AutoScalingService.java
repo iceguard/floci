@@ -185,7 +185,8 @@ public class AutoScalingService {
         asg.setAutoScalingGroupName(name);
         asg.setAutoScalingGroupArn(
                 AwsArnUtils.Arn.of("autoscaling", region, regionResolver.getAccountId(),
-                        "autoScalingGroup:" + name).toString());
+                        "autoScalingGroup:" + UUID.randomUUID()
+                                + ":autoScalingGroupName/" + name).toString());
         asg.setLaunchConfigurationName(launchConfigName);
         asg.setLaunchTemplateId(launchTemplateId);
         asg.setLaunchTemplateName(launchTemplateName);
@@ -313,6 +314,10 @@ public class AutoScalingService {
         return groups.values().stream()
                 .filter(g -> region == null || region.equals(g.getRegion()))
                 .collect(Collectors.toList());
+    }
+
+    public AutoScalingGroup requireAutoScalingGroup(String region, String name) {
+        return requireGroup(region, name);
     }
 
     public void saveAutoScalingGroup(AutoScalingGroup asg) {
@@ -623,7 +628,10 @@ public class AutoScalingService {
     public void deletePolicy(String region, String asgName, String policyNameOrArn) {
         policies.entrySet().removeIf(e -> {
             ScalingPolicy p = e.getValue();
-            return p.getPolicyName().equals(policyNameOrArn) || p.getPolicyArn().equals(policyNameOrArn);
+            return region.equals(p.getRegion())
+                    && asgName.equals(p.getAutoScalingGroupName())
+                    && (p.getPolicyName().equals(policyNameOrArn)
+                    || p.getPolicyArn().equals(policyNameOrArn));
         });
     }
 

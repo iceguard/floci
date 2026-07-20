@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.services.iam;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsFormRequestResolver;
+import io.github.hectorvent.floci.core.common.IamConditionContextResolver.ResourceAwareConditionContext;
+import io.github.hectorvent.floci.services.autoscaling.AutoScalingService;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
@@ -25,11 +27,14 @@ public class ResourceArnBuilder {
 
     private final IamService iamService;
     private final AwsFormRequestResolver formRequestResolver;
+    private final AutoScalingService autoScalingService;
 
     @Inject
-    public ResourceArnBuilder(IamService iamService, AwsFormRequestResolver formRequestResolver) {
+    public ResourceArnBuilder(IamService iamService, AwsFormRequestResolver formRequestResolver,
+                              AutoScalingService autoScalingService) {
         this.iamService = iamService;
         this.formRequestResolver = formRequestResolver;
+        this.autoScalingService = autoScalingService;
     }
 
     public String build(String credentialScope, ContainerRequestContext ctx,
@@ -46,6 +51,7 @@ public class ResourceArnBuilder {
             case "ssm"            -> buildSsmArn(ctx, region, accountId);
             case "kms"            -> buildKmsArn(path, region, accountId);
             case "iam"            -> buildIamArn(ctx, accountId);
+            case "autoscaling"    -> buildAutoScalingArn(ctx, region, accountId);
             default               -> "*";
         };
     }
@@ -63,6 +69,13 @@ public class ResourceArnBuilder {
 
     public List<AuthorizationRequest> additionalAuthorizations(
             String action, String primaryResource, Map<String, List<String>> conditionContext) {
+        if ("autoscaling:CreateOrUpdateTags".equals(action)
+                && conditionContext instanceof ResourceAwareConditionContext resourceAware) {
+            return resourceAware.additionalResources().stream()
+                    .map(resource -> new AuthorizationRequest(
+                            action, resource.resourceArn(), resource.conditionContext()))
+                    .toList();
+        }
         return List.of();
     }
 
@@ -179,6 +192,48 @@ public class ResourceArnBuilder {
             LOG.debugv("Unable to resolve IAM role resource {0}: {1}", roleName, e.getMessage());
             return AwsArnUtils.Arn.of("iam", "", accountId, "role/" + roleName).toString();
         }
+    }
+
+    // ── Auto Scaling ─────────────────────────────────────────────────────────────
+    private String buildAutoScalingArn(ContainerRequestContext ctx, String region, String accountId) {
+        String action = formRequestResolver.firstParameter(ctx, "Action");
+        if ("CreateAutoScalingGroup".equals(action)) {
+            return futureAutoScalingGroupArn(
+                    formRequestResolver.firstParameter(ctx, "AutoScalingGroupName"), region, accountId);
+        }
+        if ("CreateOrUpdateTags".equals(action)) {
+            return exactAutoScalingGroupArn(
+                    formRequestResolver.firstParameter(ctx, "Tags.member.1.ResourceId"), region, accountId);
+        }
+        if ("DeleteAutoScalingGroup".equals(action)
+                || "PutLifecycleHook".equals(action)
+                || "DeleteLifecycleHook".equals(action)
+                || "PutScalingPolicy".equals(action)
+                || "DeletePolicy".equals(action)) {
+            String name = formRequestResolver.firstParameter(ctx, "AutoScalingGroupName");
+            return exactAutoScalingGroupArn(name, region, accountId);
+        }
+        return "*";
+    }
+
+    private String exactAutoScalingGroupArn(String name, String region, String accountId) {
+        if (name == null || name.isBlank()) {
+            return "*";
+        }
+        try {
+            return autoScalingService.requireAutoScalingGroup(region, name).getAutoScalingGroupArn();
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve Auto Scaling group {0}: {1}", name, e.getMessage());
+            return futureAutoScalingGroupArn(name, region, accountId);
+        }
+    }
+
+    private String futureAutoScalingGroupArn(String name, String region, String accountId) {
+        return name == null || name.isBlank()
+                ? "*"
+                : AwsArnUtils.Arn.of("autoscaling", region, accountId,
+                        "autoScalingGroup:00000000-0000-0000-0000-000000000000:"
+                                + "autoScalingGroupName/" + name).toString();
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────────
