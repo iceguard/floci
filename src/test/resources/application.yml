@@ -265,6 +265,9 @@ floci:
     cloudtrail:
       enabled: true
     lightsail:
+    servicequotas:
+      enabled: true
+      standard-on-demand-vcpus: 100
     cloudcontrol:
       enabled: true
     cloudfront:

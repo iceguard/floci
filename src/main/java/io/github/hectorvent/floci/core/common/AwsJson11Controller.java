@@ -24,6 +24,7 @@ import io.github.hectorvent.floci.services.cloudcontrol.CloudControlJsonHandler;
 import io.github.hectorvent.floci.services.configservice.ConfigServiceJsonHandler;
 import io.github.hectorvent.floci.services.cur.CurJsonHandler;
 import io.github.hectorvent.floci.services.pricing.PricingJsonHandler;
+import io.github.hectorvent.floci.services.servicequotas.ServiceQuotasJsonHandler;
 import io.github.hectorvent.floci.services.textract.TextractJsonHandler;
 import io.github.hectorvent.floci.services.transcribe.TranscribeJsonHandler;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2JsonHandler;
@@ -98,6 +99,7 @@ public class AwsJson11Controller {
     private final ConfigServiceJsonHandler configServiceJsonHandler;
     private final CloudTrailJsonHandler cloudTrailJsonHandler;
     private final LightsailJsonHandler lightsailJsonHandler;
+    private final ServiceQuotasJsonHandler serviceQuotasJsonHandler;
     private final CloudControlJsonHandler cloudControlJsonHandler;
 
     @Inject
@@ -132,6 +134,7 @@ public class AwsJson11Controller {
                                ConfigServiceJsonHandler configServiceJsonHandler,
                                CloudTrailJsonHandler cloudTrailJsonHandler,
                                LightsailJsonHandler lightsailJsonHandler,
+                               ServiceQuotasJsonHandler serviceQuotasJsonHandler,
                                CloudControlJsonHandler cloudControlJsonHandler) {
         this.objectMapper = objectMapper;
         this.strictBodyReader = objectMapper.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
@@ -170,6 +173,7 @@ public class AwsJson11Controller {
         this.configServiceJsonHandler = configServiceJsonHandler;
         this.cloudTrailJsonHandler = cloudTrailJsonHandler;
         this.lightsailJsonHandler = lightsailJsonHandler;
+        this.serviceQuotasJsonHandler = serviceQuotasJsonHandler;
         this.cloudControlJsonHandler = cloudControlJsonHandler;
     }
 
@@ -239,6 +243,7 @@ public class AwsJson11Controller {
                 case "config" -> configServiceJsonHandler.handle(action, request, region);
                 case "cloudtrail" -> cloudTrailJsonHandler.handle(action, request, region);
                 case "lightsail" -> lightsailJsonHandler.handle(action, request, region);
+                case "servicequotas" -> serviceQuotasJsonHandler.handle(action, request, region);
                 case "cloudcontrol" -> cloudControlJsonHandler.handle(action, request, region);
                 default -> null;
             };

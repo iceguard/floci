@@ -26,6 +26,10 @@ services:
     doc: docs/services/cloudtrail.md
     sources:
       - { path: src/main/java/io/github/hectorvent/floci/services/cloudtrail/CloudTrailJsonHandler.java, mode: switch }
+  - service: servicequotas
+    doc: docs/services/service-quotas.md
+    sources:
+      - { path: src/main/java/io/github/hectorvent/floci/services/servicequotas/ServiceQuotasJsonHandler.java, mode: switch }
   - service: docdb
     doc: docs/services/docdb.md
     sources:

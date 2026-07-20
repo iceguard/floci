@@ -158,6 +158,28 @@ class Ec2ServiceConcurrencyTest {
     }
 
     @Test
+    void concurrentRunInstancesCannotOversubscribeStandardOnDemandVcpuQuota() throws Exception {
+        Ec2Service service = newService();
+        AtomicInteger admitted = new AtomicInteger();
+        AtomicInteger quotaDenied = new AtomicInteger();
+
+        runRaceAllowing(i -> {
+            try {
+                service.runInstances("us-east-1", "ami-1234567890abcdef0", "m8gd.medium",
+                        1, 1, null, List.of(), null, null, List.of(), null, null);
+                admitted.incrementAndGet();
+            } catch (AwsException e) {
+                assertEquals("VcpuLimitExceeded", e.getErrorCode());
+                quotaDenied.incrementAndGet();
+            }
+        });
+
+        assertEquals(17, admitted.get());
+        assertEquals(N - 17, quotaDenied.get());
+        assertEquals(17, service.describeInstances("us-east-1", List.of(), Map.of()).size());
+    }
+
+    @Test
     void concurrentReplaceNetworkAclAssociationMovesTheSubnetOnce() throws Exception {
         for (int trial = 0; trial < TRIALS; trial++) {
             String region = "race-aclassoc-" + trial;
@@ -246,10 +268,14 @@ class Ec2ServiceConcurrencyTest {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
+        EmulatorConfig.ServiceQuotasServiceConfig serviceQuotas =
+                mock(EmulatorConfig.ServiceQuotasServiceConfig.class);
         when(config.defaultAccountId()).thenReturn("000000000000");
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
+        when(services.servicequotas()).thenReturn(serviceQuotas);
         when(ec2.mock()).thenReturn(true);
+        when(serviceQuotas.standardOnDemandVcpus()).thenReturn(17);
         return config;
     }
 
