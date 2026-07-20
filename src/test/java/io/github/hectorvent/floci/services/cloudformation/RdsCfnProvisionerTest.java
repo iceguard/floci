@@ -193,7 +193,7 @@ class RdsCfnProvisionerTest {
     void provisionsDbParameterGroup() {
         DbParameterGroup group = mock(DbParameterGroup.class);
         when(group.getDbParameterGroupName()).thenReturn("my-pg");
-        when(rdsService.createDbParameterGroup(any(), any(), any())).thenReturn(group);
+        when(rdsService.createDbParameterGroup(any(), any(), any(), any(), anyMap())).thenReturn(group);
 
         StackResource r = provision("Pg", "AWS::RDS::DBParameterGroup", """
                 {"DBParameterGroupName":"my-pg","Family":"postgres16","Description":"params"}
@@ -201,7 +201,8 @@ class RdsCfnProvisionerTest {
 
         assertEquals("my-pg", r.getPhysicalId());
         assertEquals("my-pg", r.getAttributes().get("DBParameterGroupName"));
-        verify(rdsService).createDbParameterGroup("my-pg", "postgres16", "params");
+        verify(rdsService).createDbParameterGroup(
+                "my-pg", "postgres16", "params", "us-east-1", Map.of());
     }
 
     @Test
@@ -214,10 +215,10 @@ class RdsCfnProvisionerTest {
         verify(rdsService).deleteDbCluster("mycluster");
 
         provisioner.delete("AWS::RDS::DBSubnetGroup", "my-subnet-group", "us-east-1");
-        verify(rdsService).deleteDbSubnetGroup("my-subnet-group");
+        verify(rdsService).deleteDbSubnetGroup("my-subnet-group", "us-east-1");
 
         provisioner.delete("AWS::RDS::DBParameterGroup", "my-pg", "us-east-1");
-        verify(rdsService).deleteDbParameterGroup("my-pg");
+        verify(rdsService).deleteDbParameterGroup("my-pg", "us-east-1");
 
         provisioner.delete("AWS::RDS::DBClusterParameterGroup", "my-cpg", "us-east-1");
         verify(rdsService).deleteDbClusterParameterGroup("my-cpg");
