@@ -47,7 +47,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     /** Extracts the credential-scope service name (e.g. "s3", "lambda"). */
     private static final Pattern SERVICE_PATTERN =
-            Pattern.compile("Credential=\\S+/\\d{8}/[^/]+/([^/]+)/");
+            Pattern.compile("(?:Credential=)?[^/\\s]+/\\d{8}/[^/]+/([^/]+)/");
 
     private final EmulatorConfig config;
     private final AccountResolver accountResolver;
@@ -85,21 +85,21 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
     @Override
     public void filter(ContainerRequestContext ctx) {
-        if (!config.services().iam().enforcementEnabled()) {
-            return;
-        }
-
         String auth = ctx.getHeaderString("Authorization");
-        if (auth == null) {
+        String presignedCredential = auth == null
+                ? ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Credential") : null;
+        if (auth == null && presignedCredential == null) {
             return;
         }
 
-        String akid = accountResolver.extractAccessKeyId(auth);
+        String akid = auth == null
+                ? accountResolver.extractPresignedAccessKeyId(presignedCredential)
+                : accountResolver.extractAccessKeyId(auth);
         if (akid == null || "test".equals(akid)) {
             return; // root bypass
         }
 
-        String credentialScope = extractCredentialScope(auth);
+        String credentialScope = extractCredentialScope(auth == null ? presignedCredential : auth);
         if (credentialScope == null) {
             return;
         }
@@ -109,7 +109,24 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             return; // unknown action → ALLOW (permissive)
         }
 
-        CallerContext caller = iamService.resolveCallerContext(akid);
+        // AWS does not permission-control these authentication operations. The STS handler
+        // still authenticates temporary credential tuples and rejects nested GetSessionToken.
+        if ("sts:GetCallerIdentity".equals(action) || "sts:GetSessionToken".equals(action)) {
+            return;
+        }
+
+        String sessionToken = securityToken(ctx, auth != null);
+        if (!iamService.isSessionActionAllowed(akid, sessionToken, action)) {
+            LOG.infov("IAM session restriction DENY: akid={0} action={1}", akid, action);
+            ctx.abortWith(accessDeniedResponse(action, credentialScope, ctx.getMediaType()));
+            return;
+        }
+
+        if (!config.services().iam().enforcementEnabled()) {
+            return;
+        }
+
+        CallerContext caller = iamService.resolveCallerContext(akid, sessionToken);
         if (caller == null) {
             return; // unknown access key → bypass (backward-compat)
         }
@@ -238,6 +255,12 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         return m.find() ? m.group(1) : null;
     }
 
+    private static String securityToken(ContainerRequestContext ctx, boolean headerCredential) {
+        return headerCredential
+                ? ctx.getHeaderString("X-Amz-Security-Token")
+                : ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Security-Token");
+    }
+
     /**
      * Builds a 403 Access Denied response in the wire format the calling SDK
      * expects. AWS SDKs hard-fail when they receive the wrong shape: an XML
@@ -254,13 +277,18 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     // Package-private for unit testing.
     static Response accessDeniedResponse(String action, String credentialScope, MediaType requestMediaType) {
         String message = "User is not authorized to perform: " + action;
+        return awsErrorResponse("AccessDenied", message, credentialScope, requestMediaType);
+    }
+
+    static Response awsErrorResponse(String code, String message,
+                                     String credentialScope, MediaType requestMediaType) {
         if ("s3".equals(credentialScope)) {
-            return s3XmlAccessDenied(message);
+            return s3XmlError(code, message);
         }
         if (isFormEncoded(requestMediaType)) {
-            return queryXmlAccessDenied(message);
+            return queryXmlError(code, message);
         }
-        return jsonAccessDenied(message);
+        return jsonError(code, message);
     }
 
     private static boolean isFormEncoded(MediaType mt) {
@@ -269,12 +297,12 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 && "x-www-form-urlencoded".equalsIgnoreCase(mt.getSubtype());
     }
 
-    private static Response queryXmlAccessDenied(String message) {
+    private static Response queryXmlError(String code, String message) {
         String xml = new XmlBuilder()
                 .start("ErrorResponse")
                   .start("Error")
                     .elem("Type", "Sender")
-                    .elem("Code", "AccessDenied")
+                    .elem("Code", code)
                     .elem("Message", message)
                   .end("Error")
                   .elem("RequestId", UUID.randomUUID().toString())
@@ -283,11 +311,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         return Response.status(403).type(MediaType.APPLICATION_XML).entity(xml).build();
     }
 
-    private static Response s3XmlAccessDenied(String message) {
+    private static Response s3XmlError(String code, String message) {
         String xml = new XmlBuilder()
                 .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
                 .start("Error")
-                  .elem("Code", "AccessDenied")
+                  .elem("Code", code)
                   .elem("Message", message)
                   .elem("RequestId", UUID.randomUUID().toString())
                 .end("Error")
@@ -295,8 +323,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         return Response.status(403).type(MediaType.APPLICATION_XML).entity(xml).build();
     }
 
-    private static Response jsonAccessDenied(String message) {
-        String body = "{\"__type\":\"AccessDeniedException\",\"message\":\"" + message + "\"}";
+    private static Response jsonError(String code, String message) {
+        String jsonType = "AccessDenied".equals(code) ? "AccessDeniedException" : code;
+        String body = "{\"__type\":\"" + jsonType + "\",\"message\":\"" + message + "\"}";
         return Response.status(403).type(MediaType.APPLICATION_JSON).entity(body).build();
     }
 }
