@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
 import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration;
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.Ec2UserData;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
@@ -285,7 +286,7 @@ public class AutoScalingReconciler {
                 : asg.getAvailabilityZones().get(0);
         String subnetId = asg.getSubnetIds().isEmpty() ? null : asg.getSubnetIds().get(0);
         try {
-            Reservation reservation = ec2Service.runInstances(
+            Reservation reservation = ec2Service.runInstancesWithUserData(
                     asg.getRegion(),
                     launchSource.imageId(),
                     launchSource.instanceType(),
@@ -409,7 +410,7 @@ public class AutoScalingReconciler {
                     lc.getKeyName(),
                     lc.getSecurityGroups(),
                     List.of(),
-                    lc.getUserData(),
+                    Ec2UserData.fromEncoded(lc.getUserData()),
                     lc.getIamInstanceProfile(),
                     null,
                     null,
@@ -434,7 +435,7 @@ public class AutoScalingReconciler {
                     version.getKeyName(),
                     version.getSecurityGroupIds(),
                     version.getInstanceTags(),
-                    version.getUserData(),
+                    Ec2UserData.fromEncoded(version.getEncodedUserData()),
                     version.getIamInstanceProfileArn(),
                     asg.getLaunchTemplateId(),
                     asg.getLaunchTemplateName(),
@@ -463,7 +464,7 @@ public class AutoScalingReconciler {
                         version.getKeyName(),
                         version.getSecurityGroupIds(),
                         version.getInstanceTags(),
-                        version.getUserData(),
+                        Ec2UserData.fromEncoded(version.getEncodedUserData()),
                         version.getIamInstanceProfileArn(),
                         specification.getLaunchTemplateId() == null
                                 ? mixedLaunchTemplate.getLaunchTemplateId()
@@ -554,7 +555,7 @@ public class AutoScalingReconciler {
             String keyName,
             List<String> securityGroupIds,
             List<io.github.hectorvent.floci.services.ec2.model.Tag> instanceTags,
-            String userData,
+            Ec2UserData userData,
             String iamInstanceProfile,
             String launchTemplateId,
             String launchTemplateName,

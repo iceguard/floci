@@ -13,6 +13,8 @@ import io.github.hectorvent.floci.services.ec2.model.Image;
 import io.github.hectorvent.floci.services.ec2.model.NetworkAcl;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
+import io.github.hectorvent.floci.services.ec2.model.LaunchSpecification;
 import io.github.hectorvent.floci.services.ec2.model.NatGateway;
 import io.github.hectorvent.floci.services.ec2.model.RouteTable;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
@@ -28,7 +30,10 @@ import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 
@@ -69,6 +74,137 @@ class Ec2ServicePersistenceTest {
                 REGION, List.of(), Map.of("attachment.vpc-id", List.of("vpc-0123456789abcdef0"))).isEmpty());
         assertTrue(restarted.describeEgressOnlyInternetGatewayIds(
                 REGION, List.of(), Map.of("tag:Owner", List.of("TeamA"))).isEmpty());
+    }
+
+    @Test
+    void exactUserDataBytesSurviveRestart(@TempDir Path dir) {
+        byte[] bytes = new byte[]{0x1f, (byte) 0x8b, 0x00, (byte) 0xff};
+        String encoded = Base64.getEncoder().encodeToString(bytes);
+
+        Instance instance = new Instance();
+        instance.setInstanceId("i-user-data-persistence");
+        instance.setEncodedUserData(encoded);
+        StorageBackend<String, Instance> firstInstances = load(
+                dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {});
+        firstInstances.put(REGION + "::" + instance.getInstanceId(), instance);
+
+        LaunchTemplateData version = new LaunchTemplateData();
+        version.setEncodedUserData(encoded);
+        LaunchTemplate launchTemplate = new LaunchTemplate();
+        launchTemplate.setLaunchTemplateId("lt-user-data-persistence");
+        launchTemplate.setEncodedUserData(encoded);
+        launchTemplate.getVersions().put("1", version);
+        StorageBackend<String, LaunchTemplate> firstTemplates = load(
+                dir, "ec2-launch-templates.json", new TypeReference<Map<String, LaunchTemplate>>() {});
+        firstTemplates.put(REGION + "::" + launchTemplate.getLaunchTemplateId(), launchTemplate);
+
+        LaunchSpecification specification = new LaunchSpecification();
+        specification.setEncodedUserData(encoded);
+        SpotInstanceRequest spotRequest = new SpotInstanceRequest();
+        spotRequest.setSpotInstanceRequestId("sir-user-data-persistence");
+        spotRequest.setLaunchSpecification(specification);
+        StorageBackend<String, SpotInstanceRequest> firstSpotRequests = load(
+                dir, "ec2-spot-instance-requests.json",
+                new TypeReference<Map<String, SpotInstanceRequest>>() {});
+        firstSpotRequests.put(REGION + "::" + spotRequest.getSpotInstanceRequestId(), spotRequest);
+
+        StorageBackend<String, Instance> restartedInstances = load(
+                dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {});
+        assertEquals(encoded, restartedInstances.get(REGION + "::" + instance.getInstanceId())
+                .orElseThrow()
+                .getEncodedUserData());
+        StorageBackend<String, LaunchTemplate> restartedTemplates = load(
+                dir, "ec2-launch-templates.json", new TypeReference<Map<String, LaunchTemplate>>() {});
+        LaunchTemplate restartedTemplate = restartedTemplates.get(
+                REGION + "::" + launchTemplate.getLaunchTemplateId()).orElseThrow();
+        assertEquals(encoded, restartedTemplate.getEncodedUserData());
+        assertEquals(encoded, restartedTemplate.getVersions().get("1").getEncodedUserData());
+        StorageBackend<String, SpotInstanceRequest> restartedSpotRequests = load(
+                dir, "ec2-spot-instance-requests.json",
+                new TypeReference<Map<String, SpotInstanceRequest>>() {});
+        assertEquals(encoded, restartedSpotRequests.get(
+                        REGION + "::" + spotRequest.getSpotInstanceRequestId()).orElseThrow()
+                .getLaunchSpecification().getEncodedUserData());
+    }
+
+    @Test
+    void legacyTextUserDataMigratesAcrossAllPersistedModels(@TempDir Path dir) throws IOException {
+        String legacyText = "#!/bin/sh\necho legacy\n";
+        String encoded = Base64.getEncoder().encodeToString(legacyText.getBytes());
+
+        Files.writeString(dir.resolve("ec2-instances.json"), """
+                {
+                  "us-east-1::i-legacy": {
+                    "instanceId": "i-legacy",
+                    "userData": "#!/bin/sh\\necho legacy\\n"
+                  }
+                }
+                """);
+        Files.writeString(dir.resolve("ec2-launch-templates.json"), """
+                {
+                  "us-east-1::lt-legacy": {
+                    "launchTemplateId": "lt-legacy",
+                    "userData": "#!/bin/sh\\necho legacy\\n",
+                    "versions": {
+                      "1": {
+                        "userData": "#!/bin/sh\\necho legacy\\n"
+                      }
+                    }
+                  }
+                }
+                """);
+        Files.writeString(dir.resolve("ec2-spot-instance-requests.json"), """
+                {
+                  "us-east-1::sir-legacy": {
+                    "spotInstanceRequestId": "sir-legacy",
+                    "launchSpecification": {
+                      "userData": "#!/bin/sh\\necho legacy\\n"
+                    }
+                  }
+                }
+                """);
+
+        StorageBackend<String, Instance> instances = load(
+                dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {});
+        assertEquals(encoded, instances.get("us-east-1::i-legacy").orElseThrow().getEncodedUserData());
+
+        StorageBackend<String, LaunchTemplate> templates = load(
+                dir, "ec2-launch-templates.json", new TypeReference<Map<String, LaunchTemplate>>() {});
+        LaunchTemplate template = templates.get("us-east-1::lt-legacy").orElseThrow();
+        assertEquals(encoded, template.getEncodedUserData());
+        assertEquals(encoded, template.getVersions().get("1").getEncodedUserData());
+
+        StorageBackend<String, SpotInstanceRequest> spotRequests = load(
+                dir, "ec2-spot-instance-requests.json",
+                new TypeReference<Map<String, SpotInstanceRequest>>() {});
+        assertEquals(encoded, spotRequests.get("us-east-1::sir-legacy").orElseThrow()
+                .getLaunchSpecification().getEncodedUserData());
+    }
+
+    @Test
+    void canonicalEncodedUserDataWinsOverLegacyTextInEitherPropertyOrder(@TempDir Path dir)
+            throws IOException {
+        String canonical = Base64.getEncoder().encodeToString(new byte[]{0x00, (byte) 0xff});
+
+        Files.writeString(dir.resolve("ec2-instances.json"), """
+                {
+                  "us-east-1::i-first": {
+                    "instanceId": "i-first",
+                    "encodedUserData": "%s",
+                    "userData": "legacy"
+                  },
+                  "us-east-1::i-last": {
+                    "instanceId": "i-last",
+                    "userData": "legacy",
+                    "encodedUserData": "%s"
+                  }
+                }
+                """.formatted(canonical, canonical));
+
+        StorageBackend<String, Instance> instances = load(
+                dir, "ec2-instances.json", new TypeReference<Map<String, Instance>>() {});
+        assertEquals(canonical, instances.get("us-east-1::i-first").orElseThrow().getEncodedUserData());
+        assertEquals(canonical, instances.get("us-east-1::i-last").orElseThrow().getEncodedUserData());
     }
 
     @Test

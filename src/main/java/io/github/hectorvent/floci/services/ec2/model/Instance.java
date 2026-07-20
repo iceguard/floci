@@ -1,6 +1,9 @@
 package io.github.hectorvent.floci.services.ec2.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonSetter;
+import io.github.hectorvent.floci.services.ec2.Ec2UserData;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -58,6 +61,7 @@ public class Instance {
     private String dockerContainerId;
     private String containerBridgeIp;
     private String userData;
+    private String encodedUserData;
     private int sshHostPort;
     private long terminatedAt;
 
@@ -166,8 +170,19 @@ public class Instance {
     public String getDockerContainerId() { return dockerContainerId; }
     public void setDockerContainerId(String dockerContainerId) { this.dockerContainerId = dockerContainerId; }
 
+    @JsonIgnore
     public String getUserData() { return userData; }
-    public void setUserData(String userData) { this.userData = userData; }
+
+    @JsonSetter("userData")
+    public void setUserData(String userData) {
+        this.userData = userData;
+        if (encodedUserData == null && userData != null) {
+            encodedUserData = Ec2UserData.fromText(userData).encoded();
+        }
+    }
+
+    public String getEncodedUserData() { return encodedUserData; }
+    public void setEncodedUserData(String encodedUserData) { this.encodedUserData = encodedUserData; }
 
     public int getSshHostPort() { return sshHostPort; }
     public void setSshHostPort(int sshHostPort) { this.sshHostPort = sshHostPort; }

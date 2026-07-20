@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.ec2.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonSetter;
+import io.github.hectorvent.floci.services.ec2.Ec2UserData;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.util.ArrayList;
@@ -13,7 +15,6 @@ public class LaunchTemplateData {
     private String imageId;
     private String instanceType;
     private String keyName;
-    private String userData;
     private String encodedUserData;
     private String iamInstanceProfileArn;
     private List<String> securityGroupIds = new ArrayList<>();
@@ -25,7 +26,6 @@ public class LaunchTemplateData {
         this.imageId = source.imageId;
         this.instanceType = source.instanceType;
         this.keyName = source.keyName;
-        this.userData = source.userData;
         this.encodedUserData = source.encodedUserData;
         this.iamInstanceProfileArn = source.iamInstanceProfileArn;
         this.securityGroupIds = new ArrayList<>(source.securityGroupIds);
@@ -41,11 +41,15 @@ public class LaunchTemplateData {
     public String getKeyName() { return keyName; }
     public void setKeyName(String keyName) { this.keyName = keyName; }
 
-    public String getUserData() { return userData; }
-    public void setUserData(String userData) { this.userData = userData; }
-
     public String getEncodedUserData() { return encodedUserData; }
     public void setEncodedUserData(String encodedUserData) { this.encodedUserData = encodedUserData; }
+
+    @JsonSetter("userData")
+    public void setLegacyUserData(String userData) {
+        if (encodedUserData == null && userData != null) {
+            encodedUserData = Ec2UserData.fromText(userData).encoded();
+        }
+    }
 
     public String getIamInstanceProfileArn() { return iamInstanceProfileArn; }
     public void setIamInstanceProfileArn(String iamInstanceProfileArn) { this.iamInstanceProfileArn = iamInstanceProfileArn; }

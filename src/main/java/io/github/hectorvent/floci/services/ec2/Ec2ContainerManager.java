@@ -224,9 +224,11 @@ public class Ec2ContainerManager {
                 }
 
                 // Execute UserData
-                String userData = instance.getUserData();
-                if (userData != null && !userData.isBlank()) {
-                    executeUserData(containerId, instanceId, userData, region);
+                Ec2UserData userData = instance.getEncodedUserData() != null
+                        ? Ec2UserData.fromEncoded(instance.getEncodedUserData())
+                        : Ec2UserData.fromText(instance.getUserData());
+                if (userData != null && userData.bytes().length > 0) {
+                    executeUserData(containerId, instanceId, userData.utf8Text(), region);
                 }
 
             } catch (InterruptedException e) {
