@@ -40,6 +40,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
@@ -54,6 +55,7 @@ public class RdsService implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(RdsService.class);
     private static final ObjectMapper JSON = new ObjectMapper();
+    private static final String REGIONAL_KEY_SEPARATOR = "/";
 
     private final StorageBackend<String, DbInstance> instances;
     private final StorageBackend<String, DbCluster> clusters;
@@ -262,6 +264,25 @@ public class RdsService implements Resettable {
                                        Map<String, String> tags,
                                        List<String> vpcSecurityGroupIds,
                                        String region) {
+        return createDbInstance(id, engineParam, engineVersion, masterUsername, masterPassword,
+                dbName, dbInstanceClass, allocatedStorage, iamEnabled, paramGroupName,
+                dbSubnetGroupName, dbClusterIdentifier, availabilityZone, multiAz,
+                manageMasterUserPassword, masterUserSecretKmsKeyId, tags, vpcSecurityGroupIds,
+                region, true);
+    }
+
+    public DbInstance createDbInstance(String id, String engineParam, String engineVersion,
+                                       String masterUsername, String masterPassword,
+                                       String dbName, String dbInstanceClass,
+                                       int allocatedStorage, boolean iamEnabled,
+                                       String paramGroupName, String dbSubnetGroupName,
+                                       String dbClusterIdentifier, String availabilityZone,
+                                       boolean multiAz, boolean manageMasterUserPassword,
+                                       String masterUserSecretKmsKeyId,
+                                       Map<String, String> tags,
+                                       List<String> vpcSecurityGroupIds,
+                                       String region,
+                                       boolean autoMinorVersionUpgrade) {
         String effectiveRegion = effectiveRegion(region);
         if (instances.get(id).isPresent()) {
             throw new AwsException("DBInstanceAlreadyExists",
@@ -270,9 +291,9 @@ public class RdsService implements Resettable {
 
         DatabaseEngine engine = resolveEngine(engineParam);
         if (dbSubnetGroupName != null && !dbSubnetGroupName.isBlank() && !"default".equalsIgnoreCase(dbSubnetGroupName)) {
-            getDbSubnetGroup(dbSubnetGroupName);
+            getDbSubnetGroup(dbSubnetGroupName, effectiveRegion);
         }
-        validateInstanceParameterGroup(paramGroupName, engineParam, engineVersion);
+        validateInstanceParameterGroup(paramGroupName, engineParam, engineVersion, effectiveRegion);
         boolean mock = config.services().rds().mock();
         // Always reserve a unique port (even in mock) so endpoints stay distinct and usedPorts
         // is consistent; mock mode only skips starting the container and auth proxy.
@@ -343,6 +364,7 @@ public class RdsService implements Resettable {
         instance.setVpcId(placement.vpcId());
         instance.setAvailabilityZone(placement.availabilityZone());
         instance.setMultiAz(placement.multiAz());
+        instance.setAutoMinorVersionUpgrade(autoMinorVersionUpgrade);
         instance.setSubnetAvailabilityZones(placement.subnetAvailabilityZones());
 
         instance.setDbiResourceId("db-" + java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 24).toUpperCase());
@@ -405,17 +427,17 @@ public class RdsService implements Resettable {
 
         String type = "db";
         String id = resourceName;
+        AwsArnUtils.Arn suppliedArn = null;
         if (resourceName.startsWith("arn:")) {
-            AwsArnUtils.Arn arn;
             try {
-                arn = AwsArnUtils.parse(resourceName);
+                suppliedArn = AwsArnUtils.parse(resourceName);
             } catch (IllegalArgumentException malformed) {
                 throw new AwsException("InvalidParameterValue", "Invalid resource name: " + resourceName, 400);
             }
-            if (!"rds".equals(arn.service())) {
+            if (!"rds".equals(suppliedArn.service())) {
                 throw new AwsException("InvalidParameterValue", "Invalid resource name: " + resourceName, 400);
             }
-            String resource = arn.resource();
+            String resource = suppliedArn.resource();
             int sep = resource.indexOf(':');
             if (sep < 0) {
                 // Real AWS requires the resource part of an RDS ARN to be <type>:<id>.
@@ -427,9 +449,11 @@ public class RdsService implements Resettable {
         // A bare (non-ARN) resource name is treated as a DB instance identifier for backwards compatibility.
 
         String resourceId = id;
+        AwsArnUtils.Arn parsedArn = suppliedArn;
         return switch (type) {
             case "db" -> {
                 DbInstance instance = getDbInstance(resourceId);
+                validateTagResourceArn(parsedArn, instance.getDbInstanceArn(), resourceName);
                 yield new TagHandle(instance.getTags(), updated -> {
                     instance.setTags(updated);
                     instances.put(resourceId, instance);
@@ -437,23 +461,52 @@ public class RdsService implements Resettable {
             }
             case "cluster" -> {
                 DbCluster cluster = getDbCluster(resourceId);
+                validateTagResourceArn(parsedArn, cluster.getDbClusterArn(), resourceName);
                 yield new TagHandle(cluster.getTags(), updated -> {
                     cluster.setTags(updated);
                     clusters.put(resourceId, cluster);
                 });
             }
             case "subgrp" -> {
-                DbSubnetGroup group = getDbSubnetGroup(resourceId);
+                String region = parsedArn != null ? parsedArn.region() : regionResolver.getDefaultRegion();
+                DbSubnetGroup group = getDbSubnetGroup(resourceId, region);
+                validateTagResourceArn(parsedArn, group.getDbSubnetGroupArn(), resourceName);
                 yield new TagHandle(group.getTags(), updated -> {
                     group.setTags(updated);
-                    subnetGroups.put(resourceId, group);
+                    subnetGroups.put(regionalStorageKey(region, resourceId), group);
                 });
             }
-            // Valid RDS resource types Floci does not model yet (og, pg, snapshot, ...) — taggable
+            case "pg" -> {
+                String region = parsedArn != null ? parsedArn.region() : regionResolver.getDefaultRegion();
+                DbParameterGroup group = getDbParameterGroup(resourceId, region);
+                validateTagResourceArn(parsedArn, group.getDbParameterGroupArn(), resourceName);
+                yield new TagHandle(group.getTags(), updated -> {
+                    group.setTags(updated);
+                    parameterGroups.put(regionalStorageKey(region, resourceId), group);
+                });
+            }
+            // Valid RDS resource types Floci does not model yet (og, snapshot, ...) — taggable
             // on real AWS, so the message states the Floci limitation rather than AWS semantics.
             default -> throw new AwsException("InvalidParameterValue",
                     "Tagging for resource type '" + type + "' is not yet implemented by Floci: " + resourceName, 400);
         };
+    }
+
+    private void validateTagResourceArn(
+            AwsArnUtils.Arn suppliedArn, String canonicalArn, String resourceName) {
+        if (suppliedArn == null) {
+            return;
+        }
+
+        AwsArnUtils.Arn expectedArn;
+        try {
+            expectedArn = AwsArnUtils.parse(canonicalArn);
+        } catch (IllegalArgumentException malformed) {
+            throw new AwsException("InvalidParameterValue", "Invalid resource name: " + resourceName, 400);
+        }
+        if (!suppliedArn.equals(expectedArn)) {
+            throw new AwsException("InvalidParameterValue", "Invalid resource name: " + resourceName, 400);
+        }
     }
 
     private void attachManagedMasterUserSecret(DbInstance instance, String region, String kmsKeyId) {
@@ -514,6 +567,20 @@ public class RdsService implements Resettable {
 
     public DbInstance modifyDbInstance(String id, String newPassword, Boolean iamEnabled,
                                        String dbSubnetGroupName, List<String> vpcSecurityGroupIds) {
+        return modifyDbInstance(id, newPassword, iamEnabled, dbSubnetGroupName,
+                vpcSecurityGroupIds, regionResolver.getDefaultRegion());
+    }
+
+    public DbInstance modifyDbInstance(String id, String newPassword, Boolean iamEnabled,
+                                       String dbSubnetGroupName, List<String> vpcSecurityGroupIds,
+                                       String region) {
+        return modifyDbInstance(id, newPassword, iamEnabled, dbSubnetGroupName,
+                vpcSecurityGroupIds, region, null);
+    }
+
+    public DbInstance modifyDbInstance(String id, String newPassword, Boolean iamEnabled,
+                                       String dbSubnetGroupName, List<String> vpcSecurityGroupIds,
+                                       String region, Boolean autoMinorVersionUpgrade) {
         DbInstance instance = getDbInstance(id);
         instance.setStatus(DbInstanceStatus.AVAILABLE);
         if (newPassword != null && !newPassword.isBlank()) {
@@ -523,11 +590,14 @@ public class RdsService implements Resettable {
             instance.setIamDatabaseAuthenticationEnabled(iamEnabled);
         }
         if (dbSubnetGroupName != null && !dbSubnetGroupName.isBlank()) {
-            getDbSubnetGroup(dbSubnetGroupName);
+            getDbSubnetGroup(dbSubnetGroupName, effectiveRegion(region));
             instance.setDbSubnetGroupName(dbSubnetGroupName);
         }
         if (vpcSecurityGroupIds != null && !vpcSecurityGroupIds.isEmpty()) {
             instance.setVpcSecurityGroupIds(vpcSecurityGroupIds);
+        }
+        if (autoMinorVersionUpgrade != null) {
+            instance.setAutoMinorVersionUpgrade(autoMinorVersionUpgrade);
         }
         instances.put(id, instance);
         LOG.infov("DB instance {0} modified", id);
@@ -773,14 +843,20 @@ public class RdsService implements Resettable {
     // ── DB Subnet Groups ──────────────────────────────────────────────────────
 
     public DbSubnetGroup createDbSubnetGroup(String name, String description, List<String> subnetIds) {
-        return createDbSubnetGroup(name, description, subnetIds, regionResolver.getDefaultRegion());
+        return createDbSubnetGroup(name, description, subnetIds, regionResolver.getDefaultRegion(), Map.of());
     }
 
     public DbSubnetGroup createDbSubnetGroup(String name, String description, List<String> subnetIds, String region) {
+        return createDbSubnetGroup(name, description, subnetIds, region, Map.of());
+    }
+
+    public DbSubnetGroup createDbSubnetGroup(
+            String name, String description, List<String> subnetIds, String region, Map<String, String> tags) {
         if (name == null || name.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter DBSubnetGroupName.", 400);
         }
-        if (subnetGroups.get(name).isPresent() || "default".equalsIgnoreCase(name)) {
+        String effectiveRegion = effectiveRegion(region);
+        if (findStoredDbSubnetGroup(name, effectiveRegion).isPresent() || "default".equalsIgnoreCase(name)) {
             throw new AwsException("DBSubnetGroupAlreadyExists",
                     "DB subnet group " + name + " already exists.", 400);
         }
@@ -788,8 +864,9 @@ public class RdsService implements Resettable {
             throw new AwsException("MissingParameter", "The request must contain the parameter SubnetIds.", 400);
         }
 
-        DbSubnetGroup group = buildSubnetGroup(name, description, subnetIds, effectiveRegion(region));
-        subnetGroups.put(name, group);
+        DbSubnetGroup group = buildSubnetGroup(name, description, subnetIds, effectiveRegion);
+        group.setTags(tags);
+        subnetGroups.put(regionalStorageKey(effectiveRegion, name), group);
         return group;
     }
 
@@ -798,9 +875,10 @@ public class RdsService implements Resettable {
     }
 
     public Collection<DbSubnetGroup> listDbSubnetGroups(String filterName, String region) {
+        String effectiveRegion = effectiveRegion(region);
         List<DbSubnetGroup> groups = new ArrayList<>();
         if (filterName == null || filterName.isBlank() || "default".equalsIgnoreCase(filterName)) {
-            groups.add(buildDefaultSubnetGroup(effectiveRegion(region)));
+            groups.add(buildDefaultSubnetGroup(effectiveRegion));
         }
         if (filterName != null && !filterName.isBlank()) {
             if (!"default".equalsIgnoreCase(filterName)) {
@@ -809,7 +887,10 @@ public class RdsService implements Resettable {
             }
             return groups;
         }
-        groups.addAll(subnetGroups.scan(k -> true));
+        migrateLegacySubnetGroups();
+        String regionalPrefix = regionalStoragePrefix(effectiveRegion);
+        groups.addAll(subnetGroups.scan(k -> k.startsWith(regionalPrefix)
+                && !k.equals(regionalStorageKey(effectiveRegion, "default"))));
         return groups;
     }
 
@@ -819,10 +900,11 @@ public class RdsService implements Resettable {
 
     public DbSubnetGroup resolveDbSubnetGroupView(String name, String region) {
         String effectiveName = (name == null || name.isBlank()) ? "default" : name;
+        String effectiveRegion = effectiveRegion(region);
         if ("default".equalsIgnoreCase(effectiveName)) {
-            return buildDefaultSubnetGroup(effectiveRegion(region));
+            return buildDefaultSubnetGroup(effectiveRegion);
         }
-        return subnetGroups.get(effectiveName).orElseThrow(() ->
+        return findStoredDbSubnetGroup(effectiveName, effectiveRegion).orElseThrow(() ->
                 new AwsException("DBSubnetGroupNotFoundFault",
                         "DB subnet group " + effectiveName + " not found.", 404));
     }
@@ -830,43 +912,74 @@ public class RdsService implements Resettable {
     // ── Parameter Groups ──────────────────────────────────────────────────────
 
     public DbParameterGroup createDbParameterGroup(String name, String family, String description) {
-        if (parameterGroups.get(name).isPresent()) {
+        return createDbParameterGroup(name, family, description, regionResolver.getDefaultRegion(), Map.of());
+    }
+
+    public DbParameterGroup createDbParameterGroup(
+            String name, String family, String description, String region, Map<String, String> tags) {
+        String effectiveRegion = effectiveRegion(region);
+        if (findStoredDbParameterGroup(name, effectiveRegion).isPresent()) {
             throw new AwsException("DBParameterGroupAlreadyExists",
                     "DB parameter group " + name + " already exists.", 400);
         }
         DbParameterGroup group = new DbParameterGroup(name, family, description);
-        parameterGroups.put(name, group);
+        group.setDbParameterGroupArn(regionResolver.buildArn("rds", effectiveRegion, "pg:" + name));
+        group.setTags(tags);
+        parameterGroups.put(regionalStorageKey(effectiveRegion, name), group);
         return group;
     }
 
     public DbParameterGroup getDbParameterGroup(String name) {
-        return parameterGroups.get(name).orElseThrow(() ->
+        return getDbParameterGroup(name, regionResolver.getDefaultRegion());
+    }
+
+    public DbParameterGroup getDbParameterGroup(String name, String region) {
+        return findStoredDbParameterGroup(name, effectiveRegion(region)).orElseThrow(() ->
                 new AwsException("DBParameterGroupNotFound",
                         "DBParameterGroupName doesn't refer to an existing DB parameter group.", 404));
     }
 
     public Collection<DbParameterGroup> listDbParameterGroups(String filterName) {
+        return listDbParameterGroups(filterName, regionResolver.getDefaultRegion());
+    }
+
+    public Collection<DbParameterGroup> listDbParameterGroups(String filterName, String region) {
+        String effectiveRegion = effectiveRegion(region);
         if (filterName != null && !filterName.isBlank()) {
-            return parameterGroups.get(filterName).map(List::of).orElse(List.of());
+            return findStoredDbParameterGroup(filterName, effectiveRegion).map(List::of).orElse(List.of());
         }
-        return parameterGroups.scan(k -> true);
+        migrateLegacyParameterGroups();
+        String regionalPrefix = regionalStoragePrefix(effectiveRegion);
+        return parameterGroups.scan(k -> k.startsWith(regionalPrefix));
     }
 
     public void deleteDbParameterGroup(String name) {
-        if (parameterGroups.get(name).isEmpty()) {
+        deleteDbParameterGroup(name, regionResolver.getDefaultRegion());
+    }
+
+    public void deleteDbParameterGroup(String name, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        if (findStoredDbParameterGroup(name, effectiveRegion).isEmpty()) {
             throw new AwsException("DBParameterGroupNotFound",
                     "DBParameterGroupName doesn't refer to an existing DB parameter group.", 404);
         }
-        parameterGroups.delete(name);
+        parameterGroups.delete(regionalStorageKey(effectiveRegion, name));
     }
 
     public DbParameterGroup modifyDbParameterGroup(String name,
                                                     java.util.Map<String, String> parameters) {
-        DbParameterGroup group = getDbParameterGroup(name);
+        return modifyDbParameterGroup(name, parameters, regionResolver.getDefaultRegion());
+    }
+
+    public DbParameterGroup modifyDbParameterGroup(String name,
+                                                    java.util.Map<String, String> parameters,
+                                                    String region) {
+        String effectiveRegion = effectiveRegion(region);
+        DbParameterGroup group = getDbParameterGroup(name, effectiveRegion);
         if (parameters != null) {
             group.getParameters().putAll(parameters);
         }
-        parameterGroups.put(name, group);
+        parameterGroups.put(regionalStorageKey(effectiveRegion, name), group);
         return group;
     }
 
@@ -875,10 +988,11 @@ public class RdsService implements Resettable {
     }
 
     public DbSubnetGroup getDbSubnetGroup(String name, String region) {
+        String effectiveRegion = effectiveRegion(region);
         if ("default".equalsIgnoreCase(name)) {
-            return buildDefaultSubnetGroup(effectiveRegion(region));
+            return buildDefaultSubnetGroup(effectiveRegion);
         }
-        return subnetGroups.get(name).orElseThrow(() ->
+        return findStoredDbSubnetGroup(name, effectiveRegion).orElseThrow(() ->
                 new AwsException("DBSubnetGroupNotFoundFault",
                         "DB subnet group " + name + " not found.", 404));
     }
@@ -888,23 +1002,29 @@ public class RdsService implements Resettable {
     }
 
     public DbSubnetGroup modifyDbSubnetGroup(String name, List<String> subnetIds, String region) {
-        DbSubnetGroup existing = getDbSubnetGroup(name);
+        String effectiveRegion = effectiveRegion(region);
+        DbSubnetGroup existing = getDbSubnetGroup(name, effectiveRegion);
         if (subnetIds == null || subnetIds.isEmpty()) {
             throw new AwsException("InvalidParameterValue",
                     "SubnetIds must contain at least one subnet.", 400);
         }
-        DbSubnetGroup group = buildSubnetGroup(name, existing.getDescription(), subnetIds, effectiveRegion(region));
+        DbSubnetGroup group = buildSubnetGroup(name, existing.getDescription(), subnetIds, effectiveRegion);
         group.setTags(existing.getTags());
-        subnetGroups.put(name, group);
+        subnetGroups.put(regionalStorageKey(effectiveRegion, name), group);
         return group;
     }
 
     public void deleteDbSubnetGroup(String name) {
-        if (subnetGroups.get(name).isEmpty()) {
+        deleteDbSubnetGroup(name, regionResolver.getDefaultRegion());
+    }
+
+    public void deleteDbSubnetGroup(String name, String region) {
+        String effectiveRegion = effectiveRegion(region);
+        if ("default".equalsIgnoreCase(name) || findStoredDbSubnetGroup(name, effectiveRegion).isEmpty()) {
             throw new AwsException("DBSubnetGroupNotFoundFault",
                     "DB subnet group " + name + " not found.", 404);
         }
-        subnetGroups.delete(name);
+        subnetGroups.delete(regionalStorageKey(effectiveRegion, name));
     }
 
     // ── Cluster Parameter Groups ──────────────────────────────────────────────
@@ -997,11 +1117,12 @@ public class RdsService implements Resettable {
         return imageForRequestedVersion(defaultImage, engineVersion);
     }
 
-    private void validateInstanceParameterGroup(String paramGroupName, String engineParam, String engineVersion) {
+    private void validateInstanceParameterGroup(
+            String paramGroupName, String engineParam, String engineVersion, String region) {
         if (paramGroupName == null || paramGroupName.isBlank()) {
             return;
         }
-        DbParameterGroup group = getDbParameterGroup(paramGroupName);
+        DbParameterGroup group = getDbParameterGroup(paramGroupName, region);
         validateParameterGroupFamily(paramGroupName, group.getDbParameterGroupFamily(), engineParam, engineVersion);
     }
 
@@ -1237,11 +1358,7 @@ public class RdsService implements Resettable {
         String effectiveSubnetGroupName = (dbSubnetGroupName == null || dbSubnetGroupName.isBlank())
                 ? "default"
                 : dbSubnetGroupName;
-        DbSubnetGroup group = "default".equals(effectiveSubnetGroupName)
-                ? buildDefaultSubnetGroup(region)
-                : subnetGroups.get(effectiveSubnetGroupName).orElseThrow(() ->
-                        new AwsException("DBSubnetGroupNotFoundFault",
-                                "DB subnet group " + effectiveSubnetGroupName + " not found.", 404));
+        DbSubnetGroup group = getDbSubnetGroup(effectiveSubnetGroupName, region);
 
         Map<String, String> subnetAvailabilityZones = group.getSubnetAvailabilityZones();
         String vpcId = group.getVpcId();
@@ -1289,7 +1406,9 @@ public class RdsService implements Resettable {
             throw new AwsException("InvalidVPCNetworkStateFault",
                     "No subnets available for DB subnet group default.", 400);
         }
-        return buildSubnetGroup("default", "default subnet group", extractSubnetIds(subnets), region);
+        DbSubnetGroup group = buildSubnetGroup("default", "default subnet group", extractSubnetIds(subnets), region);
+        findStoredDbSubnetGroup("default", region).ifPresent(stored -> group.setTags(stored.getTags()));
+        return group;
     }
 
     private DbSubnetGroup buildSubnetGroup(String name, String description, List<String> subnetIds, String region) {
@@ -1318,6 +1437,102 @@ public class RdsService implements Resettable {
         group.setDbSubnetGroupArn(regionResolver.buildArn("rds", region, "subgrp:" + name));
         group.setSubnetGroupStatus("Complete");
         return group;
+    }
+
+    private Optional<DbSubnetGroup> findStoredDbSubnetGroup(String name, String region) {
+        migrateLegacySubnetGroup(name);
+        return subnetGroups.get(regionalStorageKey(region, name));
+    }
+
+    private void migrateLegacySubnetGroups() {
+        List.copyOf(subnetGroups.keys()).stream()
+                .filter(key -> !key.contains(REGIONAL_KEY_SEPARATOR))
+                .forEach(this::migrateLegacySubnetGroup);
+    }
+
+    private void migrateLegacySubnetGroup(String name) {
+        subnetGroups.get(name).ifPresent(group -> {
+            String arn = group.getDbSubnetGroupArn();
+            String region;
+            if (arn == null || arn.isBlank()) {
+                region = regionResolver.getDefaultRegion();
+                group.setDbSubnetGroupArn(regionResolver.buildArn("rds", region,
+                        "subgrp:" + group.getDbSubnetGroupName()));
+            } else {
+                region = regionFromCanonicalGroupArn(arn, "subgrp", group.getDbSubnetGroupName());
+                if (region == null) {
+                    return;
+                }
+            }
+            String regionalKey = regionalStorageKey(region, group.getDbSubnetGroupName());
+            if (subnetGroups.get(regionalKey).isPresent()) {
+                return;
+            }
+            subnetGroups.put(regionalKey, group);
+            subnetGroups.delete(name);
+        });
+    }
+
+    private Optional<DbParameterGroup> findStoredDbParameterGroup(String name, String region) {
+        migrateLegacyParameterGroup(name);
+        return parameterGroups.get(regionalStorageKey(region, name));
+    }
+
+    private void migrateLegacyParameterGroups() {
+        List.copyOf(parameterGroups.keys()).stream()
+                .filter(key -> !key.contains(REGIONAL_KEY_SEPARATOR))
+                .forEach(this::migrateLegacyParameterGroup);
+    }
+
+    private void migrateLegacyParameterGroup(String name) {
+        parameterGroups.get(name).ifPresent(group -> {
+            String arn = group.getDbParameterGroupArn();
+            String region;
+            if (arn == null || arn.isBlank()) {
+                region = regionResolver.getDefaultRegion();
+                group.setDbParameterGroupArn(regionResolver.buildArn("rds", region,
+                        "pg:" + group.getDbParameterGroupName()));
+            } else {
+                region = regionFromCanonicalGroupArn(arn, "pg", group.getDbParameterGroupName());
+                if (region == null) {
+                    return;
+                }
+            }
+            String regionalKey = regionalStorageKey(region, group.getDbParameterGroupName());
+            if (parameterGroups.get(regionalKey).isPresent()) {
+                return;
+            }
+            parameterGroups.put(regionalKey, group);
+            parameterGroups.delete(name);
+        });
+    }
+
+    private String regionFromCanonicalGroupArn(String arn, String resourceType, String name) {
+        if (arn == null || arn.isBlank()) {
+            return null;
+        }
+        try {
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            String expectedResource = resourceType + ":" + name;
+            if ("aws".equals(parsed.partition())
+                    && "rds".equals(parsed.service())
+                    && regionResolver.getAccountId().equals(parsed.accountId())
+                    && expectedResource.equals(parsed.resource())
+                    && !parsed.region().isBlank()) {
+                return parsed.region();
+            }
+        } catch (IllegalArgumentException malformed) {
+            LOG.warnv("Ignoring malformed persisted RDS group ARN for {0}: {1}", name, arn);
+        }
+        return null;
+    }
+
+    private static String regionalStorageKey(String region, String name) {
+        return region + REGIONAL_KEY_SEPARATOR + name;
+    }
+
+    private static String regionalStoragePrefix(String region) {
+        return region + REGIONAL_KEY_SEPARATOR;
     }
 
     private String effectiveRegion(String region) {

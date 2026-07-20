@@ -6,6 +6,10 @@
 
 Floci manages real PostgreSQL, MySQL, and MariaDB Docker containers and proxies TCP connections to them, including IAM authentication support.
 
+`AutoMinorVersionUpgrade` follows the RDS control-plane contract: creation defaults it to `true`,
+and modification preserves the stored value when the parameter is omitted. Floci stores and
+returns this configuration but does not schedule or execute database engine upgrades.
+
 RDS Data API (`rds-data`) is documented separately because it uses REST JSON routes instead of the RDS Query protocol. See [RDS Data API](rds-data.md).
 
 ## Supported Management Actions

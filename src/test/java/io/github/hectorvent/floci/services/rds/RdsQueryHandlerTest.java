@@ -53,6 +53,7 @@ class RdsQueryHandlerTest {
         String body = (String) response.getEntity();
         assertTrue(body.contains("<DBInstance>"), "Expected <DBInstance> element in response");
         assertFalse(body.contains("<member><DBInstanceIdentifier>"), "Did not expect <member> wrapping DBInstance");
+        assertTrue(body.contains("<AutoMinorVersionUpgrade>true</AutoMinorVersionUpgrade>"));
     }
 
     @Test
@@ -125,7 +126,7 @@ class RdsQueryHandlerTest {
     void describeDbInstances_dbSubnetGroupUsesSubnetTag() {
         DbInstance instance = makeInstance("mydb");
         instance.setDbSubnetGroupName("custom-group");
-        when(service.getDbSubnetGroup("custom-group")).thenReturn(customSubnetGroup());
+        when(service.getDbSubnetGroup("custom-group", null)).thenReturn(customSubnetGroup());
         when(service.listDbInstances(null)).thenReturn(List.of(instance));
 
         Response response = handler.handle("DescribeDBInstances", params());
@@ -180,7 +181,7 @@ class RdsQueryHandlerTest {
         DbInstance instance = makeInstance("mydb");
         instance.setDbSubnetGroupName("sample-db-subnets");
         when(service.listDbInstances(null)).thenReturn(List.of(instance));
-        when(service.getDbSubnetGroup("sample-db-subnets")).thenReturn(new DbSubnetGroup(
+        when(service.getDbSubnetGroup("sample-db-subnets", null)).thenReturn(new DbSubnetGroup(
                 "sample-db-subnets", "test subnets", "vpc-123", List.of("subnet-aaa", "subnet-bbb"),
                 Map.of("subnet-aaa", "us-east-1a", "subnet-bbb", "us-east-1b")));
 
@@ -215,7 +216,7 @@ class RdsQueryHandlerTest {
         when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
                 eq(null), eq(null), eq(null), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false), eq(false), eq(null),
-                eq(java.util.Map.of("example:ClusterId", "cluster-a", "Name", "mydb")), eq(List.of()), isNull()))
+                eq(java.util.Map.of("example:ClusterId", "cluster-a", "Name", "mydb")), eq(List.of()), isNull(), eq(true)))
                 .thenReturn(instance);
 
         MultivaluedMap<String, String> p = params();
@@ -225,11 +226,37 @@ class RdsQueryHandlerTest {
         p.add("Tags.member.1.Value", "cluster-a");
         p.add("Tags.member.2.Key", "Name");
         p.add("Tags.member.2.Value", "mydb");
-        handler.handle("CreateDBInstance", p);
+        Response response = handler.handle("CreateDBInstance", p);
 
         verify(service).createDbInstance("mydb", "postgres", "16.3",
                 null, null, null, "db.t3.micro", 20, false, null, null, null, null, false, false, null,
-                java.util.Map.of("example:ClusterId", "cluster-a", "Name", "mydb"), List.of(), null);
+                java.util.Map.of("example:ClusterId", "cluster-a", "Name", "mydb"), List.of(), null, true);
+        assertTrue(((String) response.getEntity())
+                .contains("<AutoMinorVersionUpgrade>true</AutoMinorVersionUpgrade>"));
+    }
+
+    @Test
+    void createDbInstancePassesExplicitAutoMinorVersionUpgrade() {
+        DbInstance instance = makeInstance("mydb");
+        instance.setAutoMinorVersionUpgrade(false);
+        when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
+                eq(null), eq(null), eq(null), eq("db.t3.micro"),
+                eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false), eq(false), eq(null),
+                eq(java.util.Map.of()), eq(List.of()), isNull(), eq(false)))
+                .thenReturn(instance);
+
+        MultivaluedMap<String, String> p = params();
+        p.add("DBInstanceIdentifier", "mydb");
+        p.add("Engine", "postgres");
+        p.add("AutoMinorVersionUpgrade", "false");
+
+        Response response = handler.handle("CreateDBInstance", p);
+
+        verify(service).createDbInstance("mydb", "postgres", "16.3",
+                null, null, null, "db.t3.micro", 20, false, null, null, null, null, false, false, null,
+                java.util.Map.of(), List.of(), null, false);
+        assertTrue(((String) response.getEntity())
+                .contains("<AutoMinorVersionUpgrade>false</AutoMinorVersionUpgrade>"));
     }
 
     @Test
@@ -239,7 +266,7 @@ class RdsQueryHandlerTest {
         when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
                 eq(null), eq(null), eq(null), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false), eq(false), eq(null),
-                eq(java.util.Map.of()), eq(List.of("sg-123", "sg-456")), isNull()))
+                eq(java.util.Map.of()), eq(List.of("sg-123", "sg-456")), isNull(), eq(true)))
                 .thenReturn(instance);
 
         MultivaluedMap<String, String> p = params();
@@ -254,7 +281,7 @@ class RdsQueryHandlerTest {
         assertTrue(body.contains("<VpcSecurityGroupId>sg-456</VpcSecurityGroupId>"));
         verify(service).createDbInstance("mydb", "postgres", "16.3",
                 null, null, null, "db.t3.micro", 20, false, null, null, null, null, false, false, null,
-                java.util.Map.of(), List.of("sg-123", "sg-456"), null);
+                java.util.Map.of(), List.of("sg-123", "sg-456"), null, true);
     }
 
     @Test
@@ -270,7 +297,7 @@ class RdsQueryHandlerTest {
         assertTrue(((String) response.getEntity()).contains("InvalidParameterValue"));
         verify(service, never()).createDbInstance(any(), any(), any(), any(), any(), any(), any(),
                 anyInt(), anyBoolean(), any(), any(), any(), any(), anyBoolean(), anyBoolean(),
-                any(), any(), any(), any());
+                any(), any(), any(), any(), anyBoolean());
     }
 
     @Test
@@ -283,7 +310,68 @@ class RdsQueryHandlerTest {
 
         assertEquals(400, response.getStatus());
         assertTrue(((String) response.getEntity()).contains("InvalidParameterValue"));
-        verify(service, never()).modifyDbInstance(any(), any(), any(), any(), any());
+        verify(service, never()).modifyDbInstance(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void invalidAutoMinorVersionUpgradeIsRejectedBeforeCreateMutation() {
+        MultivaluedMap<String, String> p = params();
+        p.add("DBInstanceIdentifier", "mydb");
+        p.add("Engine", "postgres");
+        p.add("AutoMinorVersionUpgrade", " ");
+
+        Response response = handler.handle("CreateDBInstance", p);
+
+        assertEquals(400, response.getStatus());
+        assertTrue(((String) response.getEntity()).contains("InvalidParameterValue"));
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void invalidAutoMinorVersionUpgradeIsRejectedBeforeModifyMutation() {
+        MultivaluedMap<String, String> p = params();
+        p.add("DBInstanceIdentifier", "mydb");
+        p.add("AutoMinorVersionUpgrade", "enabled");
+
+        Response response = handler.handle("ModifyDBInstance", p);
+
+        assertEquals(400, response.getStatus());
+        assertTrue(((String) response.getEntity()).contains("InvalidParameterValue"));
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void modifyDbInstancePreservesAutoMinorVersionUpgradeWhenOmitted() {
+        DbInstance instance = makeInstance("mydb");
+        instance.setAutoMinorVersionUpgrade(false);
+        when(service.modifyDbInstance("mydb", null, null, null, List.of(), null, null))
+                .thenReturn(instance);
+
+        MultivaluedMap<String, String> p = params();
+        p.add("DBInstanceIdentifier", "mydb");
+
+        Response response = handler.handle("ModifyDBInstance", p);
+
+        verify(service).modifyDbInstance("mydb", null, null, null, List.of(), null, null);
+        assertTrue(((String) response.getEntity())
+                .contains("<AutoMinorVersionUpgrade>false</AutoMinorVersionUpgrade>"));
+    }
+
+    @Test
+    void modifyDbInstancePassesExplicitAutoMinorVersionUpgrade() {
+        DbInstance instance = makeInstance("mydb");
+        when(service.modifyDbInstance("mydb", null, null, null, List.of(), null, true))
+                .thenReturn(instance);
+
+        MultivaluedMap<String, String> p = params();
+        p.add("DBInstanceIdentifier", "mydb");
+        p.add("AutoMinorVersionUpgrade", "TrUe");
+
+        Response response = handler.handle("ModifyDBInstance", p);
+
+        verify(service).modifyDbInstance("mydb", null, null, null, List.of(), null, true);
+        assertTrue(((String) response.getEntity())
+                .contains("<AutoMinorVersionUpgrade>true</AutoMinorVersionUpgrade>"));
     }
 
     @Test
@@ -320,6 +408,23 @@ class RdsQueryHandlerTest {
     }
 
     @Test
+    void addTagsNormalizesOmittedAndExplicitEmptyValues() {
+        MultivaluedMap<String, String> add = params();
+        add.add("ResourceName", "arn:aws:rds:us-east-1:000000000000:pg:application");
+        add.add("Tags.member.1.Key", "normal");
+        add.add("Tags.member.1.Value", "value");
+        add.add("Tags.member.2.Key", "omitted");
+        add.add("Tags.member.3.Key", "explicit-empty");
+        add.add("Tags.member.3.Value", "");
+
+        assertEquals(200, handler.handle("AddTagsToResource", add).getStatus());
+
+        verify(service).addTagsToResource(
+                "arn:aws:rds:us-east-1:000000000000:pg:application",
+                Map.of("normal", "value", "omitted", "", "explicit-empty", ""));
+    }
+
+    @Test
     void describeOrderableDbInstanceOptions_usesServiceCatalog() {
         when(service.describeOrderableDbInstanceOptions("postgres", "16.3", "db.t4g.medium"))
                 .thenReturn(List.of(java.util.Map.of(
@@ -344,7 +449,7 @@ class RdsQueryHandlerTest {
     @Test
     void describeDbParameterGroups_usesDBParameterGroupTag() {
         DbParameterGroup group = new DbParameterGroup("pg1", "postgres15", "test group");
-        when(service.listDbParameterGroups(null)).thenReturn(List.of(group));
+        when(service.listDbParameterGroups(null, null)).thenReturn(List.of(group));
 
         Response response = handler.handle("DescribeDBParameterGroups", params());
 
@@ -354,12 +459,93 @@ class RdsQueryHandlerTest {
     }
 
     @Test
+    void parameterGroupOperationsPassSignedRegionToService() {
+        DbParameterGroup group = new DbParameterGroup("pg1", "postgres18", "west group");
+        when(service.listDbParameterGroups("pg1", "us-west-2")).thenReturn(List.of(group));
+        when(service.getDbParameterGroup("pg1", "us-west-2")).thenReturn(group);
+
+        MultivaluedMap<String, String> p = params();
+        p.add("DBParameterGroupName", "pg1");
+
+        assertEquals(200, handler.handle("DescribeDBParameterGroups", p, "us-west-2").getStatus());
+        assertEquals(200, handler.handle("DescribeDBParameters", p, "us-west-2").getStatus());
+        assertEquals(200, handler.handle("DeleteDBParameterGroup", p, "us-west-2").getStatus());
+
+        verify(service).listDbParameterGroups("pg1", "us-west-2");
+        verify(service).getDbParameterGroup("pg1", "us-west-2");
+        verify(service).deleteDbParameterGroup("pg1", "us-west-2");
+    }
+
+    @Test
+    void createDbParameterGroupPassesRegionAndCreationTagsToService() {
+        DbParameterGroup group = new DbParameterGroup("pg1", "postgres18", "Managed by SDK test");
+        group.setDbParameterGroupArn("arn:aws:rds:us-west-2:123456789012:pg:pg1");
+        when(service.createDbParameterGroup(
+                "pg1",
+                "postgres18",
+                "Managed by SDK test",
+                "us-west-2",
+                Map.of("example.io:managed-by", "sdk-test")))
+                .thenReturn(group);
+
+        MultivaluedMap<String, String> p = params();
+        p.add("DBParameterGroupName", "pg1");
+        p.add("DBParameterGroupFamily", "postgres18");
+        p.add("Description", "Managed by SDK test");
+        p.add("Tags.member.1.Key", "example.io:managed-by");
+        p.add("Tags.member.1.Value", "sdk-test");
+
+        Response response = handler.handle("CreateDBParameterGroup", p, "us-west-2");
+
+        assertEquals(200, response.getStatus());
+        verify(service).createDbParameterGroup(
+                "pg1",
+                "postgres18",
+                "Managed by SDK test",
+                "us-west-2",
+                Map.of("example.io:managed-by", "sdk-test"));
+        assertTrue(((String) response.getEntity()).contains(
+                "<DBParameterGroupArn>arn:aws:rds:us-west-2:123456789012:pg:pg1</DBParameterGroupArn>"));
+    }
+
+    @Test
+    void createDbParameterGroupNormalizesOmittedAndExplicitEmptyTagValues() {
+        DbParameterGroup group = new DbParameterGroup("pg-empty", "postgres18", "empty values");
+        when(service.createDbParameterGroup(
+                "pg-empty",
+                "postgres18",
+                "empty values",
+                "us-west-2",
+                Map.of("normal", "value", "omitted", "", "explicit-empty", "")))
+                .thenReturn(group);
+
+        MultivaluedMap<String, String> p = params();
+        p.add("DBParameterGroupName", "pg-empty");
+        p.add("DBParameterGroupFamily", "postgres18");
+        p.add("Description", "empty values");
+        p.add("Tags.member.1.Key", "normal");
+        p.add("Tags.member.1.Value", "value");
+        p.add("Tags.member.2.Key", "omitted");
+        p.add("Tags.member.3.Key", "explicit-empty");
+        p.add("Tags.member.3.Value", "");
+
+        assertEquals(200, handler.handle("CreateDBParameterGroup", p, "us-west-2").getStatus());
+
+        verify(service).createDbParameterGroup(
+                "pg-empty",
+                "postgres18",
+                "empty values",
+                "us-west-2",
+                Map.of("normal", "value", "omitted", "", "explicit-empty", ""));
+    }
+
+    @Test
     void createDbInstance_invalidAllocatedStorageFallsBackToDefaultAndEngineVersionDefaults() {
         DbInstance instance = makeInstance("mydb");
         when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
                 eq("admin"), eq("secret"), eq("dbname"), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false), eq(false),
-                eq(null), eq(java.util.Map.of()), eq(List.of()), isNull()))
+                eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), eq(true)))
                 .thenReturn(instance);
 
         MultivaluedMap<String, String> p = params();
@@ -373,7 +559,7 @@ class RdsQueryHandlerTest {
 
         verify(service).createDbInstance("mydb", "postgres", "16.3",
                 "admin", "secret", "dbname", "db.t3.micro", 20, false, null, null, null, null, false, false,
-                null, java.util.Map.of(), List.of(), null);
+                null, java.util.Map.of(), List.of(), null, true);
     }
 
     @Test
@@ -385,7 +571,7 @@ class RdsQueryHandlerTest {
         when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
                 eq("admin"), eq(null), eq("dbname"), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false), eq(true),
-                eq("kms-key-1"), eq(java.util.Map.of()), eq(List.of()), isNull()))
+                eq("kms-key-1"), eq(java.util.Map.of()), eq(List.of()), isNull(), eq(true)))
                 .thenReturn(instance);
 
         MultivaluedMap<String, String> p = params();
@@ -404,7 +590,7 @@ class RdsQueryHandlerTest {
         assertTrue(body.contains("<KmsKeyId>kms-key-1</KmsKeyId>"));
         verify(service).createDbInstance("mydb", "postgres", "16.3",
                 "admin", null, "dbname", "db.t3.micro", 20, false, null, null, null, null, false, true,
-                "kms-key-1", java.util.Map.of(), List.of(), null);
+                "kms-key-1", java.util.Map.of(), List.of(), null, true);
     }
 
     @Test
@@ -417,7 +603,7 @@ class RdsQueryHandlerTest {
         when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
                 eq("admin"), eq("secret"), eq("dbname"), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq("default"), eq(null), eq("ap-northeast-1a"), eq(true),
-                eq(false), eq(null), eq(java.util.Map.of()), eq(List.of()), isNull()))
+                eq(false), eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), eq(true)))
                 .thenReturn(instance);
 
         MultivaluedMap<String, String> p = params();
@@ -445,7 +631,7 @@ class RdsQueryHandlerTest {
         when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
                 eq("admin"), eq("secret"), eq("dbname"), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq("missing-subnet-group"), eq(null), eq(null), eq(false),
-                eq(false), eq(null), eq(java.util.Map.of()), eq(List.of()), isNull()))
+                eq(false), eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), eq(true)))
                 .thenThrow(new AwsException("DBSubnetGroupNotFoundFault",
                         "DB subnet group missing-subnet-group not found.", 404));
 
@@ -465,7 +651,12 @@ class RdsQueryHandlerTest {
 
     @Test
     void createDbSubnetGroup_passesSubnetMembersToService() {
-        when(service.createDbSubnetGroup("sample-db-subnets", "test", List.of("subnet-aaa", "subnet-bbb"), null))
+        when(service.createDbSubnetGroup(
+                "sample-db-subnets",
+                "test",
+                List.of("subnet-aaa", "subnet-bbb"),
+                null,
+                Map.of("example.io:managed-by", "sdk-test")))
                 .thenReturn(new DbSubnetGroup(
                         "sample-db-subnets", "test", "vpc-123", List.of("subnet-aaa", "subnet-bbb"),
                         Map.of("subnet-aaa", "us-east-1a", "subnet-bbb", "us-east-1b")));
@@ -475,9 +666,16 @@ class RdsQueryHandlerTest {
         p.add("DBSubnetGroupDescription", "test");
         p.add("SubnetIds.SubnetIdentifier.1", "subnet-aaa");
         p.add("SubnetIds.SubnetIdentifier.2", "subnet-bbb");
+        p.add("Tags.member.1.Key", "example.io:managed-by");
+        p.add("Tags.member.1.Value", "sdk-test");
         Response response = handler.handle("CreateDBSubnetGroup", p);
 
-        verify(service).createDbSubnetGroup("sample-db-subnets", "test", List.of("subnet-aaa", "subnet-bbb"), null);
+        verify(service).createDbSubnetGroup(
+                "sample-db-subnets",
+                "test",
+                List.of("subnet-aaa", "subnet-bbb"),
+                null,
+                Map.of("example.io:managed-by", "sdk-test"));
         String body = (String) response.getEntity();
         assertEquals(200, response.getStatus());
         assertTrue(body.contains("<DBSubnetGroupName>sample-db-subnets</DBSubnetGroupName>"));
@@ -489,7 +687,8 @@ class RdsQueryHandlerTest {
 
     @Test
     void createDbSubnetGroupPassesRequestRegionToService() {
-        when(service.createDbSubnetGroup("sample-db-subnets", "test", List.of("subnet-aaa", "subnet-bbb"), "us-west-2"))
+        when(service.createDbSubnetGroup(
+                "sample-db-subnets", "test", List.of("subnet-aaa", "subnet-bbb"), "us-west-2", Map.of()))
                 .thenReturn(new DbSubnetGroup(
                         "sample-db-subnets", "test", "vpc-123", List.of("subnet-aaa", "subnet-bbb"),
                         Map.of("subnet-aaa", "us-west-2a", "subnet-bbb", "us-west-2b")));
@@ -503,7 +702,44 @@ class RdsQueryHandlerTest {
         Response response = handler.handle("CreateDBSubnetGroup", p, "us-west-2");
 
         assertEquals(200, response.getStatus());
-        verify(service).createDbSubnetGroup("sample-db-subnets", "test", List.of("subnet-aaa", "subnet-bbb"), "us-west-2");
+        verify(service).createDbSubnetGroup(
+                "sample-db-subnets", "test", List.of("subnet-aaa", "subnet-bbb"), "us-west-2", Map.of());
+    }
+
+    @Test
+    void createDbSubnetGroupNormalizesOmittedAndExplicitEmptyTagValues() {
+        when(service.createDbSubnetGroup(
+                "empty-value-subnets",
+                "empty values",
+                List.of("subnet-aaa", "subnet-bbb"),
+                "us-west-2",
+                Map.of("normal", "value", "omitted", "", "explicit-empty", "")))
+                .thenReturn(new DbSubnetGroup(
+                        "empty-value-subnets",
+                        "empty values",
+                        "vpc-123",
+                        List.of("subnet-aaa", "subnet-bbb"),
+                        Map.of("subnet-aaa", "us-west-2a", "subnet-bbb", "us-west-2b")));
+
+        MultivaluedMap<String, String> p = params();
+        p.add("DBSubnetGroupName", "empty-value-subnets");
+        p.add("DBSubnetGroupDescription", "empty values");
+        p.add("SubnetIds.SubnetIdentifier.1", "subnet-aaa");
+        p.add("SubnetIds.SubnetIdentifier.2", "subnet-bbb");
+        p.add("Tags.member.1.Key", "normal");
+        p.add("Tags.member.1.Value", "value");
+        p.add("Tags.member.2.Key", "omitted");
+        p.add("Tags.member.3.Key", "explicit-empty");
+        p.add("Tags.member.3.Value", "");
+
+        assertEquals(200, handler.handle("CreateDBSubnetGroup", p, "us-west-2").getStatus());
+
+        verify(service).createDbSubnetGroup(
+                "empty-value-subnets",
+                "empty values",
+                List.of("subnet-aaa", "subnet-bbb"),
+                "us-west-2",
+                Map.of("normal", "value", "omitted", "", "explicit-empty", ""));
     }
 
     @Test
@@ -537,7 +773,7 @@ class RdsQueryHandlerTest {
         when(service.createDbInstance(eq("mydb"), eq("oracle"), eq("1.0"),
                 eq(null), eq(null), eq(null), eq("db.t3.micro"),
                 eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false), eq(false),
-                eq(null), eq(java.util.Map.of()), eq(List.of()), isNull()))
+                eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), eq(true)))
                 .thenThrow(new AwsException("InvalidParameterValue",
                         "Unsupported engine: oracle. Supported: postgres, mysql, mariadb.", 400));
 
@@ -553,7 +789,8 @@ class RdsQueryHandlerTest {
     @Test
     void modifyDbParameterGroup_ignoresParametersWithoutValue() {
         DbParameterGroup group = new DbParameterGroup("pg1", "postgres15", "test group");
-        when(service.modifyDbParameterGroup(eq("pg1"), eq(java.util.Map.of("max_connections", "200"))))
+        when(service.modifyDbParameterGroup(
+                eq("pg1"), eq(java.util.Map.of("max_connections", "200")), eq("us-west-2")))
                 .thenReturn(group);
 
         MultivaluedMap<String, String> p = params();
@@ -561,9 +798,10 @@ class RdsQueryHandlerTest {
         p.add("Parameters.member.1.ParameterName", "max_connections");
         p.add("Parameters.member.1.ParameterValue", "200");
         p.add("Parameters.member.2.ParameterName", "ignored_without_value");
-        handler.handle("ModifyDBParameterGroup", p);
+        handler.handle("ModifyDBParameterGroup", p, "us-west-2");
 
-        verify(service).modifyDbParameterGroup("pg1", java.util.Map.of("max_connections", "200"));
+        verify(service).modifyDbParameterGroup(
+                "pg1", java.util.Map.of("max_connections", "200"), "us-west-2");
     }
 
     @Test
@@ -688,7 +926,8 @@ class RdsQueryHandlerTest {
         group.setVpcId("vpc-12345678");
         group.setSubnetIds(List.of("subnet-a", "subnet-b"));
         group.setSubnetAvailabilityZones(Map.of("subnet-a", "us-east-1a", "subnet-b", "us-east-1b"));
-        when(service.createDbSubnetGroup("my-subnet-group", "test subnet group", List.of("subnet-a", "subnet-b"), null))
+        when(service.createDbSubnetGroup(
+                "my-subnet-group", "test subnet group", List.of("subnet-a", "subnet-b"), null, Map.of()))
                 .thenReturn(group);
 
         MultivaluedMap<String, String> p = params();

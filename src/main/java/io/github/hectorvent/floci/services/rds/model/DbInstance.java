@@ -22,6 +22,7 @@ public class DbInstance {
     private DbInstanceStatus status;
     private DbEndpoint endpoint;
     private boolean iamDatabaseAuthenticationEnabled;
+    private boolean autoMinorVersionUpgrade = true;
     private String parameterGroupName;
     private String dbSubnetGroupName;
     private String dbClusterIdentifier;
@@ -104,6 +105,11 @@ public class DbInstance {
     public boolean isIamDatabaseAuthenticationEnabled() { return iamDatabaseAuthenticationEnabled; }
     public void setIamDatabaseAuthenticationEnabled(boolean iamDatabaseAuthenticationEnabled) {
         this.iamDatabaseAuthenticationEnabled = iamDatabaseAuthenticationEnabled;
+    }
+
+    public boolean isAutoMinorVersionUpgrade() { return autoMinorVersionUpgrade; }
+    public void setAutoMinorVersionUpgrade(boolean autoMinorVersionUpgrade) {
+        this.autoMinorVersionUpgrade = autoMinorVersionUpgrade;
     }
 
     public String getParameterGroupName() { return parameterGroupName; }

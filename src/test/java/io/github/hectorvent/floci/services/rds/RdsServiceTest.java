@@ -99,6 +99,7 @@ class RdsServiceTest {
         assertNotNull(instance.getDbiResourceId());
         assertTrue(instance.getDbiResourceId().startsWith("db-"));
         assertEquals("arn:aws:rds:us-east-1:123456789012:db:mydb", instance.getDbInstanceArn());
+        assertTrue(instance.isAutoMinorVersionUpgrade());
     }
 
     @Test
@@ -115,6 +116,22 @@ class RdsServiceTest {
 
         assertEquals(List.of("sg-updated-a", "sg-updated-b"), modified.getVpcSecurityGroupIds());
         assertEquals(List.of("sg-updated-a", "sg-updated-b"), rdsService.getDbInstance("mydb").getVpcSecurityGroupIds());
+    }
+
+    @Test
+    void createAndModifyDbInstancePreserveAutoMinorVersionUpgrade() {
+        DbInstance created = rdsService.createDbInstance("mydb", "postgres", "13",
+                "admin", "password", "dbname", "db.t3.micro",
+                20, false, null, null, null, null, false, false, null,
+                Map.of(), List.of(), null, false);
+
+        assertFalse(created.isAutoMinorVersionUpgrade());
+        assertFalse(rdsService.modifyDbInstance("mydb", null, null, null,
+                null, null, null).isAutoMinorVersionUpgrade());
+        assertTrue(rdsService.modifyDbInstance("mydb", null, null, null,
+                null, null, true).isAutoMinorVersionUpgrade());
+        assertFalse(rdsService.modifyDbInstance("mydb", null, null, null,
+                null, null, false).isAutoMinorVersionUpgrade());
     }
 
     @Test
@@ -215,6 +232,28 @@ class RdsServiceTest {
     }
 
     @Test
+    void dbParameterGroupCreationTagsRoundTripByRegionalArn() {
+        DbParameterGroup group = rdsService.createDbParameterGroup(
+                "pg1",
+                "postgres18",
+                "test group",
+                "us-west-2",
+                Map.of("normal", "value", "empty", ""));
+        rdsService.addTagsToResource(
+                group.getDbParameterGroupArn(),
+                Map.of("added-normal", "added-value", "added-empty", ""));
+
+        assertEquals("arn:aws:rds:us-west-2:123456789012:pg:pg1", group.getDbParameterGroupArn());
+        assertEquals(
+                Map.of(
+                        "normal", "value",
+                        "empty", "",
+                        "added-normal", "added-value",
+                        "added-empty", ""),
+                rdsService.listTagsForResource(group.getDbParameterGroupArn()));
+    }
+
+    @Test
     void createDbInstanceRejectsIncompatibleParameterGroupFamily() {
         rdsService.createDbParameterGroup("pg1", "mysql8.0", "test group");
 
@@ -286,10 +325,15 @@ class RdsServiceTest {
     @Test
     void dbSubnetGroupRoundTrip() {
         DbSubnetGroup group = rdsService.createDbSubnetGroup(
-                "sample-db-subnets", "test", java.util.List.of("subnet-default-a", "subnet-default-b"));
+                "sample-db-subnets",
+                "test",
+                java.util.List.of("subnet-default-a", "subnet-default-b"),
+                null,
+                java.util.Map.of("example.io:managed-by", "sdk-test"));
 
         assertEquals("sample-db-subnets", group.getDbSubnetGroupName());
         assertEquals(java.util.List.of("subnet-default-a", "subnet-default-b"), group.getSubnetIds());
+        assertEquals(java.util.Map.of("example.io:managed-by", "sdk-test"), group.getTags());
         assertEquals(1, rdsService.listDbSubnetGroups("sample-db-subnets").size());
 
         rdsService.deleteDbSubnetGroup("sample-db-subnets");
@@ -317,19 +361,43 @@ class RdsServiceTest {
     @Test
     void dbSubnetGroupTagsRoundTripAndMutateByArn() {
         rdsService.createDbSubnetGroup(
-                "sample-db-subnets", "test", java.util.List.of("subnet-default-a", "subnet-default-b"));
+                "sample-db-subnets",
+                "test",
+                java.util.List.of("subnet-default-a", "subnet-default-b"),
+                null,
+                Map.of("normal", "value", "empty", ""));
         String arn = "arn:aws:rds:us-east-1:123456789012:subgrp:sample-db-subnets";
 
-        // A subnet group with no tags must list cleanly — previously this threw DBInstanceNotFound (404)
-        // because every ResourceName was resolved as a DB instance.
-        assertEquals(java.util.Map.of(), rdsService.listTagsForResource(arn));
-
-        rdsService.addTagsToResource(arn, java.util.Map.of("Name", "sample-db-subnets"));
-        assertEquals(java.util.Map.of("Name", "sample-db-subnets"),
+        assertEquals(
+                Map.of("normal", "value", "empty", ""),
                 rdsService.listTagsForResource(arn));
 
-        rdsService.removeTagsFromResource(arn, java.util.List.of("Name"));
-        assertEquals(java.util.Map.of(), rdsService.listTagsForResource(arn));
+        rdsService.addTagsToResource(
+                arn,
+                Map.of("added-normal", "added-value", "added-empty", ""));
+        assertEquals(
+                Map.of(
+                        "normal", "value",
+                        "empty", "",
+                        "added-normal", "added-value",
+                        "added-empty", ""),
+                rdsService.listTagsForResource(arn));
+
+        rdsService.removeTagsFromResource(
+                arn,
+                java.util.List.of("normal", "empty", "added-normal", "added-empty"));
+        assertEquals(Map.of(), rdsService.listTagsForResource(arn));
+    }
+
+    @Test
+    void listTagsForDefaultSubnetGroupUsesArnRegion() {
+        when(ec2Service.describeSubnets(eq("us-west-2"), anyList(), any()))
+                .thenReturn(List.of(
+                        subnet("subnet-west-a", "vpc-west", "us-west-2a"),
+                        subnet("subnet-west-b", "vpc-west", "us-west-2b")));
+
+        assertEquals(Map.of(), rdsService.listTagsForResource(
+                "arn:aws:rds:us-west-2:123456789012:subgrp:default"));
     }
 
     @Test
@@ -399,6 +467,106 @@ class RdsServiceTest {
                 rdsService.listTagsForResource("arn:aws:rds:incomplete"));
 
         assertEquals("InvalidParameterValue", exception.getErrorCode());
+    }
+
+    @Test
+    void groupTagOperationsRejectMismatchedPartition() {
+        rdsService.createDbParameterGroup("pg1", "postgres18", "test group");
+
+        AwsException exception = assertThrows(AwsException.class, () ->
+                rdsService.listTagsForResource("arn:aws-cn:rds:us-east-1:123456789012:pg:pg1"));
+
+        assertEquals("InvalidParameterValue", exception.getErrorCode());
+    }
+
+    @Test
+    void groupTagOperationsDoNotLeakAcrossRegions() {
+        rdsService.createDbParameterGroup("pg1", "postgres18", "test group");
+
+        AwsException exception = assertThrows(AwsException.class, () ->
+                rdsService.listTagsForResource("arn:aws:rds:us-west-2:123456789012:pg:pg1"));
+
+        assertEquals("DBParameterGroupNotFound", exception.getErrorCode());
+    }
+
+    @Test
+    void groupTagOperationsRejectMismatchedAccount() {
+        rdsService.createDbParameterGroup("pg1", "postgres18", "test group");
+
+        AwsException exception = assertThrows(AwsException.class, () ->
+                rdsService.listTagsForResource("arn:aws:rds:us-east-1:999999999999:pg:pg1"));
+
+        assertEquals("InvalidParameterValue", exception.getErrorCode());
+    }
+
+    @Test
+    void instanceAndClusterTagOperationsRejectForgedArns() {
+        when(config.services().rds().mock()).thenReturn(true);
+        DbInstance instance = rdsService.createDbInstance("mydb", "postgres", "13",
+                "admin", "password", "dbname", "db.t3.micro",
+                20, false, null, null, null);
+        DbCluster cluster = rdsService.createDbCluster("cluster1", "postgres", "13",
+                "admin", "password", "dbname", false, null);
+
+        for (String forgedArn : List.of(
+                instance.getDbInstanceArn().replace("arn:aws:", "arn:aws-cn:"),
+                instance.getDbInstanceArn().replace("us-east-1", "us-west-2"),
+                instance.getDbInstanceArn().replace("123456789012", "999999999999"),
+                cluster.getDbClusterArn().replace("us-east-1", "us-west-2"),
+                cluster.getDbClusterArn().replace("123456789012", "999999999999"))) {
+            AwsException exception = assertThrows(AwsException.class,
+                    () -> rdsService.listTagsForResource(forgedArn));
+            assertEquals("InvalidParameterValue", exception.getErrorCode());
+        }
+    }
+
+    @Test
+    void sameGroupNamesAreScopedByRegionForDescribeAndTags() {
+        when(ec2Service.describeSubnets(eq("us-west-2"), anyList(), any()))
+                .thenReturn(List.of(
+                        subnet("subnet-west-a", "vpc-west", "us-west-2a"),
+                        subnet("subnet-west-b", "vpc-west", "us-west-2b")));
+
+        DbSubnetGroup eastSubnets = rdsService.createDbSubnetGroup(
+                "shared", "east", List.of("subnet-default-a", "subnet-default-b"),
+                "us-east-1", Map.of("region", "east"));
+        DbSubnetGroup westSubnets = rdsService.createDbSubnetGroup(
+                "shared", "west", List.of("subnet-west-a", "subnet-west-b"),
+                "us-west-2", Map.of("region", "west"));
+        DbParameterGroup eastParameters = rdsService.createDbParameterGroup(
+                "shared", "postgres18", "east", "us-east-1", Map.of("region", "east"));
+        DbParameterGroup westParameters = rdsService.createDbParameterGroup(
+                "shared", "postgres18", "west", "us-west-2", Map.of("region", "west"));
+
+        assertEquals("east", rdsService.listDbSubnetGroups("shared", "us-east-1")
+                .iterator().next().getDescription());
+        assertEquals("west", rdsService.listDbSubnetGroups("shared", "us-west-2")
+                .iterator().next().getDescription());
+        assertEquals("east", rdsService.listDbParameterGroups("shared", "us-east-1")
+                .iterator().next().getDescription());
+        assertEquals("west", rdsService.listDbParameterGroups("shared", "us-west-2")
+                .iterator().next().getDescription());
+        assertEquals(Map.of("region", "east"), rdsService.listTagsForResource(eastSubnets.getDbSubnetGroupArn()));
+        assertEquals(Map.of("region", "west"), rdsService.listTagsForResource(westSubnets.getDbSubnetGroupArn()));
+        assertEquals(Map.of("region", "east"), rdsService.listTagsForResource(eastParameters.getDbParameterGroupArn()));
+        assertEquals(Map.of("region", "west"), rdsService.listTagsForResource(westParameters.getDbParameterGroupArn()));
+    }
+
+    @Test
+    void syntheticDefaultSubnetGroupTagsPersistWithoutDuplicateDescribeRows() {
+        String arn = "arn:aws:rds:us-east-1:123456789012:subgrp:default";
+
+        rdsService.addTagsToResource(arn, Map.of("owner", "network"));
+        Collection<DbSubnetGroup> groups = rdsService.listDbSubnetGroups(null, "us-east-1");
+
+        assertEquals(Map.of("owner", "network"), rdsService.listTagsForResource(arn));
+        assertEquals(1, groups.stream()
+                .filter(group -> "default".equals(group.getDbSubnetGroupName()))
+                .count());
+        assertEquals(Map.of("owner", "network"), groups.iterator().next().getTags());
+
+        rdsService.removeTagsFromResource(arn, List.of("owner"));
+        assertEquals(Map.of(), rdsService.listTagsForResource(arn));
     }
 
     @Test
