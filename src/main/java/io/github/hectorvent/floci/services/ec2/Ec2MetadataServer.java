@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.vertx.core.Vertx;
+import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
@@ -295,14 +296,23 @@ public class Ec2MetadataServer {
         if (inst == null) {
             return;
         }
-        String userData = inst.getUserData();
-        if (userData == null || userData.isBlank()) {
+        byte[] userData = userDataBytes(inst);
+        if (userData == null) {
             ctx.response().setStatusCode(404).end();
             return;
         }
         ctx.response().setStatusCode(200)
-                .putHeader("content-type", "text/plain")
-                .end(userData);
+                .putHeader("content-type", "application/octet-stream")
+                .end(Buffer.buffer(userData));
+    }
+
+    static byte[] userDataBytes(Instance instance) {
+        if (instance.getEncodedUserData() != null) {
+            return Ec2UserData.fromEncoded(instance.getEncodedUserData()).bytes();
+        }
+        return instance.getUserData() != null
+                ? instance.getUserData().getBytes(StandardCharsets.UTF_8)
+                : null;
     }
 
     private void handleIdentityDocument(RoutingContext ctx) {
