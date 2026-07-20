@@ -371,19 +371,24 @@ class Ec2ServiceTest {
     }
 
     @Test
-    void describeImagesAdvertisesCloudGuestWithoutChangingUbuntuDefault() {
+    void describeImagesAdvertisesOneStockUbuntuArm64CloudGuest() {
         Ec2ImageCatalog imageCatalog = new Ec2ImageCatalog();
         AmiImageResolver amiImageResolver = new AmiImageResolver(imageCatalog);
         Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
                 mock(Ec2PortForwardManager.class),
                 amiImageResolver, imageCatalog, new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
 
-        assertTrue(service.describeImages("us-east-1", List.of(), List.of()).stream()
-                .anyMatch(image -> "ami-ubuntu2404-cloud-arm64".equals(image.getImageId())));
-        assertEquals("public.ecr.aws/docker/library/ubuntu:24.04", amiImageResolver.resolve("ami-ubuntu2404"));
+        List<io.github.hectorvent.floci.services.ec2.model.Image> stockImages = service.describeImages(
+                "us-east-1", List.of(), List.of("099720109477"), Map.of(
+                        "name", List.of("ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"),
+                        "architecture", List.of("arm64"),
+                        "state", List.of("available")));
+        assertEquals(1, stockImages.size());
+        assertEquals("ami-ubuntu2404-arm64", stockImages.getFirst().getImageId());
 
         ResolvedAmiImage resolved = amiImageResolver.resolveImage("ami-ubuntu2404-cloud");
-        assertEquals("floci/ami-ubuntu:24.04-arm64", resolved.dockerImage());
+        assertEquals("floci/ami-ubuntu:24.04-arm64-sha256-15188696da114a3ffd3d3554f5858a0c3ac257933656e85feb4e0e83ad542b4a",
+                resolved.dockerImage());
         assertTrue(resolved.systemd());
     }
 
