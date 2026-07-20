@@ -6,6 +6,10 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsFormRequestResolver;
 import io.github.hectorvent.floci.core.common.AwsJsonRequestResolver;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.Reservation;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -16,8 +20,12 @@ import org.jboss.logging.Logger;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Constructs the target resource ARN for a request so the policy evaluator
@@ -37,17 +45,20 @@ public class ResourceArnBuilder {
     private final SecretsManagerService secretsManagerService;
     private final AwsJsonRequestResolver jsonRequestResolver;
     private final KmsService kmsService;
+    private final Ec2Service ec2Service;
 
     @Inject
     public ResourceArnBuilder(IamService iamService, AwsFormRequestResolver formRequestResolver,
                               ObjectMapper objectMapper, SecretsManagerService secretsManagerService,
-                              AwsJsonRequestResolver jsonRequestResolver, KmsService kmsService) {
+                              AwsJsonRequestResolver jsonRequestResolver, KmsService kmsService,
+                              Ec2Service ec2Service) {
         this.iamService = iamService;
         this.formRequestResolver = formRequestResolver;
         this.objectMapper = objectMapper;
         this.secretsManagerService = secretsManagerService;
         this.jsonRequestResolver = jsonRequestResolver;
         this.kmsService = kmsService;
+        this.ec2Service = ec2Service;
     }
 
     public String build(String credentialScope, ContainerRequestContext ctx,
@@ -79,7 +90,85 @@ public class ResourceArnBuilder {
                     new AuthorizationRequest(action, existingRoleArn(ctx, accountId), null),
                     new AuthorizationRequest(action, existingInstanceProfileArn(ctx, accountId), null));
         }
-        return List.of();
+        if (!"ssm".equals(credentialScope) || !"ssm:SendCommand".equals(action)) {
+            return List.of();
+        }
+        JsonNode request = jsonRequestResolver.body(ctx);
+        if (request == null) {
+            return List.of();
+        }
+
+        List<AuthorizationRequest> authorizations = new ArrayList<>();
+        for (String targetId : resolveSsmTargetIds(request, region)) {
+            if (targetId.startsWith("i-")) {
+                authorizations.add(new AuthorizationRequest(
+                        action,
+                        AwsArnUtils.Arn.of("ec2", region, accountId, "instance/" + targetId).toString(),
+                        ssmTargetTagContext(ec2Service.findInstanceById(targetId), region)));
+            } else if (targetId.startsWith("mi-")) {
+                authorizations.add(new AuthorizationRequest(
+                        action,
+                        AwsArnUtils.Arn.of(
+                                "ssm", region, accountId, "managed-instance/" + targetId).toString(),
+                        null));
+            }
+        }
+
+        String documentName = request.path("DocumentName").asText(null);
+        if (documentName != null && !documentName.isBlank()) {
+            String documentArn = documentName.startsWith("arn:")
+                    ? documentName
+                    : AwsArnUtils.Arn.of(
+                            "ssm", region, awsOwnedDocument(documentName) ? "" : accountId,
+                            "document/" + documentName).toString();
+            authorizations.add(new AuthorizationRequest(action, documentArn, null));
+        }
+        return List.copyOf(authorizations);
+    }
+
+    private Set<String> resolveSsmTargetIds(JsonNode request, String region) {
+        Set<String> targetIds = new LinkedHashSet<>();
+        request.path("InstanceIds").forEach(node -> addTargetId(targetIds, node.asText(null)));
+        request.path("Targets").forEach(target -> {
+            String key = target.path("Key").asText("");
+            List<String> values = new ArrayList<>();
+            target.path("Values").forEach(value -> values.add(value.asText()));
+            if ("InstanceIds".equals(key)) {
+                values.forEach(value -> addTargetId(targetIds, value));
+            } else if (key.startsWith("tag:") && !values.isEmpty()) {
+                Map<String, List<String>> filters = Map.of(key, values);
+                for (Reservation reservation : ec2Service.describeInstances(region, List.of(), filters)) {
+                    reservation.getInstances().forEach(
+                            instance -> addTargetId(targetIds, instance.getInstanceId()));
+                }
+            }
+        });
+        return targetIds;
+    }
+
+    private static void addTargetId(Set<String> targetIds, String targetId) {
+        if (targetId != null && (targetId.startsWith("i-") || targetId.startsWith("mi-"))) {
+            targetIds.add(targetId);
+        }
+    }
+
+    private static Map<String, List<String>> ssmTargetTagContext(Instance instance, String region) {
+        if (instance == null || !region.equals(instance.getRegion())
+                || instance.getTags() == null || instance.getTags().isEmpty()) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        for (Tag tag : instance.getTags()) {
+            if (tag.getKey() != null && tag.getValue() != null) {
+                conditions.put("ssm:resourceTag/" + tag.getKey(), List.of(tag.getValue()));
+                conditions.put("aws:ResourceTag/" + tag.getKey(), List.of(tag.getValue()));
+            }
+        }
+        return conditions.isEmpty() ? null : Map.copyOf(conditions);
+    }
+
+    private static boolean awsOwnedDocument(String documentName) {
+        return documentName.startsWith("AWS-") || documentName.startsWith("Amazon-");
     }
 
     public List<String> additionalResources(String credentialScope, ContainerRequestContext ctx,
