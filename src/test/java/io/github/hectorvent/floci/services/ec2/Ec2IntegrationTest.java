@@ -1131,6 +1131,81 @@ class Ec2IntegrationTest {
     }
 
     @Test
+    @Order(42)
+    void runInstancesRejectsOversizedDecodedUserData() {
+        assertOversizedUserDataRejected("RunInstances", "UserData");
+    }
+
+    @Test
+    @Order(42)
+    void createLaunchTemplateRejectsOversizedDecodedUserData() {
+        given()
+            .formParam("Action", "CreateLaunchTemplate")
+            .formParam("LaunchTemplateName", "oversized-user-data-template")
+            .formParam("LaunchTemplateData.ImageId", "ami-0abcdef1234567890")
+            .formParam("LaunchTemplateData.InstanceType", "t3.micro")
+            .formParam("LaunchTemplateData.UserData", oversizedUserData())
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"))
+            .body("Response.Errors.Error.Message", equalTo("User data is limited to 16384 bytes"));
+    }
+
+    @Test
+    @Order(42)
+    void requestSpotInstancesRejectsOversizedDecodedUserData() {
+        assertOversizedUserDataRejected("RequestSpotInstances", "LaunchSpecification.UserData");
+    }
+
+    @Test
+    @Order(42)
+    void runInstancesRejectsMalformedBase64UserData() {
+        given()
+            .formParam("Action", "RunInstances")
+            .formParam("ImageId", "ami-0abcdef1234567890")
+            .formParam("InstanceType", "t3.micro")
+            .formParam("MinCount", "1")
+            .formParam("MaxCount", "1")
+            .formParam("UserData", "not-valid-base64")
+            .header("Authorization", AUTH_HEADER)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"))
+            .body("Response.Errors.Error.Message", equalTo("UserData is not valid base64 content."));
+    }
+
+    private static void assertOversizedUserDataRejected(String action, String parameter) {
+        var request = given()
+                .formParam("Action", action)
+                .formParam(parameter, oversizedUserData())
+                .header("Authorization", AUTH_HEADER);
+        if ("RunInstances".equals(action)) {
+            request.formParam("ImageId", "ami-0abcdef1234567890")
+                    .formParam("InstanceType", "t3.micro")
+                    .formParam("MinCount", "1")
+                    .formParam("MaxCount", "1");
+        } else {
+            request.formParam("LaunchSpecification.ImageId", "ami-0abcdef1234567890")
+                    .formParam("LaunchSpecification.InstanceType", "t3.micro");
+        }
+        request.when()
+                .post("/")
+                .then()
+                .statusCode(400)
+                .body("Response.Errors.Error.Code", equalTo("InvalidParameterValue"))
+                .body("Response.Errors.Error.Message", equalTo("User data is limited to 16384 bytes"));
+    }
+
+    private static String oversizedUserData() {
+        return Base64.getEncoder().encodeToString(new byte[Ec2UserData.MAX_DECODED_BYTES + 1]);
+    }
+
+    @Test
     @Order(43)
     void createLaunchTemplate()
             throws IOException {
@@ -2952,6 +3027,7 @@ class Ec2IntegrationTest {
     @Order(150)
     void spotInstanceLifecycle() {
         // 1. Request Spot Instance
+        String spotUserData = Base64.getEncoder().encodeToString(new byte[]{(byte) 0xff, 0x00, 0x09});
         String spotRequestId = given()
             .formParam("Action", "RequestSpotInstances")
             .formParam("SpotPrice", "0.05")
@@ -2959,6 +3035,7 @@ class Ec2IntegrationTest {
             .formParam("Type", "one-time")
             .formParam("LaunchSpecification.ImageId", "ami-0abcdef1234567890")
             .formParam("LaunchSpecification.InstanceType", "t2.micro")
+            .formParam("LaunchSpecification.UserData", spotUserData)
             .formParam("TagSpecification.1.ResourceType", "spot-instances-request")
             .formParam("TagSpecification.1.Tag.1.Key", "SpotKey")
             .formParam("TagSpecification.1.Tag.1.Value", "SpotValue")
@@ -2973,6 +3050,7 @@ class Ec2IntegrationTest {
             .body("RequestSpotInstancesResponse.spotInstanceRequestSet.item[0].state", equalTo("active"))
             .body("RequestSpotInstancesResponse.spotInstanceRequestSet.item[0].status.code", equalTo("fulfilled"))
             .body("RequestSpotInstancesResponse.spotInstanceRequestSet.item[0].launchSpecification.imageId", equalTo("ami-0abcdef1234567890"))
+            .body("RequestSpotInstancesResponse.spotInstanceRequestSet.item[0].launchSpecification.userData", equalTo(spotUserData))
             .body("RequestSpotInstancesResponse.spotInstanceRequestSet.item[0].productDescription", equalTo("Linux/UNIX"))
             .body("RequestSpotInstancesResponse.spotInstanceRequestSet.item[0].tagSet.item[0].key", equalTo("SpotKey"))
             .body("RequestSpotInstancesResponse.spotInstanceRequestSet.item[0].tagSet.item[0].value", equalTo("SpotValue"))
@@ -2988,7 +3066,8 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .body("DescribeSpotInstanceRequestsResponse.spotInstanceRequestSet.item[0].spotInstanceRequestId", equalTo(spotRequestId))
-            .body("DescribeSpotInstanceRequestsResponse.spotInstanceRequestSet.item[0].state", equalTo("active"));
+            .body("DescribeSpotInstanceRequestsResponse.spotInstanceRequestSet.item[0].state", equalTo("active"))
+            .body("DescribeSpotInstanceRequestsResponse.spotInstanceRequestSet.item[0].launchSpecification.userData", equalTo(spotUserData));
 
         // 3. Describe Spot Instance Request using tag filter
         given()

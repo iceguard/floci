@@ -1,14 +1,19 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
+import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import jakarta.ws.rs.core.MultivaluedHashMap;
@@ -21,10 +26,75 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.util.List;
+import java.util.Base64;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
 class Ec2QueryHandlerTest {
+
+    private static final String REGION = "us-east-1";
+
+    @ParameterizedTest
+    @MethodSource("explicitUserDataOverrides")
+    void runInstancesUsesPresentUserDataInsteadOfLaunchTemplateData(
+            String encodedUserData, byte[] expectedBytes) {
+        Ec2Service service = mock(Ec2Service.class);
+        LaunchTemplateData templateData = new LaunchTemplateData();
+        templateData.setImageId("ami-template");
+        templateData.setInstanceType("t3.micro");
+        templateData.setEncodedUserData(Base64.getEncoder().encodeToString("template".getBytes()));
+        when(service.resolveLaunchTemplateData(REGION, "lt-123", null, null)).thenReturn(templateData);
+        when(service.runInstancesWithUserData(
+                eq(REGION), eq("ami-template"), eq("t3.micro"), eq(1), eq(1),
+                isNull(), anyList(), isNull(), isNull(), anyList(),
+                org.mockito.ArgumentMatchers.any(Ec2UserData.class), isNull()))
+                .thenReturn(new Reservation());
+
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.add("LaunchTemplate.LaunchTemplateId", "lt-123");
+        params.add("UserData", encodedUserData);
+
+        handler(service).handle("RunInstances", params, REGION);
+
+        ArgumentCaptor<Ec2UserData> captured = ArgumentCaptor.forClass(Ec2UserData.class);
+        verify(service).runInstancesWithUserData(
+                eq(REGION), eq("ami-template"), eq("t3.micro"), eq(1), eq(1),
+                isNull(), anyList(), isNull(), isNull(), anyList(), captured.capture(), isNull());
+        assertEquals(encodedUserData, captured.getValue().encoded());
+        assertArrayEquals(expectedBytes, captured.getValue().bytes());
+    }
+
+    @Test
+    void runInstancesUsesLaunchTemplateUserDataOnlyWhenRequestValueIsAbsent() {
+        Ec2Service service = mock(Ec2Service.class);
+        LaunchTemplateData templateData = new LaunchTemplateData();
+        templateData.setImageId("ami-template");
+        templateData.setInstanceType("t3.micro");
+        templateData.setEncodedUserData("dGVtcGxhdGU=");
+        when(service.resolveLaunchTemplateData(REGION, "lt-123", null, null)).thenReturn(templateData);
+        when(service.runInstancesWithUserData(
+                eq(REGION), eq("ami-template"), eq("t3.micro"), eq(1), eq(1),
+                isNull(), anyList(), isNull(), isNull(), anyList(),
+                org.mockito.ArgumentMatchers.any(Ec2UserData.class), isNull()))
+                .thenReturn(new Reservation());
+
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.add("LaunchTemplate.LaunchTemplateId", "lt-123");
+
+        handler(service).handle("RunInstances", params, REGION);
+
+        ArgumentCaptor<Ec2UserData> captured = ArgumentCaptor.forClass(Ec2UserData.class);
+        verify(service).runInstancesWithUserData(
+                eq(REGION), eq("ami-template"), eq("t3.micro"), eq(1), eq(1),
+                isNull(), anyList(), isNull(), isNull(), anyList(), captured.capture(), isNull());
+        assertEquals("dGVtcGxhdGU=", captured.getValue().encoded());
+    }
+
+    private static Stream<Arguments> explicitUserDataOverrides() {
+        return Stream.of(
+                Arguments.of("", new byte[0]),
+                Arguments.of("/wAJ", new byte[]{(byte) 0xff, 0x00, 0x09}));
+    }
 
     @Test
     void normalizesValuelessCreateSubnetTagsBeforeMutation() {

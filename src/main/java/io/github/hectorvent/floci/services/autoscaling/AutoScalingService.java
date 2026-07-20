@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.storage.StorageBackedMap;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.autoscaling.model.*;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.Ec2UserData;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import jakarta.annotation.PostConstruct;
@@ -106,8 +107,8 @@ public class AutoScalingService {
                             .filter(Objects::nonNull)
                             .collect(Collectors.toList());
                 }
-                if (isBlank(userData)) {
-                    userData = source.getUserData();
+                if (userData == null) {
+                    userData = source.getEncodedUserData();
                 }
                 if (isBlank(iamInstanceProfile)) {
                     iamInstanceProfile = source.getIamInstanceProfileArn();
@@ -123,7 +124,8 @@ public class AutoScalingService {
         lc.setInstanceType(instanceType);
         lc.setKeyName(keyName);
         lc.setSecurityGroups(securityGroups != null ? new ArrayList<>(securityGroups) : new ArrayList<>());
-        lc.setUserData(userData);
+        Ec2UserData validatedUserData = Ec2UserData.fromEncoded(userData);
+        lc.setUserData(validatedUserData != null ? validatedUserData.encoded() : null);
         lc.setIamInstanceProfile(iamInstanceProfile);
         lc.setAssociatePublicIpAddress(associatePublicIpAddress);
         lc.setCreatedTime(Instant.now());

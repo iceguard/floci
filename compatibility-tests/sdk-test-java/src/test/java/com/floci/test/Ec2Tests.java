@@ -290,8 +290,8 @@ class Ec2Tests {
     @Order(7)
     @DisplayName("DescribeLaunchTemplateVersions - user data readback")
     void describeLaunchTemplateVersionsReturnsEncodedUserData() {
-        String encodedUserData = Base64.getEncoder()
-                .encodeToString("#!/bin/sh\necho sdk-launch-template\n".getBytes(StandardCharsets.UTF_8));
+        String encodedUserData = Base64.getEncoder().encodeToString(
+                new byte[]{0x1f, (byte) 0x8b, 0x00, (byte) 0xff});
         String launchTemplateId = ec2.createLaunchTemplate(CreateLaunchTemplateRequest.builder()
                 .launchTemplateName("sdk-user-data-readback")
                 .launchTemplateData(RequestLaunchTemplateData.builder()
@@ -317,6 +317,91 @@ class Ec2Tests {
                     .launchTemplateId(launchTemplateId)
                     .build());
         }
+    }
+
+    @Test
+    @Order(7)
+    @DisplayName("CreateLaunchTemplateVersion - present empty user data overrides source")
+    void launchTemplateVersionPreservesPresentEmptyUserData() {
+        String launchTemplateId = ec2.createLaunchTemplate(CreateLaunchTemplateRequest.builder()
+                .launchTemplateName("sdk-empty-user-data-override")
+                .launchTemplateData(RequestLaunchTemplateData.builder()
+                        .imageId("ami-0abcdef1234567890")
+                        .instanceType(InstanceType.T3_MICRO)
+                        .userData(Base64.getEncoder().encodeToString("source".getBytes(StandardCharsets.UTF_8)))
+                        .build())
+                .build()).launchTemplate().launchTemplateId();
+
+        try {
+            ec2.createLaunchTemplateVersion(CreateLaunchTemplateVersionRequest.builder()
+                    .launchTemplateId(launchTemplateId)
+                    .sourceVersion("1")
+                    .launchTemplateData(RequestLaunchTemplateData.builder().userData("").build())
+                    .build());
+
+            assertThat(ec2.describeLaunchTemplateVersions(DescribeLaunchTemplateVersionsRequest.builder()
+                            .launchTemplateId(launchTemplateId)
+                            .versions("2")
+                            .build())
+                    .launchTemplateVersions().getFirst().launchTemplateData().userData()).isEmpty();
+        } finally {
+            ec2.deleteLaunchTemplate(DeleteLaunchTemplateRequest.builder()
+                    .launchTemplateId(launchTemplateId)
+                    .build());
+        }
+    }
+
+    @Test
+    @Order(7)
+    @DisplayName("RunInstances - exact binary user data readback")
+    void runInstancesPreservesExactBinaryUserData() {
+        String encodedUserData = Base64.getEncoder().encodeToString(
+                new byte[]{(byte) 0xff, 0x00, 0x09});
+        String launchedInstanceId = ec2.runInstances(RunInstancesRequest.builder()
+                .imageId("ami-0abcdef1234567890")
+                .instanceType(InstanceType.T3_MICRO)
+                .minCount(1)
+                .maxCount(1)
+                .userData(encodedUserData)
+                .build()).instances().getFirst().instanceId();
+
+        try {
+            DescribeInstanceAttributeResponse described = ec2.describeInstanceAttribute(
+                    DescribeInstanceAttributeRequest.builder()
+                            .instanceId(launchedInstanceId)
+                            .attribute(InstanceAttributeName.USER_DATA)
+                            .build());
+
+            assertThat(described.userData().value()).isEqualTo(encodedUserData);
+        } finally {
+            ec2.terminateInstances(TerminateInstancesRequest.builder()
+                    .instanceIds(launchedInstanceId)
+                    .build());
+        }
+    }
+
+    @Test
+    @Order(7)
+    @DisplayName("CreateLaunchTemplate - oversized decoded user data uses EC2 error shape")
+    void createLaunchTemplateRejectsOversizedDecodedUserData() {
+        String oversized = Base64.getEncoder().encodeToString(new byte[16 * 1024 + 1]);
+
+        assertThatThrownBy(() -> ec2.createLaunchTemplate(CreateLaunchTemplateRequest.builder()
+                .launchTemplateName("sdk-oversized-user-data")
+                .launchTemplateData(RequestLaunchTemplateData.builder()
+                        .imageId("ami-0abcdef1234567890")
+                        .instanceType(InstanceType.T3_MICRO)
+                        .userData(oversized)
+                        .build())
+                .build()))
+                .isInstanceOf(Ec2Exception.class)
+                .satisfies(error -> {
+                    Ec2Exception ec2Error = (Ec2Exception) error;
+                    assertThat(ec2Error.statusCode()).isEqualTo(400);
+                    assertThat(ec2Error.awsErrorDetails().errorCode()).isEqualTo("InvalidParameterValue");
+                    assertThat(ec2Error.awsErrorDetails().errorMessage())
+                            .isEqualTo("User data is limited to 16384 bytes");
+                });
     }
 
     @Test
