@@ -737,23 +737,29 @@ public class ElbV2Service {
 
     public void registerTargets(String region, String tgArn, List<TargetDescription> targets) {
         TargetGroup tg = requireTargetGroup(region, tgArn);
+        List<TargetDescription> normalizedTargets = targets.stream()
+                .map(target -> normalizeRegisteredTarget(tg, target))
+                .toList();
         List<TargetDescription> existing = tg.getTargets();
-        for (TargetDescription t : targets) {
+        for (TargetDescription t : normalizedTargets) {
             // replace if same id+port already registered
             existing.removeIf(e -> e.getId().equals(t.getId()) && Objects.equals(e.getPort(), t.getPort()));
             existing.add(t);
         }
         persistRegion(targetGroups, region);
-        healthChecker.addTargets(tgArn, targets, tg);
+        healthChecker.addTargets(tgArn, normalizedTargets, tg);
     }
 
     public void deregisterTargets(String region, String tgArn, List<TargetDescription> targets) {
         TargetGroup tg = requireTargetGroup(region, tgArn);
-        for (TargetDescription t : targets) {
+        List<TargetDescription> normalizedTargets = targets.stream()
+                .map(target -> normalizeRegisteredTarget(tg, target))
+                .toList();
+        for (TargetDescription t : normalizedTargets) {
             tg.getTargets().removeIf(e -> e.getId().equals(t.getId()) && Objects.equals(e.getPort(), t.getPort()));
         }
         persistRegion(targetGroups, region);
-        healthChecker.removeTargets(tgArn, targets, tg);
+        healthChecker.removeTargets(tgArn, normalizedTargets, tg);
     }
 
     public List<TargetHealth> describeTargetHealth(String region, String tgArn,
@@ -764,27 +770,39 @@ public class ElbV2Service {
 
         boolean isLambdaTg = "lambda".equals(tg.getTargetType());
         return candidates.stream().map(t -> {
+            TargetDescription visibleTarget = normalizeRegisteredTarget(tg, t);
             TargetHealth th = new TargetHealth();
-            th.setTarget(t);
+            th.setTarget(visibleTarget);
             if (isLambdaTg) {
                 th.setHealthCheckPort("N/A");
                 th.setState("healthy");
                 return th;
             }
-            int port = ElbV2HealthChecker.effectivePort(t, tg);
+            int port = ElbV2HealthChecker.effectivePort(visibleTarget, tg);
             th.setHealthCheckPort(String.valueOf(port));
-            if (hasFilterTargets && !isRegisteredTarget(tg, t, port)) {
+            if (hasFilterTargets && !isRegisteredTarget(tg, visibleTarget, port)) {
                 th.setState("unused");
                 th.setReason("Target.NotRegistered");
                 th.setDescription("Target is not registered to the target group");
                 return th;
             }
-            ElbV2HealthChecker.TargetHealthStatus health = healthChecker.getHealth(tgArn, t.getId(), port);
+            ElbV2HealthChecker.TargetHealthStatus health = healthChecker.getHealth(tgArn, visibleTarget.getId(), port);
             th.setState(health.state());
             th.setReason(health.reason());
             th.setDescription(health.description());
             return th;
         }).collect(Collectors.toList());
+    }
+
+    private static TargetDescription normalizeRegisteredTarget(TargetGroup targetGroup, TargetDescription target) {
+        if ("lambda".equals(targetGroup.getTargetType()) || target.getPort() != null) {
+            return target;
+        }
+        TargetDescription normalized = new TargetDescription();
+        normalized.setId(target.getId());
+        normalized.setPort(ElbV2HealthChecker.effectivePort(target, targetGroup));
+        normalized.setAvailabilityZone(target.getAvailabilityZone());
+        return normalized;
     }
 
     private static boolean isRegisteredTarget(TargetGroup targetGroup, TargetDescription candidate, int candidatePort) {

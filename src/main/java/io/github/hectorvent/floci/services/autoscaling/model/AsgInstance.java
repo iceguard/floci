@@ -15,6 +15,7 @@ public class AsgInstance {
     private String launchTemplateId;
     private String launchTemplateName;
     private String launchTemplateVersion;
+    private String launchClientToken;
     private String instanceType;
     private boolean protectedFromScaleIn;
 
@@ -43,6 +44,9 @@ public class AsgInstance {
 
     public String getLaunchTemplateVersion() { return launchTemplateVersion; }
     public void setLaunchTemplateVersion(String v) { this.launchTemplateVersion = v; }
+
+    public String getLaunchClientToken() { return launchClientToken; }
+    public void setLaunchClientToken(String v) { this.launchClientToken = v; }
 
     public String getInstanceType() { return instanceType; }
     public void setInstanceType(String v) { this.instanceType = v; }

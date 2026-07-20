@@ -292,12 +292,12 @@ class ElbV2Test {
 
     @Test
     @Order(14)
-    @DisplayName("RegisterTargets - registers two instance IDs")
+    @DisplayName("RegisterTargets - defaults omitted port and preserves explicit port")
     void registerTargets() {
         elb.registerTargets(RegisterTargetsRequest.builder()
                 .targetGroupArn(tgArn)
                 .targets(
-                        TargetDescription.builder().id("i-00000000001").port(8080).build(),
+                        TargetDescription.builder().id("i-00000000001").build(),
                         TargetDescription.builder().id("i-00000000002").port(8080).build()
                 )
                 .build());
@@ -311,6 +311,11 @@ class ElbV2Test {
                 DescribeTargetHealthRequest.builder().targetGroupArn(tgArn).build());
 
         assertThat(resp.targetHealthDescriptions()).hasSize(2);
+        assertThat(resp.targetHealthDescriptions())
+                .extracting(thd -> thd.target().id(), thd -> thd.target().port())
+                .containsExactly(
+                        tuple("i-00000000001", 80),
+                        tuple("i-00000000002", 8080));
         for (TargetHealthDescription thd : resp.targetHealthDescriptions()) {
             assertThat(thd.targetHealth().state()).isEqualTo(TargetHealthStateEnum.INITIAL);
             assertThat(thd.targetHealth().reason()).isEqualTo(TargetHealthReasonEnum.ELB_REGISTRATION_IN_PROGRESS);
@@ -320,13 +325,13 @@ class ElbV2Test {
 
     @Test
     @Order(16)
-    @DisplayName("DescribeTargetHealth - reports unused for explicit unregistered target")
+    @DisplayName("DescribeTargetHealth - treats the same ID at a different port as unregistered")
     void describeTargetHealthForUnregisteredTarget() {
         DescribeTargetHealthResponse resp = elb.describeTargetHealth(
                 DescribeTargetHealthRequest.builder()
                         .targetGroupArn(tgArn)
                         .targets(TargetDescription.builder()
-                                .id("i-1234567890abcdef0")
+                                .id("i-00000000001")
                                 .port(8080)
                                 .build())
                         .build());

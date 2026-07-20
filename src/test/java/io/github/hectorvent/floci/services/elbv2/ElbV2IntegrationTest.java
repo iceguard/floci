@@ -649,9 +649,8 @@ class ElbV2IntegrationTest {
                 .formParam("Action", "RegisterTargets")
                 .formParam("TargetGroupArn", tgArn)
                 .formParam("Targets.member.1.Id", "10.0.0.1")
-                .formParam("Targets.member.1.Port", "80")
                 .formParam("Targets.member.2.Id", "10.0.0.2")
-                .formParam("Targets.member.2.Port", "80")
+                .formParam("Targets.member.2.Port", "8080")
                 .header("Authorization", AUTH)
             .when()
                 .post("/")
@@ -670,6 +669,10 @@ class ElbV2IntegrationTest {
                 .post("/")
             .then()
                 .statusCode(200)
+                .body("DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member.Target.Id",
+                        hasItems("10.0.0.1", "10.0.0.2"))
+                .body("DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member.Target.Port",
+                        hasItems("80", "8080"))
                 .body("DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member[0].TargetHealth.State",
                         equalTo("initial"))
                 .body("DescribeTargetHealthResponse.DescribeTargetHealthResult.TargetHealthDescriptions.member[0].TargetHealth.Reason",
@@ -678,12 +681,12 @@ class ElbV2IntegrationTest {
 
     @Test
     @Order(28)
-    void describeTargetHealthReturnsUnusedForExplicitUnregisteredTarget() {
+    void describeTargetHealthTreatsSameIdWithDifferentPortAsUnregistered() {
         given()
                 .formParam("Action", "DescribeTargetHealth")
                 .formParam("TargetGroupArn", tgArn)
-                .formParam("Targets.member.1.Id", "i-1234567890abcdef0")
-                .formParam("Targets.member.1.Port", "80")
+                .formParam("Targets.member.1.Id", "10.0.0.1")
+                .formParam("Targets.member.1.Port", "8080")
                 .header("Authorization", AUTH)
             .when()
                 .post("/")

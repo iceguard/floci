@@ -25,6 +25,17 @@ public class InstanceRefresh {
     private String desiredLaunchTemplateId;
     private String desiredLaunchTemplateName;
     private String desiredLaunchTemplateVersion;
+    private MixedInstancesPolicy desiredMixedInstancesPolicy;
+
+    private String sourceLaunchConfigurationName;
+    private String sourceLaunchTemplateId;
+    private String sourceLaunchTemplateName;
+    private String sourceLaunchTemplateVersion;
+    private MixedInstancesPolicy sourceMixedInstancesPolicy;
+    private List<String> candidateInstanceIds = new ArrayList<>();
+    private List<InstanceRefreshReplacement> replacements = new ArrayList<>();
+    private String phase;
+    private String failureReason;
 
     private Integer minHealthyPercentage;
     private Integer maxHealthyPercentage;
@@ -78,6 +89,40 @@ public class InstanceRefresh {
     public String getDesiredLaunchTemplateVersion() { return desiredLaunchTemplateVersion; }
     public void setDesiredLaunchTemplateVersion(String v) { this.desiredLaunchTemplateVersion = v; }
 
+    public MixedInstancesPolicy getDesiredMixedInstancesPolicy() { return desiredMixedInstancesPolicy; }
+    public void setDesiredMixedInstancesPolicy(MixedInstancesPolicy v) { this.desiredMixedInstancesPolicy = v; }
+
+    public String getSourceLaunchConfigurationName() { return sourceLaunchConfigurationName; }
+    public void setSourceLaunchConfigurationName(String v) { this.sourceLaunchConfigurationName = v; }
+
+    public String getSourceLaunchTemplateId() { return sourceLaunchTemplateId; }
+    public void setSourceLaunchTemplateId(String v) { this.sourceLaunchTemplateId = v; }
+
+    public String getSourceLaunchTemplateName() { return sourceLaunchTemplateName; }
+    public void setSourceLaunchTemplateName(String v) { this.sourceLaunchTemplateName = v; }
+
+    public String getSourceLaunchTemplateVersion() { return sourceLaunchTemplateVersion; }
+    public void setSourceLaunchTemplateVersion(String v) { this.sourceLaunchTemplateVersion = v; }
+
+    public MixedInstancesPolicy getSourceMixedInstancesPolicy() { return sourceMixedInstancesPolicy; }
+    public void setSourceMixedInstancesPolicy(MixedInstancesPolicy v) { this.sourceMixedInstancesPolicy = v; }
+
+    public List<String> getCandidateInstanceIds() { return candidateInstanceIds; }
+    public void setCandidateInstanceIds(List<String> v) {
+        this.candidateInstanceIds = v != null ? new ArrayList<>(v) : new ArrayList<>();
+    }
+
+    public List<InstanceRefreshReplacement> getReplacements() { return replacements; }
+    public void setReplacements(List<InstanceRefreshReplacement> v) {
+        this.replacements = v != null ? new ArrayList<>(v) : new ArrayList<>();
+    }
+
+    public String getPhase() { return phase; }
+    public void setPhase(String v) { this.phase = v; }
+
+    public String getFailureReason() { return failureReason; }
+    public void setFailureReason(String v) { this.failureReason = v; }
+
     public Integer getMinHealthyPercentage() { return minHealthyPercentage; }
     public void setMinHealthyPercentage(Integer v) { this.minHealthyPercentage = v; }
 
@@ -113,7 +158,8 @@ public class InstanceRefresh {
     public boolean hasDesiredConfiguration() {
         return desiredLaunchTemplateId != null
                 || desiredLaunchTemplateName != null
-                || desiredLaunchTemplateVersion != null;
+                || desiredLaunchTemplateVersion != null
+                || desiredMixedInstancesPolicy != null;
     }
 
     public boolean hasPreferences() {

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.autoscaling;
 
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
+import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
@@ -134,6 +135,88 @@ class AutoScalingQueryHandlerTest {
         String xml = (String) response.getEntity();
         assertTrue(xml.contains("<Code>ValidationError</Code>"));
         assertTrue(xml.contains(AutoScalingService.ACTIVE_INSTANCE_REFRESH_DESIRED_CONFIGURATION_MESSAGE));
+    }
+
+    @Test
+    void startAndDescribeInstanceRefreshPreserveDesiredMixedOverrides() {
+        AutoScalingService service = new AutoScalingService();
+        service.regionResolver = new RegionResolver(REGION, "000000000000");
+        service.createAutoScalingGroup(REGION, "mixed-refresh-asg", null, null, null, null,
+                mixedInstancesPolicy("lt-mixed", "1", "t4g.small"), 0, 3, 0, 300,
+                List.of("us-east-1a"), List.of(), List.of(), List.of(), "EC2", 0,
+                List.of("Default"), java.util.Map.of(), java.util.Map.of());
+
+        AutoScalingQueryHandler handler = new AutoScalingQueryHandler(service);
+        MultivaluedHashMap<String, String> start = new MultivaluedHashMap<>();
+        start.add("AutoScalingGroupName", "mixed-refresh-asg");
+        start.add("DesiredConfiguration.MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateId",
+                "lt-mixed");
+        start.add("DesiredConfiguration.MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.Version", "2");
+        start.add("DesiredConfiguration.MixedInstancesPolicy.LaunchTemplate.Overrides.member.1.InstanceType",
+                "t4g.medium");
+
+        assertEquals(200, handler.handle("StartInstanceRefresh", start, REGION).getStatus());
+        MultivaluedHashMap<String, String> describe = new MultivaluedHashMap<>();
+        describe.add("AutoScalingGroupName", "mixed-refresh-asg");
+        String xml = (String) handler.handle("DescribeInstanceRefreshes", describe, REGION).getEntity();
+
+        assertTrue(xml.contains("<MixedInstancesPolicy>"));
+        assertTrue(xml.contains("<LaunchTemplateId>lt-mixed</LaunchTemplateId>"));
+        assertTrue(xml.contains("<Version>2</Version>"));
+        assertTrue(xml.contains("<InstanceType>t4g.medium</InstanceType>"));
+    }
+
+    @Test
+    void startInstanceRefreshRejectsMalformedPreferenceInteger() {
+        AutoScalingService service = new AutoScalingService();
+        service.regionResolver = new RegionResolver(REGION, "000000000000");
+        service.createAutoScalingGroup(REGION, "query-asg", null, "lt-original", null, "1", null,
+                0, 3, 0, 300, List.of("us-east-1a"), List.of(), List.of(), List.of(), "EC2", 0,
+                List.of("Default"), java.util.Map.of(), java.util.Map.of());
+        AutoScalingQueryHandler handler = new AutoScalingQueryHandler(service);
+        MultivaluedHashMap<String, String> params = new MultivaluedHashMap<>();
+        params.add("AutoScalingGroupName", "query-asg");
+        params.add("Preferences.MinHealthyPercentage", "ninety");
+
+        Response response = handler.handle("StartInstanceRefresh", params, REGION);
+
+        assertEquals(400, response.getStatus());
+        assertTrue(((String) response.getEntity()).contains("<Code>ValidationError</Code>"));
+    }
+
+    @Test
+    void startInstanceRefreshRejectsMalformedCheckpointPercentage() {
+        AutoScalingService service = new AutoScalingService();
+        service.regionResolver = new RegionResolver(REGION, "000000000000");
+        service.createAutoScalingGroup(REGION, "query-asg", null, "lt-original", null, "1", null,
+                0, 3, 0, 300, List.of("us-east-1a"), List.of(), List.of(), List.of(), "EC2", 0,
+                List.of("Default"), java.util.Map.of(), java.util.Map.of());
+        AutoScalingQueryHandler handler = new AutoScalingQueryHandler(service);
+        MultivaluedHashMap<String, String> params = new MultivaluedHashMap<>();
+        params.add("AutoScalingGroupName", "query-asg");
+        params.add("Preferences.CheckpointPercentages.member.1", "half");
+
+        Response response = handler.handle("StartInstanceRefresh", params, REGION);
+
+        assertEquals(400, response.getStatus());
+        assertTrue(((String) response.getEntity()).contains("<Code>ValidationError</Code>"));
+    }
+
+    private static MixedInstancesPolicy mixedInstancesPolicy(String launchTemplateId, String version,
+                                                              String instanceType) {
+        MixedInstancesPolicy policy = new MixedInstancesPolicy();
+        MixedInstancesPolicy.LaunchTemplate launchTemplate = new MixedInstancesPolicy.LaunchTemplate();
+        MixedInstancesPolicy.LaunchTemplateSpecification specification =
+                new MixedInstancesPolicy.LaunchTemplateSpecification();
+        specification.setLaunchTemplateId(launchTemplateId);
+        specification.setVersion(version);
+        launchTemplate.setLaunchTemplateSpecification(specification);
+        MixedInstancesPolicy.LaunchTemplateOverride override =
+                new MixedInstancesPolicy.LaunchTemplateOverride();
+        override.setInstanceType(instanceType);
+        launchTemplate.setOverrides(List.of(override));
+        policy.setLaunchTemplate(launchTemplate);
+        return policy;
     }
 
     @Test
