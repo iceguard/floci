@@ -19,6 +19,7 @@ import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
@@ -825,7 +826,7 @@ public class IamQueryHandler {
         if (resourceArns.isEmpty()) {
             resourceArns = List.of("*");
         }
-        Map<String, String> context = extractContextEntries(params);
+        Map<String, List<String>> context = extractContextEntries(params);
 
         XmlBuilder results = new XmlBuilder().start("EvaluationResults");
         for (String actionName : actionNames) {
@@ -1000,14 +1001,22 @@ public class IamQueryHandler {
         return values;
     }
 
-    private Map<String, String> extractContextEntries(MultivaluedMap<String, String> params) {
-        Map<String, String> context = new HashMap<>();
+    private Map<String, List<String>> extractContextEntries(MultivaluedMap<String, String> params) {
+        Map<String, List<String>> context = new LinkedHashMap<>();
         for (int i = 1; ; i++) {
-            String name = params.getFirst("ContextEntries.member." + i + ".ContextKeyName");
+            String entryPrefix = "ContextEntries.member." + i;
+            String name = params.getFirst(entryPrefix + ".ContextKeyName");
             if (name == null) break;
-            String value = params.getFirst("ContextEntries.member." + i + ".ContextKeyValues.member.1");
-            if (value != null) {
-                context.put(name, value);
+
+            List<String> values = new ArrayList<>();
+            for (int valueIndex = 1; ; valueIndex++) {
+                String value = params.getFirst(
+                        entryPrefix + ".ContextKeyValues.member." + valueIndex);
+                if (value == null) break;
+                values.add(value);
+            }
+            if (!values.isEmpty()) {
+                context.computeIfAbsent(name, ignored -> new ArrayList<>()).addAll(values);
             }
         }
         return context;
