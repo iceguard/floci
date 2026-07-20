@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.common;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MultivaluedHashMap;
@@ -24,7 +25,8 @@ class IamConditionContextResolverTest {
                     new AwsJsonRequestResolver(new ObjectMapper()),
                     mock(KmsService.class),
                     null,
-                    null);
+                    null,
+                    mock(ElbV2Service.class));
 
     @Test
     void resolvesS3ListBucketQueryConditionContext() {
