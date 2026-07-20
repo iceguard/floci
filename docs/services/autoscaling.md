@@ -39,6 +39,22 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 | `DetachInstances` | Detaches instances from a group; optionally decrements desired capacity |
 | `TerminateInstanceInAutoScalingGroup` | Terminates a specific instance; optionally decrements desired capacity |
 
+### Instance Refresh
+
+| Operation | Notes |
+|---|---|
+| `StartInstanceRefresh` | Starts an atomic rolling refresh. Floci snapshots the original and desired launch sources, immutable candidates, replacement pairs, and progress before the reconciler changes capacity. `MinHealthyPercentage`, `MaxHealthyPercentage`, `InstanceWarmup`, `SkipMatching`, launch templates, and mixed-instance overrides are supported. Rollback, checkpoint, bake, protected-instance, standby-instance, and replace-root-volume options are rejected until their complete lifecycles can be provided. |
+| `DescribeInstanceRefreshes` | Returns persisted refresh status, progress, desired configuration, preferences, timestamps, and pagination. |
+
+The reconciler advances one replacement pair at a time. It respects the
+minimum healthy floor and maximum healthy ceiling; a `100/100` refresh launches
+the replacement before terminating the original. A replacement must be an EC2
+`running` instance, `InService` in the group, exactly `healthy` in every attached
+ELBv2 target group, and past the configured warmup before the original is
+terminated. Launch and termination failures stop the refresh and preserve the
+remaining original instances. The desired launch source becomes the group's
+permanent configuration only after the refresh succeeds.
+
 ### Load Balancer Attachment
 
 | Operation | Notes |

@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.autoscaling;
 
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
+import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefresh;
+import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefreshReplacement;
 import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration;
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -9,8 +11,10 @@ import io.github.hectorvent.floci.services.ec2.Ec2UserData;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
+import io.github.hectorvent.floci.services.elbv2.ElbV2HealthChecker;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.model.TargetDescription;
+import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.github.hectorvent.floci.services.elbv2.model.TargetHealth;
 import io.github.hectorvent.floci.services.ssm.SsmCommandService;
 import jakarta.annotation.PostConstruct;
@@ -23,7 +27,11 @@ import io.quarkus.runtime.StartupEvent;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -38,16 +46,24 @@ public class AutoScalingReconciler {
     private final Ec2Service ec2Service;
     private final ElbV2Service elbV2Service;
     private final SsmCommandService ssmCommandService;
+    private final Clock clock;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
             r -> new Thread(r, "asg-reconciler"));
 
     @Inject
     AutoScalingReconciler(AutoScalingService asgService, Ec2Service ec2Service,
                           ElbV2Service elbV2Service, SsmCommandService ssmCommandService) {
+        this(asgService, ec2Service, elbV2Service, ssmCommandService, Clock.systemUTC());
+    }
+
+    AutoScalingReconciler(AutoScalingService asgService, Ec2Service ec2Service,
+                          ElbV2Service elbV2Service, SsmCommandService ssmCommandService,
+                          Clock clock) {
         this.asgService = asgService;
         this.ec2Service = ec2Service;
         this.elbV2Service = elbV2Service;
         this.ssmCommandService = ssmCommandService;
+        this.clock = clock;
     }
 
     AutoScalingReconciler(AutoScalingService asgService, Ec2Service ec2Service,
@@ -76,9 +92,20 @@ public class AutoScalingReconciler {
 
     public void reconcile(AutoScalingGroup asg) {
         removeTerminatingInstances(asg);
-        removeStaleInstances(asg);
-        removeOrphanedTargetRegistrations(asg);
+        List<String> staleInstanceIds = removeStaleInstances(asg);
+        if (!staleInstanceIds.isEmpty()) {
+            deregisterFromTargetGroups(asg, staleInstanceIds);
+        }
         promoteReadyInstances(asg);
+        reconcileActiveTargetRegistrations(asg);
+
+        Optional<InstanceRefresh> activeRefresh = asgService.activeInstanceRefresh(
+                asg.getRegion(), asg.getAutoScalingGroupName());
+        if (activeRefresh.isPresent()) {
+            reconcileInstanceRefresh(asg, activeRefresh.get());
+            asgService.saveAutoScalingGroup(asg);
+            return;
+        }
 
         long activeCapacity = activeCapacity(asg);
         int desired = asg.getDesiredCapacity();
@@ -89,7 +116,261 @@ public class AutoScalingReconciler {
             scaleIn(asg, (int) (activeCapacity - desired));
         }
         asgService.saveAutoScalingGroup(asg);
-        asgService.completeInstanceRefreshIfSettled(asg.getRegion(), asg.getAutoScalingGroupName());
+    }
+
+    private void reconcileInstanceRefresh(AutoScalingGroup asg, InstanceRefresh refresh) {
+        Instant now = clock.instant();
+        InstanceRefreshReplacement pair = refresh.getReplacements().stream()
+                .filter(replacement -> !"Completed".equals(replacement.getPhase()))
+                .filter(replacement -> !"Failed".equals(replacement.getPhase()))
+                .findFirst()
+                .orElse(null);
+        if (pair == null) {
+            asgService.completeInstanceRefresh(asg, refresh, now);
+            return;
+        }
+
+        AsgInstance original = findAsgInstance(asg, pair.getOriginalInstanceId()).orElse(null);
+        if (pair.getReplacementInstanceId() == null) {
+            if (original == null) {
+                failRefresh(asg, refresh, pair,
+                        "Original instance " + pair.getOriginalInstanceId() + " is no longer available.", now);
+                return;
+            }
+            if (!prepareCapacityForReplacement(asg, refresh, original)) {
+                return;
+            }
+            try {
+                AsgInstance replacement = recoverRefreshReplacement(asg, refresh, pair).orElse(null);
+                if (replacement == null) {
+                    pair.setLaunchClientToken(refresh.getInstanceRefreshId() + ":" + pair.getOriginalInstanceId());
+                    pair.setPhase("Launching");
+                    asgService.saveInstanceRefresh(refresh);
+                    replacement = launchRefreshReplacement(asg, refresh, pair.getLaunchClientToken());
+                }
+                pair.setReplacementInstanceId(replacement.getInstanceId());
+                pair.setPhase("Pending");
+                refresh.setPhase("Replacing");
+                updateRefreshProgress(refresh);
+                asgService.saveInstanceRefresh(refresh);
+            } catch (Exception e) {
+                restoreOriginal(original);
+                failRefresh(asg, refresh, pair, "Replacement launch failed: " + message(e), now);
+            }
+            return;
+        }
+
+        AsgInstance replacement = findAsgInstance(asg, pair.getReplacementInstanceId()).orElse(null);
+        if (replacement == null) {
+            restoreOriginal(original);
+            failRefresh(asg, refresh, pair,
+                    "Replacement instance " + pair.getReplacementInstanceId() + " failed before becoming ready.", now);
+            return;
+        }
+        if (!"InService".equals(replacement.getLifecycleState())
+                || !"Healthy".equals(replacement.getHealthStatus())) {
+            pair.setReadyTime(null);
+            pair.setPhase("Pending");
+            asgService.saveInstanceRefresh(refresh);
+            return;
+        }
+        TargetReadiness targetReadiness = targetReadiness(asg, replacement.getInstanceId());
+        if (targetReadiness.failureReason() != null) {
+            restoreOriginal(original);
+            failRefresh(asg, refresh, pair, targetReadiness.failureReason(), now);
+            return;
+        }
+        if (!targetReadiness.ready()) {
+            pair.setReadyTime(null);
+            pair.setPhase("Pending");
+            asgService.saveInstanceRefresh(refresh);
+            return;
+        }
+        if (pair.getReadyTime() == null) {
+            pair.setReadyTime(now);
+            pair.setPhase("Warming");
+            asgService.saveInstanceRefresh(refresh);
+            return;
+        }
+        int warmupSeconds = refresh.getInstanceWarmup() != null ? refresh.getInstanceWarmup() : 0;
+        if (Duration.between(pair.getReadyTime(), now).getSeconds() < warmupSeconds) {
+            return;
+        }
+
+        if (original != null) {
+            try {
+                deregisterRefreshOriginal(asg, original.getInstanceId());
+                ec2Service.terminateInstances(asg.getRegion(), List.of(original.getInstanceId()));
+                asg.getInstances().remove(original);
+            } catch (Exception e) {
+                restoreOriginal(original);
+                if (original != null) {
+                    registerWithTargetGroups(asg, original);
+                }
+                failRefresh(asg, refresh, pair, "Original termination failed: " + message(e), now);
+                return;
+            }
+        }
+        pair.setPhase("Completed");
+        updateRefreshProgress(refresh);
+        asgService.saveAutoScalingGroup(asg);
+        asgService.saveInstanceRefresh(refresh);
+        if (refresh.getInstancesToUpdate() == 0) {
+            asgService.completeInstanceRefresh(asg, refresh, now);
+        }
+    }
+
+    private boolean prepareCapacityForReplacement(AutoScalingGroup asg, InstanceRefresh refresh,
+                                                  AsgInstance original) {
+        int desired = asg.getDesiredCapacity();
+        int active = (int) activeCapacity(asg);
+        int healthy = (int) asg.getInstances().stream()
+                .filter(instance -> "InService".equals(instance.getLifecycleState()))
+                .filter(instance -> "Healthy".equals(instance.getHealthStatus()))
+                .count();
+        int minimumHealthy = (int) Math.ceil(desired * refresh.getMinHealthyPercentage() / 100.0);
+        int maximumHealthy = (int) Math.ceil(desired * refresh.getMaxHealthyPercentage() / 100.0);
+        boolean launchBeforeTerminate = minimumHealthy >= desired && maximumHealthy <= desired;
+        int effectiveCeiling = launchBeforeTerminate ? Math.max(maximumHealthy, desired + 1) : maximumHealthy;
+        if (active < effectiveCeiling) {
+            return true;
+        }
+        if (healthy - 1 < minimumHealthy) {
+            return false;
+        }
+        original.setLifecycleState("Standby");
+        asgService.saveAutoScalingGroup(asg);
+        return true;
+    }
+
+    private AsgInstance launchRefreshReplacement(AutoScalingGroup asg, InstanceRefresh refresh,
+                                                 String clientToken) {
+        AutoScalingGroup desiredSource = AutoScalingService.desiredLaunchSource(asg, refresh);
+        LaunchSource launchSource = resolveLaunchSource(desiredSource);
+        if (launchSource == null) {
+            throw new IllegalStateException("No valid launch source is available");
+        }
+        String az = asg.getAvailabilityZones().isEmpty()
+                ? asg.getRegion() + "a" : asg.getAvailabilityZones().getFirst();
+        String subnetId = asg.getSubnetIds().isEmpty() ? null : asg.getSubnetIds().getFirst();
+        Reservation reservation = ec2Service.runInstancesWithUserData(
+                asg.getRegion(), launchSource.imageId(), launchSource.instanceType(), 1, 1,
+                launchSource.keyName(), launchSource.securityGroupIds(), subnetId, clientToken,
+                propagatedInstanceTags(asg, launchSource), launchSource.userData(),
+                launchSource.iamInstanceProfile());
+        if (reservation.getInstances() == null || reservation.getInstances().size() != 1) {
+            throw new IllegalStateException("Replacement launch did not return exactly one instance");
+        }
+        return attachRefreshReplacement(
+                asg, launchSource, reservation.getInstances().getFirst(), az, clientToken);
+    }
+
+    private Optional<AsgInstance> recoverRefreshReplacement(AutoScalingGroup asg, InstanceRefresh refresh,
+                                                            InstanceRefreshReplacement pair) {
+        if (!"Launching".equals(pair.getPhase()) || pair.getLaunchClientToken() == null) {
+            return Optional.empty();
+        }
+        Optional<AsgInstance> existingMember = asg.getInstances().stream()
+                .filter(instance -> pair.getLaunchClientToken().equals(instance.getLaunchClientToken()))
+                .findFirst();
+        if (existingMember.isPresent()) {
+            return existingMember;
+        }
+        AutoScalingGroup desiredSource = AutoScalingService.desiredLaunchSource(asg, refresh);
+        LaunchSource launchSource = resolveLaunchSource(desiredSource);
+        if (launchSource == null) {
+            throw new IllegalStateException("No valid launch source is available");
+        }
+        return ec2Service.describeInstances(asg.getRegion(), List.of(), Map.of()).stream()
+                .flatMap(reservation -> reservation.getInstances().stream())
+                .filter(instance -> pair.getLaunchClientToken().equals(instance.getClientToken()))
+                .findFirst()
+                .map(instance -> attachRefreshReplacement(asg, launchSource, instance,
+                        instance.getPlacement() != null ? instance.getPlacement().getAvailabilityZone() : null,
+                        pair.getLaunchClientToken()));
+    }
+
+    private AsgInstance attachRefreshReplacement(AutoScalingGroup asg, LaunchSource launchSource,
+                                                 Instance ec2Instance, String availabilityZone,
+                                                 String clientToken) {
+        AsgInstance replacement = new AsgInstance();
+        replacement.setInstanceId(ec2Instance.getInstanceId());
+        replacement.setAvailabilityZone(availabilityZone != null ? availabilityZone
+                : asg.getAvailabilityZones().isEmpty() ? asg.getRegion() + "a" : asg.getAvailabilityZones().getFirst());
+        replacement.setLifecycleState("Pending");
+        replacement.setHealthStatus("Healthy");
+        replacement.setLaunchClientToken(clientToken);
+        replacement.setLaunchConfigurationName(launchSource.launchConfigurationName());
+        replacement.setLaunchTemplateId(launchSource.launchTemplateId());
+        replacement.setLaunchTemplateName(launchSource.launchTemplateName());
+        replacement.setLaunchTemplateVersion(launchSource.launchTemplateVersion());
+        replacement.setInstanceType(launchSource.instanceType());
+        asg.getInstances().add(replacement);
+        asgService.saveAutoScalingGroup(asg);
+        return replacement;
+    }
+
+    private TargetReadiness targetReadiness(AutoScalingGroup asg, String instanceId) {
+        for (String targetGroupArn : asg.getTargetGroupARNs()) {
+            List<TargetHealth> states;
+            try {
+                states = elbV2Service.describeTargetHealth(asg.getRegion(), targetGroupArn, List.of());
+            } catch (Exception e) {
+                return TargetReadiness.failure(
+                        "Target health lookup failed for " + targetGroupArn + ": " + message(e));
+            }
+            TargetHealth targetHealth = states.stream()
+                    .filter(state -> state.getTarget() != null)
+                    .filter(state -> instanceId.equals(state.getTarget().getId()))
+                    .findFirst()
+                    .orElse(null);
+            if (targetHealth == null || "unused".equals(targetHealth.getState())) {
+                return TargetReadiness.failure("Replacement instance " + instanceId
+                        + " is not registered with target group " + targetGroupArn + ".");
+            }
+            if ("initial".equals(targetHealth.getState())) {
+                return TargetReadiness.pending();
+            }
+            if (!"healthy".equals(targetHealth.getState())) {
+                return TargetReadiness.failure("Replacement instance " + instanceId + " is "
+                        + targetHealth.getState() + " in target group " + targetGroupArn + ".");
+            }
+        }
+        return TargetReadiness.satisfied();
+    }
+
+    private void failRefresh(AutoScalingGroup asg, InstanceRefresh refresh,
+                             InstanceRefreshReplacement pair, String reason, Instant now) {
+        pair.setPhase("Failed");
+        pair.setFailureReason(reason);
+        updateRefreshProgress(refresh);
+        asgService.saveAutoScalingGroup(asg);
+        asgService.failInstanceRefresh(refresh, reason, now);
+    }
+
+    private static Optional<AsgInstance> findAsgInstance(AutoScalingGroup asg, String instanceId) {
+        return asg.getInstances().stream()
+                .filter(instance -> instanceId.equals(instance.getInstanceId()))
+                .findFirst();
+    }
+
+    private static void restoreOriginal(AsgInstance original) {
+        if (original != null && "Standby".equals(original.getLifecycleState())) {
+            original.setLifecycleState("InService");
+        }
+    }
+
+    private static void updateRefreshProgress(InstanceRefresh refresh) {
+        long completed = refresh.getReplacements().stream()
+                .filter(replacement -> "Completed".equals(replacement.getPhase()))
+                .count();
+        int total = refresh.getReplacements().size();
+        refresh.setInstancesToUpdate(total - (int) completed);
+        refresh.setPercentageComplete(total == 0 ? 100 : (int) (completed * 100 / total));
+    }
+
+    private static String message(Exception exception) {
+        return exception.getMessage() != null ? exception.getMessage() : exception.getClass().getSimpleName();
     }
 
     static long activeCapacity(AutoScalingGroup asg) {
@@ -137,12 +418,12 @@ public class AutoScalingReconciler {
         }
     }
 
-    private void removeStaleInstances(AutoScalingGroup asg) {
+    private List<String> removeStaleInstances(AutoScalingGroup asg) {
         List<AsgInstance> staleInstances = asg.getInstances().stream()
                 .filter(instance -> isStaleInstance(asg, instance))
                 .collect(Collectors.toList());
         if (staleInstances.isEmpty()) {
-            return;
+            return List.of();
         }
 
         List<String> instanceIds = staleInstances.stream()
@@ -157,6 +438,7 @@ public class AutoScalingReconciler {
                 "Successful");
         LOG.infov("ASG {0}: removed stale instance reference(s) {1}",
                 asg.getAutoScalingGroupName(), instanceIds);
+        return instanceIds;
     }
 
     private void failActiveSsmInvocations(AutoScalingGroup asg, List<String> instanceIds) {
@@ -209,36 +491,53 @@ public class AutoScalingReconciler {
         }
     }
 
-    private void removeOrphanedTargetRegistrations(AutoScalingGroup asg) {
-        if (asg.getTargetGroupARNs().isEmpty()) {
+    private void reconcileActiveTargetRegistrations(AutoScalingGroup asg) {
+        List<String> inServiceInstanceIds = asg.getInstances().stream()
+                .filter(instance -> "InService".equals(instance.getLifecycleState()))
+                .map(AsgInstance::getInstanceId)
+                .filter(id -> id != null)
+                .distinct()
+                .toList();
+        if (inServiceInstanceIds.isEmpty() || asg.getTargetGroupARNs().isEmpty()) {
             return;
         }
 
-        Set<String> activeInstanceIds = asg.getInstances().stream()
-                .filter(instance -> isActiveLifecycleState(instance.getLifecycleState()))
-                .map(AsgInstance::getInstanceId)
-                .collect(Collectors.toSet());
-
         for (String tgArn : asg.getTargetGroupARNs()) {
             try {
-                List<TargetDescription> orphanedTargets = elbV2Service.describeTargetHealth(
+                TargetGroup targetGroup = elbV2Service.describeTargetGroups(
+                        asg.getRegion(), null, List.of(tgArn), List.of()).getFirst();
+                int effectivePort = ElbV2HealthChecker.effectivePort(new TargetDescription(), targetGroup);
+                Set<String> registeredInstanceIds = elbV2Service.describeTargetHealth(
                                 asg.getRegion(), tgArn, List.of()).stream()
                         .map(TargetHealth::getTarget)
                         .filter(target -> target != null && target.getId() != null)
-                        .filter(target -> !activeInstanceIds.contains(target.getId()))
-                        .collect(Collectors.toList());
-                if (!orphanedTargets.isEmpty()) {
-                    elbV2Service.deregisterTargets(asg.getRegion(), tgArn, orphanedTargets);
-                    LOG.infov("ASG {0}: deregistered orphaned target(s) {1} from TG {2}",
+                        .filter(target -> ElbV2HealthChecker.effectivePort(target, targetGroup) == effectivePort)
+                        .map(TargetDescription::getId)
+                        .collect(Collectors.toSet());
+                List<TargetDescription> missingTargets = inServiceInstanceIds.stream()
+                        .filter(instanceId -> !registeredInstanceIds.contains(instanceId))
+                        .map(instanceId -> target(instanceId, effectivePort))
+                        .toList();
+                if (!missingTargets.isEmpty()) {
+                    elbV2Service.registerTargets(asg.getRegion(), tgArn, missingTargets);
+                    LOG.infov("ASG {0}: registered missing target(s) {1} with TG {2} on port {3}",
                             asg.getAutoScalingGroupName(),
-                            orphanedTargets.stream().map(TargetDescription::getId).collect(Collectors.toList()),
-                            tgArn);
+                            missingTargets.stream().map(TargetDescription::getId).toList(),
+                            tgArn,
+                            effectivePort);
                 }
             } catch (Exception e) {
-                LOG.debugv("ASG {0}: could not reconcile TG {1}: {2}",
+                LOG.warnv("ASG {0}: could not heal target registrations for TG {1}: {2}",
                         asg.getAutoScalingGroupName(), tgArn, e.getMessage());
             }
         }
+    }
+
+    private static TargetDescription target(String instanceId, int port) {
+        TargetDescription target = new TargetDescription();
+        target.setId(instanceId);
+        target.setPort(port);
+        return target;
     }
 
     private void removeTerminatingInstances(AutoScalingGroup asg) {
@@ -258,6 +557,7 @@ public class AutoScalingReconciler {
         } catch (Exception e) {
             LOG.warnv("ASG {0}: failed to terminate refreshing instances {1}: {2}",
                     asg.getAutoScalingGroupName(), instanceIds, e.getMessage());
+            return;
         }
 
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
@@ -268,10 +568,6 @@ public class AutoScalingReconciler {
                 "Successful");
         LOG.infov("ASG {0}: terminated instance(s) for refresh {1}",
                 asg.getAutoScalingGroupName(), instanceIds);
-    }
-
-    private static boolean isActiveLifecycleState(String state) {
-        return "Pending".equals(state) || "InService".equals(state);
     }
 
     private void scaleOut(AutoScalingGroup asg, int count) {
@@ -361,6 +657,7 @@ public class AutoScalingReconciler {
         } catch (Exception e) {
             LOG.warnv("ASG {0}: failed to terminate instances {1}: {2}",
                     asg.getAutoScalingGroupName(), instanceIds, e.getMessage());
+            return;
         }
 
         asg.getInstances().removeIf(i -> instanceIds.contains(i.getInstanceId()));
@@ -382,6 +679,14 @@ public class AutoScalingReconciler {
                 LOG.debugv("ASG {0}: could not deregister from TG {1}: {2}",
                         asg.getAutoScalingGroupName(), tgArn, e.getMessage());
             }
+        }
+    }
+
+    private void deregisterRefreshOriginal(AutoScalingGroup asg, String instanceId) {
+        TargetDescription target = new TargetDescription();
+        target.setId(instanceId);
+        for (String targetGroupArn : asg.getTargetGroupARNs()) {
+            elbV2Service.deregisterTargets(asg.getRegion(), targetGroupArn, List.of(target));
         }
     }
 
@@ -560,6 +865,12 @@ public class AutoScalingReconciler {
             String launchTemplateId,
             String launchTemplateName,
             String launchTemplateVersion) {}
+
+    private record TargetReadiness(boolean ready, String failureReason) {
+        private static TargetReadiness satisfied() { return new TargetReadiness(true, null); }
+        private static TargetReadiness pending() { return new TargetReadiness(false, null); }
+        private static TargetReadiness failure(String reason) { return new TargetReadiness(false, reason); }
+    }
 
     // Override for describeAutoScalingGroups with null region (all regions)
     // The service only filters by region when non-null; null means all.

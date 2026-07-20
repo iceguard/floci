@@ -151,7 +151,6 @@ class ElbV2ServiceTest {
                 "ipv4", Map.of("tier", "web")).getTargetGroupArn();
         TargetDescription target = new TargetDescription();
         target.setId("i-1234567890abcdef0");
-        target.setPort(8080);
         first.registerTargets(REGION, tgArn, List.of(target));
         String listenerArn = first.createListener(
                 REGION, lbArn, "HTTP", 9080, null, List.of(),
@@ -171,6 +170,7 @@ class ElbV2ServiceTest {
         assertEquals(tgArn, reloadedTargetGroup.getTargetGroupArn());
         assertEquals(List.of(lbArn), reloadedTargetGroup.getLoadBalancerArns());
         assertEquals("i-1234567890abcdef0", reloadedTargetGroup.getTargets().getFirst().getId());
+        assertEquals(8080, reloadedTargetGroup.getTargets().getFirst().getPort());
         Listener reloadedListener = reloaded.describeListeners(REGION, lbArn, null).getFirst();
         assertEquals(listenerArn, reloadedListener.getListenerArn());
         List<Rule> reloadedRules = reloaded.describeRules(REGION, listenerArn, null);
@@ -212,17 +212,60 @@ class ElbV2ServiceTest {
     }
 
     @Test
-    void describeTargetHealthReturnsUnusedForExplicitUnregisteredTarget() {
+    void describeTargetHealthTreatsSameIdWithDifferentPortAsUnregistered() {
         String tgArn = createTargetGroup("sample-tg");
-        TargetDescription target = new TargetDescription();
-        target.setId("i-1234567890abcdef0");
-        target.setPort(9999);
+        TargetDescription registeredTarget = new TargetDescription();
+        registeredTarget.setId("i-1234567890abcdef0");
+        service.registerTargets(REGION, tgArn, List.of(registeredTarget));
+        TargetDescription targetAtWrongPort = new TargetDescription();
+        targetAtWrongPort.setId("i-1234567890abcdef0");
+        targetAtWrongPort.setPort(10000);
 
-        var health = service.describeTargetHealth(REGION, tgArn, List.of(target)).getFirst();
+        var health = service.describeTargetHealth(REGION, tgArn, List.of(targetAtWrongPort)).getFirst();
 
         assertEquals("unused", health.getState());
         assertEquals("Target.NotRegistered", health.getReason());
         assertEquals("Target is not registered to the target group", health.getDescription());
+    }
+
+    @Test
+    void registerTargetsDefaultsMissingPortAndPreservesExplicitPort() {
+        String tgArn = createTargetGroup("sample-tg");
+        TargetDescription defaultPortTarget = new TargetDescription();
+        defaultPortTarget.setId("i-default-port");
+        TargetDescription explicitPortTarget = new TargetDescription();
+        explicitPortTarget.setId("i-explicit-port");
+        explicitPortTarget.setPort(10000);
+        when(healthChecker.getHealth(tgArn, "i-default-port", 9999))
+                .thenReturn(new ElbV2HealthChecker.TargetHealthStatus("healthy", null, null));
+        when(healthChecker.getHealth(tgArn, "i-explicit-port", 10000))
+                .thenReturn(new ElbV2HealthChecker.TargetHealthStatus("healthy", null, null));
+
+        service.registerTargets(REGION, tgArn, List.of(defaultPortTarget, explicitPortTarget));
+
+        var health = service.describeTargetHealth(REGION, tgArn, List.of());
+        assertEquals(2, health.size());
+        assertEquals(9999, health.get(0).getTarget().getPort());
+        assertEquals(10000, health.get(1).getTarget().getPort());
+        ArgumentCaptor<List<TargetDescription>> targetsCaptor = ArgumentCaptor.captor();
+        verify(healthChecker).addTargets(eq(tgArn), targetsCaptor.capture(), any(TargetGroup.class));
+        assertEquals(9999, targetsCaptor.getValue().get(0).getPort());
+        assertEquals(10000, targetsCaptor.getValue().get(1).getPort());
+    }
+
+    @Test
+    void deregisterTargetsDefaultsMissingPortToTargetGroupPort() {
+        String tgArn = createTargetGroup("sample-tg");
+        TargetDescription target = new TargetDescription();
+        target.setId("i-1234567890abcdef0");
+        service.registerTargets(REGION, tgArn, List.of(target));
+
+        service.deregisterTargets(REGION, tgArn, List.of(target));
+
+        assertTrue(service.describeTargetHealth(REGION, tgArn, List.of()).isEmpty());
+        ArgumentCaptor<List<TargetDescription>> targetsCaptor = ArgumentCaptor.captor();
+        verify(healthChecker).removeTargets(eq(tgArn), targetsCaptor.capture(), any(TargetGroup.class));
+        assertEquals(9999, targetsCaptor.getValue().getFirst().getPort());
     }
 
     private String createTargetGroup(String name) {
