@@ -210,6 +210,10 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>cloudtrail</artifactId>
         </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>servicequotas</artifactId>
+        </dependency>
         <!-- EMR client -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>

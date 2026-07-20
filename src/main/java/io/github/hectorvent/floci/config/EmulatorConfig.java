@@ -563,6 +563,7 @@ public interface EmulatorConfig {
         BcmDataExportsServiceConfig bcmDataExports();
         ConfigServiceConfig configservice();
         CloudTrailServiceConfig cloudtrail();
+        ServiceQuotasServiceConfig servicequotas();
         CloudControlServiceConfig cloudcontrol();
         CloudFrontServiceConfig cloudfront();
         AppSyncServiceConfig appsync();
@@ -603,6 +604,15 @@ public interface EmulatorConfig {
     interface LightsailServiceConfig {
         @WithDefault("true")
         boolean enabled();
+    }
+
+    interface ServiceQuotasServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /** Applied account limit for EC2 Standard (A, C, D, H, I, M, R, T, Z) On-Demand vCPUs. */
+        @WithDefault("5")
+        int standardOnDemandVcpus();
     }
 
     interface CloudControlServiceConfig {

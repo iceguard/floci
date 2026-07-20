@@ -18,15 +18,22 @@ import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Snapshot;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ec2.model.VpcEndpoint;
+import io.github.hectorvent.floci.services.servicequotas.ServiceQuotaCatalog;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anySet;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -337,6 +344,161 @@ class Ec2ServiceTest {
         assertEquals("snap-owned", snapshots.getFirst().getSnapshotId());
     }
 
+    @Test
+    void configuredServiceQuotaDrivesReadbackAndAtomicAdmission() {
+        EmulatorConfig config = mockConfig(true, 17);
+        Ec2Service service = newEc2Service(config);
+        assertEquals(17.0, ServiceQuotaCatalog.appliedValue(config.services().servicequotas(),
+                ServiceQuotaCatalog.EC2_SERVICE_CODE,
+                ServiceQuotaCatalog.STANDARD_ON_DEMAND_VCPUS).orElseThrow());
+        runInstances(service, "us-east-1", "m8gd.2xlarge", 2);
+        runInstances(service, "us-east-1", "m8gd.medium", 1);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> runInstances(service, "us-east-1", "m8gd.medium", 1));
+
+        assertEquals("VcpuLimitExceeded", error.getErrorCode());
+        assertEquals("You have requested more vCPU capacity than your current vCPU limit of 17 "
+                + "allows for the instance bucket that the specified instance type belongs to.",
+                error.getMessage());
+        assertEquals(400, error.getHttpStatus());
+        assertEquals(3, service.describeInstances("us-east-1", List.of(), Map.of()).size());
+    }
+
+    @Test
+    void runInstancesAdmitsUpToMaxCountButFailsAtomicallyBelowMinCount() {
+        Ec2Service service = newEc2Service();
+        runInstances(service, "us-east-1", "m8gd.2xlarge", 1);
+
+        Reservation partial = runInstances(service, "us-east-1", "m8gd.2xlarge", 1, 2);
+        assertEquals(1, partial.getInstances().size());
+        assertEquals(2, service.describeInstances("us-east-1", List.of(), Map.of()).size());
+
+        Ec2Service rejectedService = newEc2Service();
+        runInstances(rejectedService, "us-east-1", "m8gd.2xlarge", 1);
+        AwsException error = assertThrows(AwsException.class,
+                () -> runInstances(rejectedService, "us-east-1", "m8gd.2xlarge", 2, 3));
+        assertEquals("VcpuLimitExceeded", error.getErrorCode());
+        assertEquals(1, rejectedService.describeInstances("us-east-1", List.of(), Map.of()).size());
+    }
+
+    @Test
+    void stoppedTerminatedAndActiveInstancesHaveAwsQuotaSemantics() {
+        Ec2Service service = newEc2Service();
+        Reservation initial = runInstances(service, "us-east-1", "m8gd.2xlarge", 2);
+        String stoppedId = initial.getInstances().getFirst().getInstanceId();
+        String terminatedId = initial.getInstances().get(1).getInstanceId();
+
+        service.stopInstances("us-east-1", List.of(stoppedId));
+        service.terminateInstances("us-east-1", List.of(terminatedId));
+        Reservation replacement = runInstances(service, "us-east-1", "m8gd.2xlarge", 2);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.startInstances("us-east-1", List.of(stoppedId)));
+        assertEquals("VcpuLimitExceeded", error.getErrorCode());
+
+        service.terminateInstances("us-east-1", List.of(replacement.getInstances().getFirst().getInstanceId()));
+        service.startInstances("us-east-1", List.of(stoppedId));
+        assertEquals("running", service.findInstanceById(stoppedId).getState().getName());
+    }
+
+    @Test
+    void startInstancesRejectsEntireBatchBeforeChangingAnyState() {
+        Ec2Service service = newEc2Service();
+        Reservation stopped = runInstances(service, "us-east-1", "m8gd.2xlarge", 2);
+        List<String> stoppedIds = stopped.getInstances().stream().map(Instance::getInstanceId).toList();
+        service.stopInstances("us-east-1", stoppedIds);
+        runInstances(service, "us-east-1", "m8gd.2xlarge", 1);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.startInstances("us-east-1", stoppedIds));
+
+        assertEquals("VcpuLimitExceeded", error.getErrorCode());
+        assertTrue(stoppedIds.stream()
+                .allMatch(id -> "stopped".equals(service.findInstanceById(id).getState().getName())));
+    }
+
+    @Test
+    void failedLaunchStateReleasesQuotaReservation() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        AmiImageResolver imageResolver = mock(AmiImageResolver.class);
+        when(imageResolver.resolveImage(anyString())).thenReturn(ResolvedAmiImage.minimal("test-image"));
+        AtomicInteger attempts = new AtomicInteger();
+        doAnswer(invocation -> {
+            if (attempts.getAndIncrement() == 0) {
+                Instance instance = invocation.getArgument(0);
+                instance.setState(io.github.hectorvent.floci.services.ec2.model.InstanceState.terminated());
+            }
+            return null;
+        }).when(containerManager).launch(any(Instance.class), any(ResolvedAmiImage.class),
+                nullable(String.class), anyString(), anySet());
+        Ec2Service service = new Ec2Service(mockConfig(false, 17), containerManager,
+                mock(Ec2PortForwardManager.class), imageResolver, mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+
+        runInstances(service, "us-east-1", "m8gd.2xlarge", 1);
+        runInstances(service, "us-east-1", "m8gd.2xlarge", 2);
+        runInstances(service, "us-east-1", "m8gd.medium", 1);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> runInstances(service, "us-east-1", "m8gd.medium", 1));
+        assertEquals("VcpuLimitExceeded", error.getErrorCode());
+    }
+
+    @Test
+    void modeledNonStandardInstanceTypeUsesItsOwnQuotaBucket() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class),
+                mock(Ec2ImageCatalog.class), instanceTypeCatalog("p4d.24xlarge", 96),
+                new InMemoryStorageFactory());
+
+        Reservation reservation = runInstances(service, "us-east-1", "p4d.24xlarge", 1);
+
+        assertEquals(1, reservation.getInstances().size());
+    }
+
+    @Test
+    void standardOnDemandVcpuQuotaIsRegional() {
+        Ec2Service service = newEc2Service();
+
+        runInstances(service, "us-east-1", "m8gd.2xlarge", 2);
+        runInstances(service, "us-west-2", "m8gd.2xlarge", 2);
+
+        assertEquals(2, service.describeInstances("us-east-1", List.of(), Map.of()).size());
+        assertEquals(2, service.describeInstances("us-west-2", List.of(), Map.of()).size());
+    }
+
+    private static Ec2Service newEc2Service() {
+        return newEc2Service(mockConfig(true, 17));
+    }
+
+    private static Ec2Service newEc2Service(EmulatorConfig config) {
+        return new Ec2Service(config, mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class),
+                mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+    }
+
+    private static Reservation runInstances(Ec2Service service, String region, String instanceType, int count) {
+        return runInstances(service, region, instanceType, count, count);
+    }
+
+    private static Reservation runInstances(Ec2Service service, String region, String instanceType,
+                                            int minCount, int maxCount) {
+        return service.runInstances(region, "ami-1234567890abcdef0", instanceType,
+                minCount, maxCount, null, List.of(), null, null, List.of(), null, null);
+    }
+
+    private static Ec2InstanceTypeCatalog instanceTypeCatalog(String instanceType, int vcpus) {
+        Ec2InstanceTypeCatalog.CatalogInstanceType type = new Ec2InstanceTypeCatalog.CatalogInstanceType();
+        type.instanceType = instanceType;
+        type.vcpu = vcpus;
+        type.memoryMib = 1024;
+        type.supportedArchitectures = List.of("x86_64");
+        Ec2InstanceTypeCatalog.Catalog catalog = new Ec2InstanceTypeCatalog.Catalog();
+        catalog.instanceTypes = List.of(type);
+        return new Ec2InstanceTypeCatalog(catalog);
+    }
+
     private static BlockDeviceMapping blockDeviceMapping(String snapshotId, int volumeSize) {
         EbsBlockDevice ebs = new EbsBlockDevice();
         ebs.setSnapshotId(snapshotId);
@@ -348,13 +510,21 @@ class Ec2ServiceTest {
     }
 
     private static EmulatorConfig mockConfig(boolean ec2Mock) {
+        return mockConfig(ec2Mock, 17);
+    }
+
+    private static EmulatorConfig mockConfig(boolean ec2Mock, int standardOnDemandVcpus) {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
+        EmulatorConfig.ServiceQuotasServiceConfig serviceQuotas =
+                mock(EmulatorConfig.ServiceQuotasServiceConfig.class);
         when(config.defaultAccountId()).thenReturn("000000000000");
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
+        when(services.servicequotas()).thenReturn(serviceQuotas);
         when(ec2.mock()).thenReturn(ec2Mock);
+        when(serviceQuotas.standardOnDemandVcpus()).thenReturn(standardOnDemandVcpus);
         return config;
     }
 
