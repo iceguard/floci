@@ -181,6 +181,41 @@ FLOCI_STORAGE_HOST_PERSISTENT_PATH=/absolute/host/path/data
 
 ## Authentication
 
-The RDS auth proxy validates the master username and password at the proxy layer. All other database users are passed through directly to the backend engine — create them with standard SQL (`CREATE USER`) and connect as normal.
+The RDS auth proxy validates the master username and password at the proxy layer. Database users
+that do not use IAM authentication are passed through to the backend engine; create them with
+standard SQL (`CREATE USER`) and connect with their database password.
 
-IAM database authentication is also supported. Set `--enable-iam-database-authentication` at instance creation time and use `aws rds generate-db-auth-token` to obtain a token.
+When `ManageMasterUserPassword=true`, Floci creates an RDS-managed Secrets
+Manager secret and returns its ARN in `MasterUserSecret`. Deleting the DB
+instance permanently deletes that service-owned secret; unrelated and
+customer-managed secrets are not affected.
+
+### PostgreSQL IAM database authentication
+
+Set `--enable-iam-database-authentication` when creating the DB instance, create the PostgreSQL
+login role, and grant it membership in `rds_iam`:
+
+```sql
+CREATE USER app_user WITH LOGIN;
+GRANT rds_iam TO app_user;
+```
+
+The IAM principal that generates the token must allow `rds-db:connect` on the exact database-user
+resource:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "rds-db:connect",
+  "Resource": "arn:aws:rds-db:us-east-1:000000000000:dbuser:db-RESOURCEID/app_user"
+}
+```
+
+Generate the token for the endpoint, port, region, and database user returned by Floci, then pass
+the token as the PostgreSQL password. Floci validates the SigV4 signature and temporary-session
+token, requires the token user to match the PostgreSQL startup user, and authorizes the exact
+`rds-db:connect` resource. Tokens for another endpoint, port, region, or user are rejected.
+
+As on RDS for PostgreSQL, granting `rds_iam` makes IAM authentication take precedence for that
+role: a normal database password cannot be used to bypass IAM authentication. The master user's
+password path remains available for administration.

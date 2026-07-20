@@ -28,9 +28,28 @@ public class RdsProxyManager {
                            int proxyPort, String backendHost, int backendPort,
                            String masterUsername, String masterPassword, String dbName,
                            RdsAuthProxy.PasswordValidator passwordValidator) {
+        startProxy(instanceId, engine, iamEnabled, proxyPort, backendHost, backendPort,
+                masterUsername, masterPassword, dbName, null, null, passwordValidator);
+    }
+
+    public void startProxy(String instanceId, DatabaseEngine engine, boolean iamEnabled,
+                           int proxyPort, String backendHost, int backendPort,
+                           String masterUsername, String masterPassword, String dbName,
+                           String dbUserArnPrefix,
+                           RdsAuthProxy.PasswordValidator passwordValidator) {
+        startProxy(instanceId, engine, iamEnabled, proxyPort, backendHost, backendPort,
+                masterUsername, masterPassword, dbName, dbUserArnPrefix, null, passwordValidator);
+    }
+
+    public void startProxy(String instanceId, DatabaseEngine engine, boolean iamEnabled,
+                           int proxyPort, String backendHost, int backendPort,
+                           String masterUsername, String masterPassword, String dbName,
+                           String dbUserArnPrefix, String endpointHost,
+                           RdsAuthProxy.PasswordValidator passwordValidator) {
         RdsAuthProxy proxy = new RdsAuthProxy(
                 instanceId, backendHost, backendPort, engine, iamEnabled,
-                masterUsername, masterPassword, dbName, sigV4Validator, passwordValidator);
+                masterUsername, masterPassword, dbName, dbUserArnPrefix, endpointHost,
+                sigV4Validator, passwordValidator);
         try {
             proxy.start(proxyPort);
             proxies.put(instanceId, proxy);
@@ -45,6 +64,13 @@ public class RdsProxyManager {
         if (proxy != null) {
             proxy.stop();
             LOG.infov("Stopped RDS proxy for instance {0}", instanceId);
+        }
+    }
+
+    public void setIamEnabled(String instanceId, boolean iamEnabled) {
+        RdsAuthProxy proxy = proxies.get(instanceId);
+        if (proxy != null) {
+            proxy.setIamEnabled(iamEnabled);
         }
     }
 

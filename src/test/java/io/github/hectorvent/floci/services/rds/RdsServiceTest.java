@@ -42,6 +42,16 @@ import static org.mockito.Mockito.when;
 
 class RdsServiceTest {
 
+    @Test
+    void buildsDatabaseUserArnPrefixFromRdsResourceIdentity() {
+        assertEquals(
+                "arn:aws:rds-db:us-west-2:123456789012:dbuser:db-ABCDEFGHIJKLMNOPQRSTUVWX/",
+                RdsService.dbUserArnPrefix(
+                        "arn:aws:rds:us-west-2:123456789012:db:application",
+                        "db-ABCDEFGHIJKLMNOPQRSTUVWX"));
+        assertNull(RdsService.dbUserArnPrefix("arn:aws:rds:incomplete", "db-resource"));
+    }
+
     private RdsService rdsService;
     private RdsContainerManager containerManager;
     private RdsProxyManager proxyManager;
@@ -382,6 +392,18 @@ class RdsServiceTest {
 
         assertEquals("original-password", modified.getMasterPassword());
         assertTrue(modified.isIamDatabaseAuthenticationEnabled());
+        verify(proxyManager).setIamEnabled("mydb", true);
+    }
+
+    @Test
+    void modifyDbClusterPropagatesIamStateToRunningProxy() {
+        rdsService.createDbCluster("cluster1", "aurora-postgresql", "16",
+                "admin", "original-password", "app", false, null);
+
+        DbCluster modified = rdsService.modifyDbCluster("cluster1", null, true);
+
+        assertTrue(modified.isIamDatabaseAuthenticationEnabled());
+        verify(proxyManager).setIamEnabled("cluster1", true);
     }
 
     @Test
@@ -653,7 +675,7 @@ class RdsServiceTest {
         assertEquals("DBSubnetGroupNotFoundFault", exception.getErrorCode());
         verify(containerManager, never()).start(any(), any(), any(), any(), any(), any(), any());
         verify(proxyManager, never()).startProxy(any(), any(), anyBoolean(), anyInt(),
-                any(), anyInt(), any(), any(), any(), any());
+                any(), anyInt(), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -718,7 +740,7 @@ class RdsServiceTest {
         assertNull(cluster.getContainerId());
         verify(containerManager, never()).start(any(), any(), any(), any(), any(), any(), any());
         verify(proxyManager, never()).startProxy(any(), any(), anyBoolean(), anyInt(), any(), anyInt(),
-                any(), any(), any(), any());
+                any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -738,7 +760,7 @@ class RdsServiceTest {
         assertNull(instance.getDockerVolumeName());
         verify(containerManager, never()).start(any(), any(), any(), any(), any(), any(), any());
         verify(proxyManager, never()).startProxy(any(), any(), anyBoolean(), anyInt(), any(), anyInt(),
-                any(), any(), any(), any());
+                any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -804,7 +826,7 @@ class RdsServiceTest {
         verify(containerManager, never()).start(any(), any(), any(), any(), any(), any(), any());
         verify(containerManager, never()).stop(any());
         verify(proxyManager, never()).startProxy(any(), any(), anyBoolean(), anyInt(), any(), anyInt(),
-                any(), any(), any(), any());
+                any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -1045,7 +1067,9 @@ class RdsServiceTest {
                 eq(DatabaseEngine.POSTGRES), eq("postgres:16.3-alpine"), eq("admin"), eq("secret"), eq("app"));
         verify(restoredProxyManager).startProxy(eq("mydb"), eq(DatabaseEngine.POSTGRES),
                 eq(false), eq(persistedProxyPort), eq("127.0.0.1"), eq(15432),
-                eq("admin"), eq("secret"), eq("app"), any());
+                eq("admin"), eq("secret"), eq("app"),
+                eq(RdsService.dbUserArnPrefix(restored.getDbInstanceArn(), restored.getDbiResourceId())),
+                eq(restored.getEndpoint().address()), any());
     }
 
     @Test
@@ -1090,10 +1114,14 @@ class RdsServiceTest {
                 eq(DatabaseEngine.POSTGRES), eq("postgres:16.3-alpine"), eq("admin"), eq("secret"), eq("app"));
         verify(restoredProxyManager).startProxy(eq("cluster1"), eq(DatabaseEngine.POSTGRES),
                 eq(false), eq(cluster.getProxyPort()), eq("127.0.0.1"), eq(15432),
-                eq("admin"), eq("secret"), eq("app"), any());
+                eq("admin"), eq("secret"), eq("app"),
+                eq(RdsService.dbUserArnPrefix(restoredCluster.getDbClusterArn(), restoredCluster.getDbClusterResourceId())),
+                eq(restoredCluster.getEndpoint().address()), any());
         verify(restoredProxyManager).startProxy(eq("member1"), eq(DatabaseEngine.POSTGRES),
                 eq(false), eq(member.getProxyPort()), eq("127.0.0.1"), eq(15432),
-                eq("admin"), eq("secret"), eq("app"), any());
+                eq("admin"), eq("secret"), eq("app"),
+                eq(RdsService.dbUserArnPrefix(restoredCluster.getDbClusterArn(), restoredCluster.getDbClusterResourceId())),
+                eq(restoredMember.getEndpoint().address()), any());
     }
 
     private RdsService newService(RdsContainerManager containerManager,

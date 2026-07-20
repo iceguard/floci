@@ -70,6 +70,25 @@ public class PostgresProtocolHandler {
                                   String masterUsername, String masterPassword, String dbName,
                                   boolean iamEnabled, RdsSigV4Validator sigV4,
                                   PasswordValidator passwordValidator) throws IOException {
+        handleAuth(client, backend, masterUsername, masterPassword, dbName, null,
+                iamEnabled, sigV4, passwordValidator);
+    }
+
+    public static void handleAuth(Socket client, Socket backend,
+                                  String masterUsername, String masterPassword, String dbName,
+                                  String dbUserArnPrefix,
+                                  boolean iamEnabled, RdsSigV4Validator sigV4,
+                                  PasswordValidator passwordValidator) throws IOException {
+        handleAuth(client, backend, masterUsername, masterPassword, dbName, dbUserArnPrefix,
+                null, -1, iamEnabled, sigV4, passwordValidator);
+    }
+
+    public static void handleAuth(Socket client, Socket backend,
+                                  String masterUsername, String masterPassword, String dbName,
+                                  String dbUserArnPrefix, String expectedEndpointHost,
+                                  int expectedEndpointPort,
+                                  boolean iamEnabled, RdsSigV4Validator sigV4,
+                                  PasswordValidator passwordValidator) throws IOException {
 
         // Phase 1: Read client startup message (possibly preceded by SSL request)
         StartupMessage startup = readStartupMessage(client);
@@ -102,9 +121,12 @@ public class PostgresProtocolHandler {
         boolean isMaster = masterUsername.equals(clientUsername);
 
         if (isIam) {
-            if (!sigV4.validate(clientPassword, clientUsername)) {
+            String dbUserArn = dbUserArnPrefix == null ? null : dbUserArnPrefix + clientUsername;
+            if (dbUserArn == null || !sigV4.validateAndAuthorize(
+                    clientPassword, clientUsername, dbUserArn,
+                    expectedEndpointHost, expectedEndpointPort)) {
                 sendErrorResponse(clientOut, "FATAL", "28P01",
-                        "password authentication failed for user \"" + clientUsername + "\"");
+                        "PAM authentication failed for user " + clientUsername);
                 clientOut.flush();
                 closeQuietly(client);
                 closeQuietly(backend);
@@ -157,11 +179,57 @@ public class PostgresProtocolHandler {
             return;
         }
 
-        sendMessage(clientOut, 'R', intBytes(0)); // AuthenticationOK
-        for (byte[] msg : bufferedMessages) {
-            clientOut.write(msg);
+        if (iamEnabled && !isIam) {
+            RoleIamState roleIamState = databaseRoleIamState(backendIn, backendOut, clientUsername);
+            if (roleIamState != RoleIamState.DENIED) {
+                sendErrorResponse(clientOut, "FATAL", "28P01",
+                        "PAM authentication failed for user " + clientUsername);
+                clientOut.flush();
+                closeQuietly(client);
+                closeQuietly(backend);
+                return;
+            }
         }
-        clientOut.flush();
+
+        if (isIam) {
+            if (isMaster) {
+                if (databaseRoleIamState(backendIn, backendOut, clientUsername) != RoleIamState.ALLOWED) {
+                    sendErrorResponse(clientOut, "FATAL", "28P01",
+                            "PAM authentication failed for user " + clientUsername);
+                    clientOut.flush();
+                    closeQuietly(client);
+                    closeQuietly(backend);
+                    return;
+                }
+            } else {
+                IamBackendSession iamSession = openIamBackendSession(
+                        backend, backendIn, backendOut, masterUsername, masterPassword,
+                        clientUsername, effectiveDbName);
+                if (iamSession == null) {
+                    sendErrorResponse(clientOut, "FATAL", "28P01",
+                            "PAM authentication failed for user " + clientUsername);
+                    clientOut.flush();
+                    closeQuietly(client);
+                    closeQuietly(backend);
+                    return;
+                }
+                closeQuietly(backend);
+                backend = iamSession.socket();
+                bufferedMessages = iamSession.startupMessages();
+            }
+        }
+
+        try {
+            sendMessage(clientOut, 'R', intBytes(0)); // AuthenticationOK
+            for (byte[] msg : bufferedMessages) {
+                clientOut.write(msg);
+            }
+            clientOut.flush();
+        } catch (IOException e) {
+            closeQuietly(client);
+            closeQuietly(backend);
+            throw e;
+        }
 
         bridge(client, backend);
     }
@@ -284,6 +352,230 @@ public class PostgresProtocolHandler {
 
     private static boolean endsWithErrorResponse(List<byte[]> messages) {
         return !messages.isEmpty() && messages.get(messages.size() - 1)[0] == 'E';
+    }
+
+    private static IamBackendSession openIamBackendSession(
+            Socket administratorBackend,
+            InputStream administratorIn,
+            OutputStream administratorOut,
+            String administratorUsername,
+            String administratorPassword,
+            String username,
+            String databaseName) throws IOException {
+        if (databaseRoleIamState(administratorIn, administratorOut, username) != RoleIamState.ALLOWED) {
+            return null;
+        }
+
+        String lockExpression = "hashtext(" + quoteLiteral(username) + ")";
+        if (!executeSimpleCommand(administratorIn, administratorOut,
+                "SELECT pg_advisory_lock(" + lockExpression + ")")) {
+            return null;
+        }
+
+        String oneTimePassword = generateNonce() + generateNonce();
+        Socket userBackend = null;
+        boolean authenticated = false;
+        boolean passwordChanged = false;
+        boolean passwordRestored = false;
+        boolean lockReleased = false;
+        RolePassword originalPassword = null;
+        List<byte[]> startupMessages = null;
+        try {
+            originalPassword = databaseRolePassword(administratorIn, administratorOut, username);
+            if (originalPassword == null) {
+                return null;
+            }
+            passwordChanged = executeSimpleCommand(administratorIn, administratorOut,
+                    "ALTER ROLE " + quoteIdentifier(username) + " PASSWORD "
+                            + quoteLiteral(oneTimePassword));
+            if (!passwordChanged) {
+                return null;
+            }
+            userBackend = new Socket(administratorBackend.getInetAddress(), administratorBackend.getPort());
+            userBackend.setTcpNoDelay(true);
+            InputStream userIn = userBackend.getInputStream();
+            OutputStream userOut = userBackend.getOutputStream();
+            sendStartupToBackend(userOut, username, databaseName);
+            userOut.flush();
+            authenticated = authenticateWithBackend(userIn, userOut, username, oneTimePassword);
+            if (authenticated) {
+                startupMessages = readUntilReadyForQuery(userIn);
+                authenticated = !containsErrorResponse(startupMessages);
+            }
+        } finally {
+            try {
+                if (passwordChanged) {
+                    passwordRestored = restoreRolePassword(
+                            administratorBackend, administratorIn, administratorOut,
+                            administratorUsername, administratorPassword, databaseName,
+                            username, originalPassword);
+                } else {
+                    passwordRestored = true;
+                }
+            } finally {
+                try {
+                    lockReleased = executeSimpleCommand(administratorIn, administratorOut,
+                            "SELECT pg_advisory_unlock(" + lockExpression + ")");
+                } finally {
+                    if (!authenticated || !passwordRestored || !lockReleased) {
+                        closeQuietly(userBackend);
+                    }
+                }
+            }
+        }
+        return authenticated && passwordRestored && lockReleased
+                ? new IamBackendSession(userBackend, startupMessages)
+                : null;
+    }
+
+    private static boolean restoreRolePassword(
+            Socket administratorBackend,
+            InputStream administratorIn,
+            OutputStream administratorOut,
+            String administratorUsername,
+            String administratorPassword,
+            String databaseName,
+            String username,
+            RolePassword originalPassword) {
+        String restoredPassword = originalPassword.value() == null
+                ? "NULL"
+                : quoteLiteral(originalPassword.value());
+        String restoreSql = "ALTER ROLE " + quoteIdentifier(username) + " PASSWORD " + restoredPassword;
+        try {
+            if (executeSimpleCommand(administratorIn, administratorOut, restoreSql)) {
+                return true;
+            }
+        } catch (IOException e) {
+            LOG.warnv("Failed to restore PostgreSQL role password on the existing administrator session: {0}",
+                    e.getMessage());
+        }
+
+        try (Socket recoveryBackend = new Socket(
+                administratorBackend.getInetAddress(), administratorBackend.getPort())) {
+            recoveryBackend.setTcpNoDelay(true);
+            InputStream recoveryIn = recoveryBackend.getInputStream();
+            OutputStream recoveryOut = recoveryBackend.getOutputStream();
+            sendStartupToBackend(recoveryOut, administratorUsername, databaseName);
+            recoveryOut.flush();
+            if (!authenticateWithBackend(
+                    recoveryIn, recoveryOut, administratorUsername, administratorPassword)) {
+                return false;
+            }
+            if (containsErrorResponse(readUntilReadyForQuery(recoveryIn))) {
+                return false;
+            }
+            return executeSimpleCommand(recoveryIn, recoveryOut, restoreSql);
+        } catch (IOException e) {
+            LOG.errorv("Failed to restore PostgreSQL role password on a recovery session: {0}",
+                    e.getMessage());
+            return false;
+        }
+    }
+
+    private static RolePassword databaseRolePassword(InputStream in, OutputStream out, String username)
+            throws IOException {
+        sendSimpleQuery(out, "SELECT rolpassword FROM pg_authid WHERE rolname = " + quoteLiteral(username));
+        out.flush();
+        List<byte[]> messages = readUntilReadyForQuery(in);
+        if (containsErrorResponse(messages)) {
+            return null;
+        }
+        return messages.stream()
+                .filter(message -> message[0] == 'D')
+                .findFirst()
+                .map(PostgresProtocolHandler::singleColumnValue)
+                .orElse(null);
+    }
+
+    private static RoleIamState databaseRoleIamState(InputStream in, OutputStream out, String username)
+            throws IOException {
+        sendSimpleQuery(out,
+                "WITH RECURSIVE granted_roles(oid) AS ("
+                        + " SELECT membership.roleid FROM pg_auth_members membership"
+                        + " JOIN pg_roles member_role ON member_role.oid = membership.member"
+                        + " WHERE member_role.rolname = " + quoteLiteral(username)
+                        + " UNION"
+                        + " SELECT membership.roleid FROM pg_auth_members membership"
+                        + " JOIN granted_roles inherited_role ON inherited_role.oid = membership.member"
+                        + ")"
+                        + " SELECT login_role.rolcanlogin AND EXISTS ("
+                        + " SELECT 1 FROM granted_roles granted"
+                        + " JOIN pg_roles granted_role ON granted_role.oid = granted.oid"
+                        + " WHERE granted_role.rolname = 'rds_iam'"
+                        + ") FROM pg_roles login_role WHERE login_role.rolname = "
+                        + quoteLiteral(username));
+        out.flush();
+        List<byte[]> messages = readUntilReadyForQuery(in);
+        if (containsErrorResponse(messages)) {
+            return RoleIamState.ERROR;
+        }
+        return messages.stream()
+                .filter(message -> message[0] == 'D')
+                .anyMatch(PostgresProtocolHandler::isSingleTrueDataRow)
+                ? RoleIamState.ALLOWED
+                : RoleIamState.DENIED;
+    }
+
+    private static boolean executeSimpleCommand(InputStream in, OutputStream out, String sql)
+            throws IOException {
+        sendSimpleQuery(out, sql);
+        out.flush();
+        return !containsErrorResponse(readUntilReadyForQuery(in));
+    }
+
+    private static String quoteIdentifier(String identifier) {
+        return '"' + identifier.replace("\"", "\"\"") + '"';
+    }
+
+    private static String quoteLiteral(String literal) {
+        return '\'' + literal.replace("'", "''") + '\'';
+    }
+
+    private static void sendSimpleQuery(OutputStream out, String sql) throws IOException {
+        sendMessage(out, 'Q', sql.getBytes(StandardCharsets.UTF_8), new byte[] {0});
+    }
+
+    private static boolean isSingleTrueDataRow(byte[] message) {
+        if (message.length < 12 || message[0] != 'D') {
+            return false;
+        }
+        int columnCount = ((message[5] & 0xff) << 8) | (message[6] & 0xff);
+        int valueLength = ((message[7] & 0xff) << 24)
+                | ((message[8] & 0xff) << 16)
+                | ((message[9] & 0xff) << 8)
+                | (message[10] & 0xff);
+        return columnCount == 1 && valueLength == 1 && message[11] == 't';
+    }
+
+    private static RolePassword singleColumnValue(byte[] message) {
+        if (message.length < 11 || message[0] != 'D') {
+            return null;
+        }
+        int columnCount = ((message[5] & 0xff) << 8) | (message[6] & 0xff);
+        int valueLength = ((message[7] & 0xff) << 24)
+                | ((message[8] & 0xff) << 16)
+                | ((message[9] & 0xff) << 8)
+                | (message[10] & 0xff);
+        if (columnCount != 1 || valueLength < -1 || message.length != 11 + Math.max(valueLength, 0)) {
+            return null;
+        }
+        return new RolePassword(valueLength == -1
+                ? null
+                : new String(message, 11, valueLength, StandardCharsets.UTF_8));
+    }
+
+    private static boolean containsErrorResponse(List<byte[]> messages) {
+        return messages.stream().anyMatch(message -> message[0] == 'E');
+    }
+
+    private record IamBackendSession(Socket socket, List<byte[]> startupMessages) {}
+
+    private record RolePassword(String value) {}
+
+    private enum RoleIamState {
+        ALLOWED,
+        DENIED,
+        ERROR
     }
 
     private static Map<String, String> parseStartupParams(byte[] data) {
