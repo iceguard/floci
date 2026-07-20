@@ -186,6 +186,22 @@ class IamEnforcementFilterTest {
     }
 
     @Test
+    void ec2GetsUnauthorizedOperationXmlError() {
+        Response r = IamEnforcementFilter.accessDeniedResponse(
+                "ec2:CreateLaunchTemplate", "ec2", MediaType.APPLICATION_FORM_URLENCODED_TYPE);
+
+        assertEquals(403, r.getStatus());
+        assertEquals(MediaType.APPLICATION_XML_TYPE, r.getMediaType());
+        String body = entityString(r);
+        assertTrue(body.contains("<Response>"), body);
+        assertTrue(body.contains("<Errors>"), body);
+        assertTrue(body.contains("<Code>UnauthorizedOperation</Code>"), body);
+        assertTrue(body.contains("User is not authorized to perform: ec2:CreateLaunchTemplate"), body);
+        assertTrue(body.contains("<RequestID>"), body);
+        assertTrue(!body.contains("<ErrorResponse>"), body);
+    }
+
+    @Test
     void jsonProtocolGetsJsonErrorResponse() {
         // DynamoDB / Cognito / Kinesis / ... — JSON 1.0/1.1, JSON error response.
         Response r = IamEnforcementFilter.accessDeniedResponse(
