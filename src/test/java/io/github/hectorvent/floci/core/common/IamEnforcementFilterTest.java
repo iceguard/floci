@@ -24,6 +24,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -64,6 +65,7 @@ class IamEnforcementFilterTest {
         when(services.iam()).thenReturn(iamConfig);
         when(iamConfig.enforcementEnabled()).thenReturn(true);
         when(config.defaultRegion()).thenReturn("us-east-1");
+        when(iamService.isSessionActionAllowed(any(), any(), any())).thenReturn(true);
     }
 
     @Test
@@ -78,8 +80,9 @@ class IamEnforcementFilterTest {
         when(accountResolver.extractAccessKeyId(auth)).thenReturn("ASIASESSION");
         when(accountResolver.resolve(auth)).thenReturn("000000000000");
         when(containerRequest.getHeaderString("Authorization")).thenReturn(auth);
+        when(containerRequest.getHeaderString("X-Amz-Security-Token")).thenReturn("session-token");
         when(actionRegistry.resolve("lambda", containerRequest)).thenReturn("lambda:InvokeFunction");
-        when(iamService.resolveCallerContext("ASIASESSION"))
+        when(iamService.resolveCallerContext("ASIASESSION", "session-token"))
                 .thenReturn(CallerContext.of(List.of("""
                         {"Version":"2012-10-17","Statement":[
                           {"Effect":"Allow","Action":"lambda:InvokeFunction",
@@ -119,8 +122,9 @@ class IamEnforcementFilterTest {
 
         when(accountResolver.extractAccessKeyId(auth)).thenReturn("ASIASESSION");
         when(containerRequest.getHeaderString("Authorization")).thenReturn(auth);
+        when(containerRequest.getHeaderString("X-Amz-Security-Token")).thenReturn("session-token");
         when(actionRegistry.resolve("s3", containerRequest)).thenReturn("s3:ListBucket");
-        when(iamService.resolveCallerContext("ASIASESSION"))
+        when(iamService.resolveCallerContext("ASIASESSION", "session-token"))
                 .thenReturn(CallerContext.of(List.of("""
                         {"Version":"2012-10-17","Statement":[
                           {"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}
@@ -141,6 +145,77 @@ class IamEnforcementFilterTest {
 
         verify(evaluator).evaluate(any(), isNull(), eq("s3:ListBucket"),
                 eq("arn:aws:s3:::bucket"), eq(conditions));
+    }
+
+    @Test
+    void authenticationOnlyStsActionsBypassPolicyEvaluation() {
+        ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
+        String auth = "AWS4-HMAC-SHA256 Credential=ASIASESSION/20260719/us-east-1/sts/aws4_request, "
+                + "SignedHeaders=host, Signature=abc";
+
+        when(accountResolver.extractAccessKeyId(auth)).thenReturn("ASIASESSION");
+        when(containerRequest.getHeaderString("Authorization")).thenReturn(auth);
+        when(actionRegistry.resolve("sts", containerRequest)).thenReturn("sts:GetCallerIdentity");
+
+        IamEnforcementFilter filter = new IamEnforcementFilter(
+                config, accountResolver, iamService, evaluator, actionRegistry, arnBuilder,
+                requestContext, conditionContextResolver);
+
+        filter.filter(containerRequest);
+
+        verify(iamService, never()).resolveCallerContext(any(), any());
+        verify(evaluator, never()).evaluate(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void intrinsicSessionRestrictionDeniesBeforePolicyEvaluation() {
+        ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
+        String auth = "AWS4-HMAC-SHA256 Credential=ASIASESSION/20260719/us-east-1/iam/aws4_request, "
+                + "SignedHeaders=host, Signature=abc";
+
+        when(accountResolver.extractAccessKeyId(auth)).thenReturn("ASIASESSION");
+        when(containerRequest.getHeaderString("Authorization")).thenReturn(auth);
+        when(containerRequest.getHeaderString("X-Amz-Security-Token")).thenReturn("session-token");
+        when(containerRequest.getMediaType()).thenReturn(MediaType.APPLICATION_FORM_URLENCODED_TYPE);
+        when(actionRegistry.resolve("iam", containerRequest)).thenReturn("iam:ListUsers");
+        when(iamService.isSessionActionAllowed(
+                "ASIASESSION", "session-token", "iam:ListUsers")).thenReturn(false);
+
+        IamEnforcementFilter filter = new IamEnforcementFilter(
+                config, accountResolver, iamService, evaluator, actionRegistry, arnBuilder,
+                requestContext, conditionContextResolver);
+
+        filter.filter(containerRequest);
+
+        verify(containerRequest).abortWith(any(Response.class));
+        verify(iamService, never()).resolveCallerContext(any(), any());
+        verify(evaluator, never()).evaluate(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void intrinsicSessionRestrictionAppliesWhenPolicyEnforcementIsDisabled() {
+        ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
+        String auth = "AWS4-HMAC-SHA256 Credential=ASIASESSION/20260719/us-east-1/iam/aws4_request, "
+                + "SignedHeaders=host, Signature=abc";
+
+        when(iamConfig.enforcementEnabled()).thenReturn(false);
+        when(accountResolver.extractAccessKeyId(auth)).thenReturn("ASIASESSION");
+        when(containerRequest.getHeaderString("Authorization")).thenReturn(auth);
+        when(containerRequest.getHeaderString("X-Amz-Security-Token")).thenReturn("session-token");
+        when(containerRequest.getMediaType()).thenReturn(MediaType.APPLICATION_FORM_URLENCODED_TYPE);
+        when(actionRegistry.resolve("iam", containerRequest)).thenReturn("iam:ListUsers");
+        when(iamService.isSessionActionAllowed(
+                "ASIASESSION", "session-token", "iam:ListUsers")).thenReturn(false);
+
+        IamEnforcementFilter filter = new IamEnforcementFilter(
+                config, accountResolver, iamService, evaluator, actionRegistry, arnBuilder,
+                requestContext, conditionContextResolver);
+
+        filter.filter(containerRequest);
+
+        verify(containerRequest).abortWith(any(Response.class));
+        verify(iamService, never()).resolveCallerContext(any(), any());
+        verify(evaluator, never()).evaluate(any(), any(), any(), any(), any());
     }
 
     @Test

@@ -8,10 +8,10 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
-import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class AccountContextFilterTest {
@@ -31,7 +31,13 @@ class AccountContextFilterTest {
         regionResolver = new RegionResolver(DEFAULT_REGION, DEFAULT_ACCOUNT);
         requestContext = new RequestContext();
         sessionAccounts = new java.util.HashMap<>();
-        SessionAccountLookup sessionLookup = akid -> Optional.ofNullable(sessionAccounts.get(akid));
+        SessionAccountLookup sessionLookup = (akid, token) -> {
+            if (!"valid-token".equals(token) || !sessionAccounts.containsKey(akid)) {
+                throw new AwsException("InvalidClientTokenId",
+                        "The security token included in the request is invalid", 403);
+            }
+            return java.util.Optional.of(sessionAccounts.get(akid));
+        };
         filter = new AccountContextFilter(accountResolver, regionResolver, requestContext, sessionLookup);
     }
 
@@ -97,6 +103,8 @@ class AccountContextFilterTest {
         ContainerRequestContext ctx = mockContext(
             "AWS4-HMAC-SHA256 Credential=ASIAEXAMPLESESSIONKEY/20260617/us-west-2/dynamodb/aws4_request, "
                 + "SignedHeaders=host, Signature=abc",
+            null,
+            "valid-token",
             null
         );
         filter.filter(ctx);
@@ -125,26 +133,36 @@ class AccountContextFilterTest {
         );
         filter.filter(ctx);
         assertEquals(DEFAULT_ACCOUNT, requestContext.getAccountId());
+        verify(ctx).abortWith(org.mockito.ArgumentMatchers.argThat(response -> response.getStatus() == 403));
     }
 
     @Test
     void resolvesSessionKeyFromPresignedCredential() {
         sessionAccounts.put("ASIAPRESIGNEDKEY", "555566667777");
         ContainerRequestContext ctx = mockContext(null,
-            "ASIAPRESIGNEDKEY/20260617/eu-west-1/s3/aws4_request");
+            "ASIAPRESIGNEDKEY/20260617/eu-west-1/s3/aws4_request", null, "valid-token");
         filter.filter(ctx);
         assertEquals("555566667777", requestContext.getAccountId());
         assertEquals("eu-west-1", requestContext.getRegion());
     }
 
     private ContainerRequestContext mockContext(String authHeader, String xAmzCredential) {
+        return mockContext(authHeader, xAmzCredential, null, null);
+    }
+
+    private ContainerRequestContext mockContext(String authHeader, String xAmzCredential,
+                                                String headerToken, String queryToken) {
         ContainerRequestContext ctx = mock(ContainerRequestContext.class);
         when(ctx.getHeaderString("Authorization")).thenReturn(authHeader);
+        when(ctx.getHeaderString("X-Amz-Security-Token")).thenReturn(headerToken);
 
         UriInfo uriInfo = mock(UriInfo.class);
         MultivaluedMap<String, String> queryParams = new MultivaluedHashMap<>();
         if (xAmzCredential != null) {
             queryParams.add("X-Amz-Credential", xAmzCredential);
+        }
+        if (queryToken != null) {
+            queryParams.add("X-Amz-Security-Token", queryToken);
         }
         when(uriInfo.getQueryParameters()).thenReturn(queryParams);
         when(ctx.getUriInfo()).thenReturn(uriInfo);

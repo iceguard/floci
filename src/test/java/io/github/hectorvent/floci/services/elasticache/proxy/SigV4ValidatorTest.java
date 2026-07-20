@@ -108,7 +108,7 @@ class SigV4ValidatorTest {
                 "cache-cluster-01",
                 "default",
                 "AKIDUNKNOWN",
-                "wrong-secret",
+                "AKIDUNKNOWN",
                 Instant.now().minusSeconds(60),
                 900
         );
@@ -135,7 +135,7 @@ class SigV4ValidatorTest {
     }
 
     @Test
-    void validateAcceptsTokenWhenExpectedUsernameIsNull() throws Exception {
+    void validateRejectsTokenWhenExpectedUsernameIsNull() throws Exception {
         IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDCACHE", "secret-cache");
 
         SigV4Validator validator = new SigV4Validator(iamService);
@@ -148,8 +148,25 @@ class SigV4ValidatorTest {
                 900
         );
 
-        assertTrue(validator.validate(token, "cache-cluster-01", null),
-                "Null expectedUsername should skip the user identity check");
+        assertFalse(validator.validate(token, "cache-cluster-01", null),
+                "Redis AUTH must supply the username bound into the IAM token");
+    }
+
+    @Test
+    void validateRejectsCorrectlySignedTokenWithoutUser() throws Exception {
+        IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDCACHE", "secret-cache");
+
+        String token = SigV4TokenTestHelper.createElastiCacheToken(
+                "cache-cluster-01",
+                null,
+                "AKIDCACHE",
+                "secret-cache",
+                Instant.now().minusSeconds(60),
+                900
+        );
+
+        assertFalse(new SigV4Validator(iamService)
+                .validate(token, "cache-cluster-01", "default"));
     }
 
     @Test
@@ -205,5 +222,80 @@ class SigV4ValidatorTest {
         String withoutSignature = validToken.replaceFirst("&X-Amz-Signature=[0-9a-f]+", "");
 
         assertFalse(validator.validate(withoutSignature, "cache-cluster-01", "default"));
+    }
+
+    @Test
+    void validateAcceptsTokenSignedWithStsSessionCredentials() throws Exception {
+        String accessKeyId = "ASIACACHESESSION";
+        String secretAccessKey = "temporary-secret";
+        String sessionToken = "cache-session-token";
+        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(
+                accessKeyId, secretAccessKey, sessionToken);
+
+        String token = SigV4TokenTestHelper.createElastiCacheToken(
+                "cache-cluster-01", "default", accessKeyId, secretAccessKey,
+                sessionToken, Instant.now().minusSeconds(60), 900);
+
+        assertTrue(new SigV4Validator(iamService)
+                .validate(token, "cache-cluster-01", "default"));
+    }
+
+    @Test
+    void validateRejectsStsTokenWithoutSessionToken() throws Exception {
+        String accessKeyId = "ASIACACHEMISSING";
+        String secretAccessKey = "temporary-secret";
+        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(
+                accessKeyId, secretAccessKey, "required-token");
+
+        String token = SigV4TokenTestHelper.createElastiCacheToken(
+                "cache-cluster-01", "default", accessKeyId, secretAccessKey,
+                Instant.now().minusSeconds(60), 900);
+
+        assertFalse(new SigV4Validator(iamService)
+                .validate(token, "cache-cluster-01", "default"));
+    }
+
+    @Test
+    void validateRejectsStsTokenWithWrongSessionToken() throws Exception {
+        String accessKeyId = "ASIACACHEWRONG";
+        String secretAccessKey = "temporary-secret";
+        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(
+                accessKeyId, secretAccessKey, "required-token");
+
+        String token = SigV4TokenTestHelper.createElastiCacheToken(
+                "cache-cluster-01", "default", accessKeyId, secretAccessKey,
+                "wrong-token", Instant.now().minusSeconds(60), 900);
+
+        assertFalse(new SigV4Validator(iamService)
+                .validate(token, "cache-cluster-01", "default"));
+    }
+
+    @Test
+    void validateRejectsExpiredStsCredential() throws Exception {
+        String accessKeyId = "ASIACACHEEXPIRED";
+        String secretAccessKey = "temporary-secret";
+        String sessionToken = "expired-token";
+        IamService iamService = IamServiceTestHelper.iamServiceWithSessionCredential(
+                accessKeyId, secretAccessKey, sessionToken, Instant.now().minusSeconds(1));
+
+        String token = SigV4TokenTestHelper.createElastiCacheToken(
+                "cache-cluster-01", "default", accessKeyId, secretAccessKey,
+                sessionToken, Instant.now().minusSeconds(60), 900);
+
+        assertFalse(new SigV4Validator(iamService)
+                .validate(token, "cache-cluster-01", "default"));
+    }
+
+    @Test
+    void validateRejectsUnknownStsCredentialWithoutCompatibilityFallback() throws Exception {
+        String accessKeyId = "ASIACACHEUNKNOWN";
+        IamService iamService = IamServiceTestHelper.iamServiceWithAccessKey("AKIDCACHE", "secret-cache");
+
+        String token = SigV4TokenTestHelper.createElastiCacheToken(
+                "cache-cluster-01", "default", accessKeyId, accessKeyId,
+                "unknown-token", Instant.now().minusSeconds(60), 900);
+
+        assertFalse(new SigV4Validator(iamService)
+                .validate(token, "cache-cluster-01", "default"));
     }
 }

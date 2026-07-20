@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.iam.model.IamUser;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.iam.model.PolicyVersion;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
+import io.github.hectorvent.floci.services.iam.model.SessionCredential.SessionType;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -432,13 +433,18 @@ class IamServiceTest {
         iamService.registerSession(
                 "ASIACROSSACCOUNT",
                 "temp-secret",
+                "cross-token",
                 "arn:aws:iam::222233334444:role/CrossAccountAccess",
+                "cross-session",
+                "222233334444",
+                "AROACROSSACCOUNT",
                 Instant.now().plusSeconds(3600),
                 null,
                 "111122223333"
         );
 
-        assertEquals("222233334444", iamService.resolveAccountId("ASIACROSSACCOUNT").orElseThrow());
+        assertEquals("222233334444",
+                iamService.resolveAccountId("ASIACROSSACCOUNT", "cross-token").orElseThrow());
     }
 
     @Test
@@ -446,19 +452,26 @@ class IamServiceTest {
         iamService.registerSession(
                 "ASIASESSIONTOKEN",
                 "temp-secret",
+                "session-token",
                 null,
+                null,
+                "111122223333",
+                "111122223333",
                 Instant.now().plusSeconds(3600),
                 null,
                 "111122223333"
         );
 
-        assertEquals("111122223333", iamService.resolveAccountId("ASIASESSIONTOKEN").orElseThrow());
+        assertEquals("111122223333",
+                iamService.resolveAccountId("ASIASESSIONTOKEN", "session-token").orElseThrow());
     }
 
     @Test
     void resolveAccountIdEmptyForUnknownKey() {
-        assertTrue(iamService.resolveAccountId("ASIANOTREGISTERED").isEmpty());
-        assertTrue(iamService.resolveAccountId(null).isEmpty());
+        assertEquals("InvalidClientTokenId", assertThrows(AwsException.class,
+                () -> iamService.resolveAccountId("ASIANOTREGISTERED", "token")).getErrorCode());
+        assertEquals("InvalidClientTokenId", assertThrows(AwsException.class,
+                () -> iamService.resolveAccountId(null, null)).getErrorCode());
     }
 
     @Test
@@ -466,7 +479,8 @@ class IamServiceTest {
         CountingAccountAwareSessionStorage sessions = new CountingAccountAwareSessionStorage();
         IamService service = iamService(false, new InMemoryStorage<>(), sessions);
 
-        assertTrue(service.resolveAccountId("AKIAIOSFODNN7EXAMPLE").isEmpty());
+        assertEquals("InvalidClientTokenId", assertThrows(AwsException.class,
+                () -> service.resolveAccountId("AKIAIOSFODNN7EXAMPLE", null)).getErrorCode());
         assertEquals(0, sessions.scanAllAccountsAsMapCalls);
     }
 
@@ -491,13 +505,251 @@ class IamServiceTest {
         iamService.registerSession(
                 "ASIAEXPIRED",
                 "temp-secret",
+                "expired-token",
                 "arn:aws:iam::222233334444:role/CrossAccountAccess",
+                "expired-session",
+                "222233334444",
+                "AROAEXPIRED",
                 Instant.now().minusSeconds(60),
                 null,
                 "111122223333"
         );
 
-        assertTrue(iamService.resolveAccountId("ASIAEXPIRED").isEmpty());
+        AwsException expired = assertThrows(AwsException.class,
+                () -> iamService.resolveSessionIdentity("ASIAEXPIRED", "expired-token"));
+        assertEquals("ExpiredToken", expired.getErrorCode());
+        assertEquals("InvalidClientTokenId", assertThrows(AwsException.class,
+                () -> iamService.resolveAccountId("ASIAEXPIRED", "expired-token")).getErrorCode());
+    }
+
+    @Test
+    void temporarySessionRequiresMatchingTokenAndReturnsAwsIdentity() {
+        iamService.registerSession(
+                "ASIAEXACTSESSION",
+                "temporary-secret",
+                "exact-token",
+                "arn:aws:iam::222233334444:role/ProvisioningRole",
+                "requested-session",
+                "222233334444",
+                "AROAEXACTROLEID",
+                Instant.now().plusSeconds(3600),
+                null,
+                "111122223333"
+        );
+
+        IamService.SessionIdentity identity =
+                iamService.resolveSessionIdentity("ASIAEXACTSESSION", "exact-token");
+        assertEquals("222233334444", identity.accountId());
+        assertEquals("arn:aws:sts::222233334444:assumed-role/ProvisioningRole/requested-session",
+                identity.arn());
+        assertEquals("AROAEXACTROLEID:requested-session", identity.userId());
+        assertEquals("temporary-secret", iamService.findSecretKey("ASIAEXACTSESSION").orElseThrow());
+        assertEquals("temporary-secret",
+                iamService.findSigningSecret("ASIAEXACTSESSION", "exact-token").orElseThrow());
+        assertTrue(iamService.findSigningSecret("ASIAEXACTSESSION", null).isEmpty());
+        assertTrue(iamService.findSigningSecret("ASIAEXACTSESSION", "wrong-token").isEmpty());
+        assertTrue(iamService.findSigningSecret("ASIAUNKNOWNSESSION", "unknown-token").isEmpty());
+        assertEquals("exact-token", iamService.findSessionToken("ASIAEXACTSESSION").orElseThrow());
+        assertTrue(iamService.findActiveSession("ASIAEXACTSESSION", "exact-token").isPresent());
+        assertTrue(iamService.findActiveSession("ASIAEXACTSESSION", null).isEmpty());
+        assertTrue(iamService.findActiveSession("ASIAEXACTSESSION", "wrong-token").isEmpty());
+
+        AwsException missing = assertThrows(AwsException.class,
+                () -> iamService.resolveSessionIdentity("ASIAEXACTSESSION", null));
+        assertEquals("InvalidClientTokenId", missing.getErrorCode());
+        AwsException wrong = assertThrows(AwsException.class,
+                () -> iamService.resolveSessionIdentity("ASIAEXACTSESSION", "wrong-token"));
+        assertEquals("InvalidClientTokenId", wrong.getErrorCode());
+    }
+
+    @Test
+    void providerOwnedSessionCanBeRevokedAtTeardown() {
+        iamService.registerSession(
+                "ASIAINSTANCEPROFILE",
+                "temporary-secret",
+                "temporary-session-token",
+                "arn:aws:iam::000000000000:role/instance-role",
+                "i-0123456789abcdef0",
+                "000000000000",
+                "AROA0123456789ABCDEF",
+                Instant.now().plusSeconds(3600),
+                null,
+                "000000000000"
+        );
+
+        assertEquals("temporary-secret",
+                iamService.findSigningSecret(
+                        "ASIAINSTANCEPROFILE",
+                        "temporary-session-token").orElseThrow());
+
+        iamService.unregisterSession("ASIAINSTANCEPROFILE");
+
+        assertTrue(iamService.findSigningSecret(
+                "ASIAINSTANCEPROFILE",
+                "temporary-session-token").isEmpty());
+    }
+
+    @Test
+    void legacySessionWithoutSecurityTokenFailsClosed() {
+        InMemoryStorage<String, SessionCredential> sessions = new InMemoryStorage<>();
+        SessionCredential legacy = new SessionCredential(
+                "ASIALEGACYSESSION",
+                "legacy-secret",
+                "arn:aws:iam::222233334444:role/LegacyRole",
+                Instant.now().plusSeconds(3600),
+                null,
+                "111122223333");
+        sessions.put("ASIALEGACYSESSION", legacy);
+        IamService service = iamService(false, new InMemoryStorage<>(), sessions);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.resolveSessionIdentity("ASIALEGACYSESSION", "legacy-token"));
+
+        assertEquals("InvalidClientTokenId", error.getErrorCode());
+    }
+
+    @Test
+    void assumedRoleSessionDoesNotInheritRecreatedRolePolicies() {
+        IamRole original = iamService.createRole("BoundRole", "/", "{}", null, 0, null);
+        iamService.registerSession(
+                "ASIABOUNDROLE",
+                "temporary-secret",
+                "bound-token",
+                original.getArn(),
+                "bound-session",
+                "000000000000",
+                original.getRoleId(),
+                Instant.now().plusSeconds(3600),
+                null,
+                "000000000000",
+                null,
+                null,
+                SessionType.ASSUME_ROLE,
+                false,
+                true);
+
+        assertEquals(original.getRoleId() + ":bound-session",
+                iamService.resolveSessionIdentity("ASIABOUNDROLE", "bound-token").userId());
+
+        iamService.deleteRole("BoundRole");
+        IamRole replacement = iamService.createRole("BoundRole", "/", "{}", null, 0, null);
+        assertNotEquals(original.getRoleId(), replacement.getRoleId());
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.resolveCallerContext("ASIABOUNDROLE", "bound-token"));
+        assertEquals("InvalidClientTokenId", error.getErrorCode());
+    }
+
+    @Test
+    void getSessionTokenSessionDoesNotInheritRecreatedUserPolicies() {
+        IamUser original = iamService.createUser("bound-user", "/");
+        iamService.registerSession(
+                "ASIABOUNDUSER",
+                "temporary-secret",
+                "bound-token",
+                null,
+                null,
+                "000000000000",
+                null,
+                Instant.now().plusSeconds(3600),
+                null,
+                "000000000000",
+                original.getArn(),
+                original.getUserId(),
+                SessionType.GET_SESSION_TOKEN,
+                false,
+                true);
+
+        assertEquals(original.getUserId(),
+                iamService.resolveSessionIdentity("ASIABOUNDUSER", "bound-token").userId());
+
+        iamService.deleteUser("bound-user");
+        IamUser replacement = iamService.createUser("bound-user", "/");
+        assertNotEquals(original.getUserId(), replacement.getUserId());
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.resolveSessionIdentity("ASIABOUNDUSER", "bound-token"));
+        assertEquals("InvalidClientTokenId", error.getErrorCode());
+    }
+
+    @Test
+    void getSessionTokenSessionAppliesIntrinsicIamAndStsRestrictions() {
+        iamService.registerSession(
+                "ASIAUNAUTHENTICATEDMFA",
+                "temporary-secret",
+                "session-token",
+                null,
+                null,
+                "000000000000",
+                null,
+                Instant.now().plusSeconds(3600),
+                null,
+                "000000000000",
+                "arn:aws:iam::000000000000:root",
+                "000000000000",
+                SessionType.GET_SESSION_TOKEN,
+                false,
+                false);
+        iamService.registerSession(
+                "ASIAMFAAUTHENTICATED",
+                "temporary-secret",
+                "session-token",
+                null,
+                null,
+                "000000000000",
+                null,
+                Instant.now().plusSeconds(3600),
+                null,
+                "000000000000",
+                "arn:aws:iam::000000000000:root",
+                "000000000000",
+                SessionType.GET_SESSION_TOKEN,
+                true,
+                false);
+
+        assertFalse(iamService.isSessionActionAllowed(
+                "ASIAUNAUTHENTICATEDMFA", "session-token", "iam:ListUsers"));
+        assertFalse(iamService.isSessionActionAllowed(
+                "ASIAMFAAUTHENTICATED", "session-token", "iam:ListUsers"));
+        assertTrue(iamService.isSessionActionAllowed(
+                "ASIAUNAUTHENTICATEDMFA", "session-token", "sts:AssumeRole"));
+        assertTrue(iamService.isSessionActionAllowed(
+                "ASIAUNAUTHENTICATEDMFA", "session-token", "sts:GetCallerIdentity"));
+        assertFalse(iamService.isSessionActionAllowed(
+                "ASIAUNAUTHENTICATEDMFA", "session-token", "sts:DecodeAuthorizationMessage"));
+        assertTrue(iamService.isSessionActionAllowed(
+                "ASIAUNAUTHENTICATEDMFA", "session-token", "s3:ListAllMyBuckets"));
+    }
+
+    @Test
+    void persistedUnboundRoleSessionCannotAcquirePermissionsFromLaterRoleCreation() {
+        String roleName = "later-created-role";
+        String roleArn = "arn:aws:iam::000000000000:role/" + roleName;
+        iamService.registerSession(
+                "ASIAUNBOUNDROLE",
+                "temporary-secret",
+                "session-token",
+                roleArn,
+                "unbound-session",
+                "000000000000",
+                "AROAFABRICATED",
+                Instant.now().plusSeconds(3600),
+                null,
+                "000000000000",
+                null,
+                null,
+                SessionType.ASSUME_ROLE,
+                false,
+                false);
+
+        assertThrows(AwsException.class,
+                () -> iamService.resolveCallerContext("ASIAUNBOUNDROLE", "session-token"));
+
+        iamService.createRole(roleName, "/", "{}", null, 0, null);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> iamService.resolveCallerContext("ASIAUNBOUNDROLE", "session-token"));
+        assertEquals("InvalidClientTokenId", error.getErrorCode());
     }
 
     @Test
@@ -669,6 +921,7 @@ class IamServiceTest {
                 "arn:aws:iam::000000000000:user/existing",
                 iamService.resolveCallerArn("floci").orElseThrow());
         assertEquals("existing-secret", iamService.findSecretKey("floci").orElseThrow());
+        assertTrue(iamService.findSigningSecret("AKIAUNKNOWNCOMPAT", null).isEmpty());
     }
 
     @Test
