@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
@@ -13,10 +14,13 @@ import java.util.Map;
 public class IamConditionContextResolver {
 
     private final AwsFormRequestResolver formRequestResolver;
+    private final ElbV2Service elbV2Service;
 
     @Inject
-    public IamConditionContextResolver(AwsFormRequestResolver formRequestResolver) {
+    public IamConditionContextResolver(AwsFormRequestResolver formRequestResolver,
+                                       ElbV2Service elbV2Service) {
         this.formRequestResolver = formRequestResolver;
+        this.elbV2Service = elbV2Service;
     }
 
     public Map<String, List<String>> resolve(String credentialScope, String action,
@@ -24,8 +28,73 @@ public class IamConditionContextResolver {
         return switch (credentialScope) {
             case "s3" -> s3ConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
+            case "elasticloadbalancing" -> elbConditionContext(action, ctx);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> elbConditionContext(
+            String action, ContainerRequestContext ctx) {
+        boolean create = "elasticloadbalancing:CreateLoadBalancer".equals(action)
+                || "elasticloadbalancing:CreateTargetGroup".equals(action)
+                || "elasticloadbalancing:CreateListener".equals(action);
+        boolean createListener = "elasticloadbalancing:CreateListener".equals(action);
+        boolean deleteListener = "elasticloadbalancing:DeleteListener".equals(action);
+        boolean loadBalancerMutation = "elasticloadbalancing:DeleteLoadBalancer".equals(action);
+        boolean targetGroupMutation = switch (action) {
+            case "elasticloadbalancing:DeleteTargetGroup",
+                    "elasticloadbalancing:DeregisterTargets",
+                    "elasticloadbalancing:ModifyTargetGroup",
+                    "elasticloadbalancing:ModifyTargetGroupAttributes",
+                    "elasticloadbalancing:RegisterTargets" -> true;
+            default -> false;
+        };
+        if (!create && !deleteListener && !loadBalancerMutation && !targetGroupMutation) {
+            return null;
+        }
+
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if (create) {
+            readFormTags(ctx, "Tags.member", conditions);
+        }
+        if (loadBalancerMutation || targetGroupMutation) {
+            addElbResourceTags(
+                    ctx, loadBalancerMutation ? "LoadBalancerArn" : "TargetGroupArn", conditions);
+        }
+        if (createListener) {
+            addElbResourceTags(ctx, "LoadBalancerArn", conditions);
+        }
+        if (deleteListener) {
+            addElbResourceTags(ctx, "ListenerArn", conditions);
+        }
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    private void addElbResourceTags(
+            ContainerRequestContext ctx, String parameter, Map<String, List<String>> conditions) {
+        String resourceArn = formRequestResolver.firstParameter(ctx, parameter);
+        if (resourceArn != null && !resourceArn.isBlank()) {
+            elbV2Service.describeTags(List.of(resourceArn))
+                    .getOrDefault(resourceArn, Map.of())
+                    .forEach((tagKey, tagValue) ->
+                            conditions.put("aws:ResourceTag/" + tagKey, List.of(tagValue)));
+        }
+    }
+
+    private void readFormTags(
+            ContainerRequestContext ctx,
+            String prefix,
+            Map<String, List<String>> conditions) {
+        for (int index = 1; ; index++) {
+            String key = formRequestResolver.firstParameter(ctx, prefix + "." + index + ".Key");
+            if (key == null) {
+                return;
+            }
+            String value = formRequestResolver.firstParameter(ctx, prefix + "." + index + ".Value");
+            if (value != null) {
+                conditions.put("aws:RequestTag/" + key, List.of(value));
+            }
+        }
     }
 
     private Map<String, List<String>> iamConditionContext(String action, ContainerRequestContext ctx) {
