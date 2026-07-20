@@ -3,11 +3,13 @@ package io.github.hectorvent.floci.services.iam;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsFormRequestResolver;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import org.jboss.logging.Logger;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -25,11 +27,14 @@ public class ResourceArnBuilder {
 
     private final IamService iamService;
     private final AwsFormRequestResolver formRequestResolver;
+    private final Ec2Service ec2Service;
 
     @Inject
-    public ResourceArnBuilder(IamService iamService, AwsFormRequestResolver formRequestResolver) {
+    public ResourceArnBuilder(IamService iamService, AwsFormRequestResolver formRequestResolver,
+                              Ec2Service ec2Service) {
         this.iamService = iamService;
         this.formRequestResolver = formRequestResolver;
+        this.ec2Service = ec2Service;
     }
 
     public String build(String credentialScope, ContainerRequestContext ctx,
@@ -46,6 +51,7 @@ public class ResourceArnBuilder {
             case "ssm"            -> buildSsmArn(ctx, region, accountId);
             case "kms"            -> buildKmsArn(path, region, accountId);
             case "iam"            -> buildIamArn(ctx, accountId);
+            case "ec2"            -> buildEc2Arn(ctx, region, accountId);
             default               -> "*";
         };
     }
@@ -63,7 +69,18 @@ public class ResourceArnBuilder {
 
     public List<AuthorizationRequest> additionalAuthorizations(
             String action, String primaryResource, Map<String, List<String>> conditionContext) {
+        if ("ec2:CreateLaunchTemplate".equals(action) && hasRequestTags(conditionContext)) {
+            Map<String, List<String>> createTagsContext = new LinkedHashMap<>(conditionContext);
+            createTagsContext.put("ec2:CreateAction", List.of("CreateLaunchTemplate"));
+            return List.of(new AuthorizationRequest(
+                    "ec2:CreateTags", primaryResource, Map.copyOf(createTagsContext)));
+        }
         return List.of();
+    }
+
+    private static boolean hasRequestTags(Map<String, List<String>> conditionContext) {
+        return conditionContext != null && conditionContext.keySet().stream()
+                .anyMatch(key -> key.regionMatches(true, 0, "aws:RequestTag/", 0, 15));
     }
 
     public record AuthorizationRequest(
@@ -182,6 +199,31 @@ public class ResourceArnBuilder {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────────
+
+    private String buildEc2Arn(ContainerRequestContext ctx, String region, String accountId) {
+        String action = formRequestResolver.firstParameter(ctx, "Action");
+        if ("CreateLaunchTemplate".equals(action)) {
+            return AwsArnUtils.Arn.of("ec2", region, accountId,
+                    "launch-template/lt-00000000000000000").toString();
+        }
+        if (!"DeleteLaunchTemplate".equals(action)) {
+            return "*";
+        }
+        String id = formRequestResolver.firstParameter(ctx, "LaunchTemplateId");
+        String name = formRequestResolver.firstParameter(ctx, "LaunchTemplateName");
+        try {
+            String resolvedId = ec2Service.resolveLaunchTemplate(region, id, name).getLaunchTemplateId();
+            return AwsArnUtils.Arn.of(
+                    "ec2", region, accountId, "launch-template/" + resolvedId).toString();
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve EC2 launch template resource {0}: {1}",
+                    id != null ? id : name, e.getMessage());
+            return id == null || id.isBlank()
+                    ? "*"
+                    : AwsArnUtils.Arn.of(
+                            "ec2", region, accountId, "launch-template/" + id).toString();
+        }
+    }
 
     private String extractSegmentAfter(String path, String segment) {
         String marker = "/" + segment + "/";

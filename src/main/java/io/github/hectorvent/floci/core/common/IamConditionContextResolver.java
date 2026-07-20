@@ -1,9 +1,11 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MultivaluedMap;
+import org.jboss.logging.Logger;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -12,11 +14,16 @@ import java.util.Map;
 @ApplicationScoped
 public class IamConditionContextResolver {
 
+    private static final Logger LOG = Logger.getLogger(IamConditionContextResolver.class);
+
     private final AwsFormRequestResolver formRequestResolver;
+    private final Ec2Service ec2Service;
 
     @Inject
-    public IamConditionContextResolver(AwsFormRequestResolver formRequestResolver) {
+    public IamConditionContextResolver(AwsFormRequestResolver formRequestResolver,
+                                       Ec2Service ec2Service) {
         this.formRequestResolver = formRequestResolver;
+        this.ec2Service = ec2Service;
     }
 
     public Map<String, List<String>> resolve(String credentialScope, String action,
@@ -24,8 +31,66 @@ public class IamConditionContextResolver {
         return switch (credentialScope) {
             case "s3" -> s3ConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
+            case "ec2" -> ec2ConditionContext(action, ctx, region);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> ec2ConditionContext(
+            String action, ContainerRequestContext ctx, String region) {
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if (region != null && !region.isBlank()) {
+            conditions.put("aws:RequestedRegion", List.of(region));
+        }
+        if ("ec2:CreateLaunchTemplate".equals(action)) {
+            readLaunchTemplateRequestTags(ctx, conditions);
+        } else if ("ec2:DeleteLaunchTemplate".equals(action)) {
+            addLaunchTemplateResourceTags(ctx, region, conditions);
+        } else {
+            return null;
+        }
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    private void readLaunchTemplateRequestTags(
+            ContainerRequestContext ctx, Map<String, List<String>> conditions) {
+        for (int specification = 1; ; specification++) {
+            String prefix = "TagSpecification." + specification;
+            String resourceType = formRequestResolver.firstParameter(ctx, prefix + ".ResourceType");
+            if (resourceType == null) {
+                return;
+            }
+            if (!"launch-template".equals(resourceType)) {
+                continue;
+            }
+            for (int tag = 1; ; tag++) {
+                String tagPrefix = prefix + ".Tag." + tag;
+                String key = formRequestResolver.firstParameter(ctx, tagPrefix + ".Key");
+                if (key == null) {
+                    break;
+                }
+                String value = formRequestResolver.firstParameter(ctx, tagPrefix + ".Value");
+                if (value != null) {
+                    conditions.put("aws:RequestTag/" + key, List.of(value));
+                }
+            }
+        }
+    }
+
+    private void addLaunchTemplateResourceTags(
+            ContainerRequestContext ctx, String region, Map<String, List<String>> conditions) {
+        String id = formRequestResolver.firstParameter(ctx, "LaunchTemplateId");
+        String name = formRequestResolver.firstParameter(ctx, "LaunchTemplateName");
+        try {
+            ec2Service.resolveLaunchTemplate(region, id, name).getTags().forEach(tag -> {
+                if (tag.getKey() != null && tag.getValue() != null) {
+                    conditions.put("aws:ResourceTag/" + tag.getKey(), List.of(tag.getValue()));
+                }
+            });
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve EC2 launch template tags for {0}: {1}",
+                    id != null ? id : name, e.getMessage());
+        }
     }
 
     private Map<String, List<String>> iamConditionContext(String action, ContainerRequestContext ctx) {
