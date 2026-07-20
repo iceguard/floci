@@ -52,6 +52,7 @@ public class IamService implements SessionAccountLookup {
     private static final String DEFAULT_DEPLOYER_USER = "floci-deployer";
     private static final String DEFAULT_DEPLOYER_ACCESS_KEY_ID = "floci";
     private static final String DEFAULT_DEPLOYER_SECRET_ACCESS_KEY = "floci";
+    private static final int ROLE_INLINE_POLICY_SIZE_LIMIT = 10_240;
 
     private final StorageBackend<String, IamUser> users;
     private final StorageBackend<String, IamGroup> groups;
@@ -802,8 +803,30 @@ public class IamService implements SessionAccountLookup {
 
     public void putRolePolicy(String roleName, String policyName, String policyDocument) {
         IamRole role = getRole(roleName);
-        role.getInlinePolicies().put(policyName, policyDocument);
-        roles.put(roleName, role);
+        Map<String, String> inlinePolicies = role.getInlinePolicies();
+        synchronized (inlinePolicies) {
+            long aggregateSize = inlinePolicies.entrySet().stream()
+                    .filter(entry -> !entry.getKey().equals(policyName))
+                    .mapToLong(entry -> nonWhitespaceLength(entry.getValue()))
+                    .sum() + nonWhitespaceLength(policyDocument);
+            if (aggregateSize > ROLE_INLINE_POLICY_SIZE_LIMIT) {
+                throw new AwsException("LimitExceeded",
+                        "Maximum policy size of 10240 bytes exceeded for role " + roleName, 409);
+            }
+            inlinePolicies.put(policyName, policyDocument);
+            roles.put(roleName, role);
+        }
+    }
+
+    private static int nonWhitespaceLength(String policyDocument) {
+        int size = 0;
+        for (int i = 0; i < policyDocument.length(); i++) {
+            char character = policyDocument.charAt(i);
+            if (character != ' ' && character != '\t' && character != '\n' && character != '\r') {
+                size++;
+            }
+        }
+        return size;
     }
 
     public String getRolePolicy(String roleName, String policyName) {
