@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.ec2.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonSetter;
+import io.github.hectorvent.floci.services.ec2.Ec2UserData;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.util.ArrayList;
@@ -15,7 +17,7 @@ public class LaunchSpecification {
     private String keyName;
     private String subnetId;
     private List<GroupIdentifier> securityGroups = new ArrayList<>();
-    private String userData;
+    private String encodedUserData;
     private String iamInstanceProfileArn;
 
     public LaunchSpecification() {}
@@ -60,12 +62,19 @@ public class LaunchSpecification {
         this.securityGroups = securityGroups;
     }
 
-    public String getUserData() {
-        return userData;
+    public String getEncodedUserData() {
+        return encodedUserData;
     }
 
-    public void setUserData(String userData) {
-        this.userData = userData;
+    public void setEncodedUserData(String encodedUserData) {
+        this.encodedUserData = encodedUserData;
+    }
+
+    @JsonSetter("userData")
+    public void setLegacyUserData(String userData) {
+        if (encodedUserData == null && userData != null) {
+            encodedUserData = Ec2UserData.fromText(userData).encoded();
+        }
     }
 
     public String getIamInstanceProfileArn() {
