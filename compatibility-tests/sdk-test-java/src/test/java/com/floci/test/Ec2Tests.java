@@ -287,6 +287,30 @@ class Ec2Tests {
     }
 
     @Test
+    @Order(6)
+    @DisplayName("DescribeImages - stock Ubuntu arm64 lookup is unique")
+    void describeImagesReturnsUniqueStockUbuntuArm64CloudGuest() {
+        DescribeImagesResponse response = ec2.describeImages(DescribeImagesRequest.builder()
+                .owners("099720109477")
+                .filters(
+                        Filter.builder()
+                                .name("name")
+                                .values("ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*")
+                                .build(),
+                        Filter.builder().name("architecture").values("arm64").build(),
+                        Filter.builder().name("state").values("available").build())
+                .build());
+
+        assertThat(response.images()).singleElement().satisfies(image -> {
+            assertThat(image.imageId()).isEqualTo("ami-ubuntu2404-arm64");
+            assertThat(image.name()).isEqualTo(
+                    "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-20260615");
+            assertThat(image.ownerId()).isEqualTo("099720109477");
+            assertThat(image.architecture()).isEqualTo(ArchitectureValues.ARM64);
+        });
+    }
+
+    @Test
     @Order(7)
     @DisplayName("DescribeLaunchTemplateVersions - user data readback")
     void describeLaunchTemplateVersionsReturnsEncodedUserData() {

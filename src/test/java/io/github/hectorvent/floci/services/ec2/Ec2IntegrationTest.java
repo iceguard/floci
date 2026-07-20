@@ -239,10 +239,11 @@ class Ec2IntegrationTest {
         .then()
             .statusCode(200)
             .contentType("application/xml")
-            .body("DescribeImagesResponse.imagesSet.item.size()", equalTo(2))
-            .body("DescribeImagesResponse.imagesSet.item.imageId",
-                    containsInAnyOrder("ami-ubuntu2404-arm64", "ami-ubuntu2404-cloud-arm64"))
-            .body("DescribeImagesResponse.imagesSet.item.architecture", everyItem(equalTo("arm64")));
+            .body("DescribeImagesResponse.imagesSet.item.size()", equalTo(1))
+            .body("DescribeImagesResponse.imagesSet.item.imageId", equalTo("ami-ubuntu2404-arm64"))
+            .body("DescribeImagesResponse.imagesSet.item.name",
+                    equalTo("ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-20260615"))
+            .body("DescribeImagesResponse.imagesSet.item.architecture", equalTo("arm64"));
     }
 
     @Test
