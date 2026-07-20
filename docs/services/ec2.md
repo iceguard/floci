@@ -29,9 +29,8 @@ metadata.
 | `ami-0abcdef1234567891` | `ami-amazonlinux2023` | `public.ecr.aws/amazonlinux/amazonlinux:2023` |
 | `ami-0abcdef1234567892` | `ami-ubuntu2004` | `public.ecr.aws/docker/library/ubuntu:20.04` |
 | `ami-ubuntu2204` | | `public.ecr.aws/docker/library/ubuntu:22.04` |
-| `ami-ubuntu2404-arm64` | `ami-ubuntu2404` | `public.ecr.aws/docker/library/ubuntu:24.04` |
+| `ami-ubuntu2404-arm64` | `ami-ubuntu2404`, `ami-ubuntu2404-cloud-arm64`, `ami-ubuntu2404-cloud` | `floci/ami-ubuntu:24.04-arm64-sha256-15188696da114a3ffd3d3554f5858a0c3ac257933656e85feb4e0e83ad542b4a` |
 | `ami-ubuntu2404-amd64` | | `public.ecr.aws/docker/library/ubuntu:24.04` |
-| `ami-ubuntu2404-cloud-arm64` | `ami-ubuntu2404-cloud` | `floci/ami-ubuntu:24.04-arm64` |
 | `ami-debian12` | | `public.ecr.aws/docker/library/debian:12` |
 | `ami-alpine` | | `public.ecr.aws/docker/library/alpine:latest` |
 | `ami-0abcdef1234567893` | | `public.ecr.aws/amazonlinux/amazonlinux:2023` |
@@ -40,17 +39,11 @@ Any unrecognized AMI ID (including real AWS AMI IDs like `ami-0abc12345678`) fal
 
 ### Cloud-image-derived AMI guests
 
-The `ami-ubuntu2404-cloud` entry is an experimental Ubuntu 24.04 guest image built from Canonical cloud-image artifacts, not from the Docker-library `ubuntu:24.04` image. It is intended for EC2 workflows that need packages such as `systemd` and `cloud-init` to match a real Ubuntu cloud image more closely.
-
-This mode is opt-in by AMI selection, not by a global configuration switch.
-Existing catalog entries, including `ami-ubuntu2404`, keep their current
-Docker-library image mapping and default `tail -f /dev/null` container
-lifecycle. The cloud-image-derived entry is a separate AMI ID and alias, so
-`DescribeImages` can advertise it while existing callers continue to get the
-old behavior unless they choose `ami-ubuntu2404-cloud-arm64` or the
-`ami-ubuntu2404-cloud` alias.
+The advertised Canonical Ubuntu 24.04 ARM64 AMI is built from Canonical cloud-image artifacts, not from the Docker-library `ubuntu:24.04` image. `DescribeImages` publishes one stock Canonical record, while `ami-ubuntu2404-cloud-arm64` and `ami-ubuntu2404-cloud` remain resolver aliases for callers that used the former separate cloud record.
 
 The Java metadata-driven builder lives at `io.github.hectorvent.floci.tools.ami.AmiImageTool`. Its recipe is checked in at `docker/ec2/ami-images/image-build-metadata.yaml`, and generated context/provenance defaults to `target/ami-images/<image-id>/`.
+
+The recipe pins Canonical's immutable `release-20260615` directory and verifies both the root filesystem and manifest SHA-256 digests. The Docker tag contains the complete rootfs content address. Generated labels record the source URL, Ubuntu version, artifact creation date, Canonical release serial, rootfs and manifest digests, and expected cloud-init version. Build and smoke operations explicitly target `linux/arm64`; hosts of another architecture require Docker binfmt/QEMU support.
 
 ```bash
 ./mvnw -q -DskipTests compile exec:java \
