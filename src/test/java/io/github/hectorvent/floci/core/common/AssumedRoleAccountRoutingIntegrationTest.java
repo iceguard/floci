@@ -37,11 +37,13 @@ class AssumedRoleAccountRoutingIntegrationTest {
     @Test
     void assumedRoleCredentialsRouteResourcesToTargetAccount() {
         String tableName = "routing-" + UUID.randomUUID().toString().substring(0, 8);
+        String roleName = "CrossAccountAccess" + UUID.randomUUID().toString().substring(0, 8);
+        createRole(roleName);
 
         // 1. Account A assumes a role in account B and receives temporary credentials.
-        String tempAccessKeyId = given()
+        io.restassured.path.xml.XmlPath assumeRole = given()
                 .formParam("Action", "AssumeRole")
-                .formParam("RoleArn", "arn:aws:iam::" + ACCOUNT_B + ":role/CrossAccountAccess")
+                .formParam("RoleArn", "arn:aws:iam::" + ACCOUNT_B + ":role/" + roleName)
                 .formParam("RoleSessionName", "routing-session")
                 .header("Authorization", auth(ACCOUNT_A, "sts"))
             .when()
@@ -50,22 +52,34 @@ class AssumedRoleAccountRoutingIntegrationTest {
                 .statusCode(200)
                 .body("AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId", startsWith("ASIA"))
                 .extract()
-                .path("AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId");
+                .xmlPath();
+        String tempAccessKeyId = assumeRole.getString(
+                "AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId");
+        String sessionToken = assumeRole.getString(
+                "AssumeRoleResponse.AssumeRoleResult.Credentials.SessionToken");
+        String assumedRoleId = assumeRole.getString(
+                "AssumeRoleResponse.AssumeRoleResult.AssumedRoleUser.AssumedRoleId");
 
         // 2. GetCallerIdentity with the temporary credentials resolves to account B.
         given()
                 .formParam("Action", "GetCallerIdentity")
                 .header("Authorization", auth(tempAccessKeyId, "sts"))
+                .header("X-Amz-Security-Token", sessionToken)
             .when()
                 .post("/")
             .then()
                 .statusCode(200)
-                .body("GetCallerIdentityResponse.GetCallerIdentityResult.Account", equalTo(ACCOUNT_B));
+                .body("GetCallerIdentityResponse.GetCallerIdentityResult.Account", equalTo(ACCOUNT_B))
+                .body("GetCallerIdentityResponse.GetCallerIdentityResult.Arn",
+                        equalTo("arn:aws:sts::" + ACCOUNT_B
+                                + ":assumed-role/" + roleName + "/routing-session"))
+                .body("GetCallerIdentityResponse.GetCallerIdentityResult.UserId", equalTo(assumedRoleId));
 
         // 3. Create a DynamoDB table using the temporary credentials. Its ARN must carry account B.
         given()
                 .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
                 .header("Authorization", auth(tempAccessKeyId, "dynamodb"))
+                .header("X-Amz-Security-Token", sessionToken)
                 .contentType(DYNAMODB_CONTENT_TYPE)
                 .body("""
                     {
@@ -87,6 +101,59 @@ class AssumedRoleAccountRoutingIntegrationTest {
 
         // 5. Account A does not — the resource is isolated to account B.
         listTables(ACCOUNT_A).body("TableNames", not(hasItem(tableName)));
+    }
+
+    @Test
+    void presignedTemporaryCredentialsRouteWithQuerySessionToken() {
+        String tableName = "presigned-routing-" + UUID.randomUUID().toString().substring(0, 8);
+        String roleName = "CrossAccountAccess" + UUID.randomUUID().toString().substring(0, 8);
+        createRole(roleName);
+        io.restassured.path.xml.XmlPath assumeRole = given()
+                .formParam("Action", "AssumeRole")
+                .formParam("RoleArn", "arn:aws:iam::" + ACCOUNT_B + ":role/" + roleName)
+                .formParam("RoleSessionName", "presigned-routing-session")
+                .header("Authorization", auth(ACCOUNT_A, "sts"))
+            .when().post("/")
+            .then().statusCode(200).extract().xmlPath();
+        String prefix = "AssumeRoleResponse.AssumeRoleResult.Credentials.";
+        String accessKeyId = assumeRole.getString(prefix + "AccessKeyId");
+        String sessionToken = assumeRole.getString(prefix + "SessionToken");
+
+        given()
+                .queryParam("X-Amz-Credential", accessKeyId + "/20260215/" + REGION
+                        + "/dynamodb/aws4_request")
+                .queryParam("X-Amz-Security-Token", sessionToken)
+                .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+                .contentType(DYNAMODB_CONTENT_TYPE)
+                .body("""
+                    {"TableName":"%s","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                     "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+                     "BillingMode":"PAY_PER_REQUEST"}
+                    """.formatted(tableName))
+            .when().post("/")
+            .then().statusCode(200)
+                .body("TableDescription.TableArn",
+                        equalTo("arn:aws:dynamodb:" + REGION + ":" + ACCOUNT_B + ":table/" + tableName));
+
+        given()
+                .queryParam("X-Amz-Credential", accessKeyId + "/20260215/" + REGION
+                        + "/dynamodb/aws4_request")
+                .queryParam("X-Amz-Security-Token", "wrong-token")
+                .header("X-Amz-Target", "DynamoDB_20120810.ListTables")
+                .contentType(DYNAMODB_CONTENT_TYPE).body("{}")
+            .when().post("/")
+            .then().statusCode(403).body("__type", equalTo("InvalidClientTokenId"));
+    }
+
+    private static void createRole(String roleName) {
+        given()
+                .formParam("Action", "CreateRole")
+                .formParam("RoleName", roleName)
+                .formParam("Path", "/")
+                .formParam("AssumeRolePolicyDocument", "{}")
+                .header("Authorization", auth(ACCOUNT_B, "iam"))
+            .when().post("/")
+            .then().statusCode(200);
     }
 
     private static io.restassured.response.ValidatableResponse listTables(String account) {
