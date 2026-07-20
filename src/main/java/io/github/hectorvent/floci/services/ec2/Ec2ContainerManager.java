@@ -23,6 +23,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
+import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream;
 import org.jboss.logging.Logger;
 
 import java.io.ByteArrayInputStream;
@@ -228,7 +229,7 @@ public class Ec2ContainerManager {
                         ? Ec2UserData.fromEncoded(instance.getEncodedUserData())
                         : Ec2UserData.fromText(instance.getUserData());
                 if (userData != null && userData.bytes().length > 0) {
-                    executeUserData(containerId, instanceId, userData.utf8Text(), region);
+                    executeUserData(containerId, instanceId, userDataExecutionText(userData), region);
                 }
 
             } catch (InterruptedException e) {
@@ -592,6 +593,23 @@ public class Ec2ContainerManager {
             }
         }
         return List.copyOf(scripts);
+    }
+
+    static String userDataExecutionText(Ec2UserData userData) {
+        byte[] bytes = userData.bytes();
+        if (bytes.length < 2 || bytes[0] != 0x1f || bytes[1] != (byte) 0x8b) {
+            return userData.utf8Text();
+        }
+
+        try (GzipCompressorInputStream gzip = GzipCompressorInputStream.builder()
+                .setInputStream(new ByteArrayInputStream(bytes))
+                .setDecompressConcatenated(true)
+                .get()) {
+            return new String(gzip.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            LOG.debugv("UserData has an invalid gzip payload; preserving prior execution materialization ({0} bytes)", bytes.length);
+            return userData.utf8Text();
+        }
     }
 
     private static boolean hasShellscriptContentType(String headers) {
