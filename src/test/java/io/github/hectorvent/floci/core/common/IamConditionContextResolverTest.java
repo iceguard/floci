@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.services.autoscaling.AutoScalingService;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
@@ -17,7 +18,8 @@ import static org.mockito.Mockito.when;
 class IamConditionContextResolverTest {
 
     private final IamConditionContextResolver resolver =
-            new IamConditionContextResolver(new AwsFormRequestResolver());
+            new IamConditionContextResolver(
+                    new AwsFormRequestResolver(), mock(AutoScalingService.class));
 
     @Test
     void resolvesS3ListBucketQueryConditionContext() {
