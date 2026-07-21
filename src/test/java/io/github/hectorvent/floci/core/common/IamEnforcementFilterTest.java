@@ -159,7 +159,8 @@ class IamEnforcementFilterTest {
 
         IamEnforcementFilter filter = new IamEnforcementFilter(
                 config, accountResolver, iamService, evaluator, actionRegistry, arnBuilder,
-                requestContext, conditionContextResolver);
+                requestContext, conditionContextResolver,
+                mock(CloudTrailService.class), mock(io.quarkus.vertx.http.runtime.CurrentVertxRequest.class));
 
         filter.filter(containerRequest);
 
@@ -183,7 +184,8 @@ class IamEnforcementFilterTest {
 
         IamEnforcementFilter filter = new IamEnforcementFilter(
                 config, accountResolver, iamService, evaluator, actionRegistry, arnBuilder,
-                requestContext, conditionContextResolver);
+                requestContext, conditionContextResolver,
+                mock(CloudTrailService.class), mock(io.quarkus.vertx.http.runtime.CurrentVertxRequest.class));
 
         filter.filter(containerRequest);
 
@@ -209,7 +211,8 @@ class IamEnforcementFilterTest {
 
         IamEnforcementFilter filter = new IamEnforcementFilter(
                 config, accountResolver, iamService, evaluator, actionRegistry, arnBuilder,
-                requestContext, conditionContextResolver);
+                requestContext, conditionContextResolver,
+                mock(CloudTrailService.class), mock(io.quarkus.vertx.http.runtime.CurrentVertxRequest.class));
 
         filter.filter(containerRequest);
 
