@@ -87,6 +87,86 @@ public class ResourceArnBuilder {
         };
     }
 
+    public List<String> additionalResources(String credentialScope, ContainerRequestContext ctx,
+                                            String region, String accountId) {
+        if (!"kms".equals(credentialScope) || !isKmsAction(ctx, "CreateAlias")) {
+            return List.of();
+        }
+        String targetKeyId = jsonRequestResolver.firstTextField(ctx, "TargetKeyId");
+        return targetKeyId == null || targetKeyId.isBlank()
+                ? List.of()
+                : List.of(resolveKmsKeyArn(targetKeyId, region, accountId));
+    }
+
+    public List<AuthorizationRequest> additionalAuthorizations(
+            String action, String primaryResource, Map<String, List<String>> conditionContext) {
+        if ("autoscaling:CreateOrUpdateTags".equals(action)
+                && conditionContext instanceof ResourceAwareConditionContext resourceAware) {
+            return resourceAware.additionalResources().stream()
+                    .map(resource -> new AuthorizationRequest(
+                            action, resource.resourceArn(), resource.conditionContext()))
+                    .toList();
+        }
+        if ("ec2:CreateLaunchTemplate".equals(action) && hasRequestTags(conditionContext)) {
+            Map<String, List<String>> createTagsContext = new LinkedHashMap<>(conditionContext);
+            createTagsContext.put("ec2:CreateAction", List.of("CreateLaunchTemplate"));
+            return List.of(new AuthorizationRequest(
+                    "ec2:CreateTags", primaryResource, Map.copyOf(createTagsContext)));
+        }
+        if (!hasRequestTags(conditionContext)) {
+            return List.of();
+        }
+        Map<String, List<String>> addTagsContext = new LinkedHashMap<>(conditionContext);
+        if ("elasticloadbalancing:CreateTargetGroup".equals(action)) {
+            addTagsContext.put("elasticloadbalancing:CreateAction", List.of("CreateTargetGroup"));
+            return List.of(new AuthorizationRequest(
+                    "elasticloadbalancing:AddTags", primaryResource, Map.copyOf(addTagsContext)));
+        }
+        if ("elasticloadbalancing:CreateListener".equals(action)) {
+            addTagsContext.put("elasticloadbalancing:CreateAction", List.of("CreateListener"));
+            return List.of(new AuthorizationRequest(
+                    "elasticloadbalancing:AddTags",
+                    futureListenerArn(primaryResource),
+                    Map.copyOf(addTagsContext)));
+        }
+        return List.of();
+    }
+
+    private String buildEc2Arn(ContainerRequestContext ctx, String region, String accountId) {
+        String action = formRequestResolver.firstParameter(ctx, "Action");
+        if ("CreateLaunchTemplate".equals(action)) {
+            return AwsArnUtils.Arn.of("ec2", region, accountId,
+                    "launch-template/lt-00000000000000000").toString();
+        }
+        if (!"CreateLaunchTemplateVersion".equals(action)
+                && !"ModifyLaunchTemplate".equals(action)
+                && !"DeleteLaunchTemplate".equals(action)) {
+            return "*";
+        }
+        String id = formRequestResolver.firstParameter(ctx, "LaunchTemplateId");
+        String name = formRequestResolver.firstParameter(ctx, "LaunchTemplateName");
+        try {
+            String resolvedId = ec2Service.resolveLaunchTemplate(region, id, name).getLaunchTemplateId();
+            return AwsArnUtils.Arn.of(
+                    "ec2", region, accountId, "launch-template/" + resolvedId).toString();
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve EC2 launch template resource {0}: {1}",
+                    id != null ? id : name, e.getMessage());
+            return id == null || id.isBlank()
+                    ? "*"
+                    : AwsArnUtils.Arn.of(
+                             "ec2", region, accountId, "launch-template/" + id).toString();
+        }
+    }
+
+    private static boolean hasRequestTags(Map<String, List<String>> conditionContext) {
+        return conditionContext != null && conditionContext.keySet().stream()
+                .anyMatch(key -> key.regionMatches(true, 0, "aws:RequestTag/", 0, 15));
+    }
+
+    public record AuthorizationRequest(
+            String action, String resource, Map<String, List<String>> conditionContext) {}
+
     public List<AuthorizationRequest> resourceAuthorizations(
             String credentialScope, String action, ContainerRequestContext ctx,
             String region, String accountId) {
@@ -177,86 +257,6 @@ public class ResourceArnBuilder {
     private static boolean awsOwnedDocument(String documentName) {
         return documentName.startsWith("AWS-") || documentName.startsWith("Amazon-");
     }
-
-    public List<String> additionalResources(String credentialScope, ContainerRequestContext ctx,
-                                            String region, String accountId) {
-        if (!"kms".equals(credentialScope) || !isKmsAction(ctx, "CreateAlias")) {
-            return List.of();
-        }
-        String targetKeyId = jsonRequestResolver.firstTextField(ctx, "TargetKeyId");
-        return targetKeyId == null || targetKeyId.isBlank()
-                ? List.of()
-                : List.of(resolveKmsKeyArn(targetKeyId, region, accountId));
-    }
-
-    public List<AuthorizationRequest> additionalAuthorizations(
-            String action, String primaryResource, Map<String, List<String>> conditionContext) {
-        if ("autoscaling:CreateOrUpdateTags".equals(action)
-                && conditionContext instanceof ResourceAwareConditionContext resourceAware) {
-            return resourceAware.additionalResources().stream()
-                    .map(resource -> new AuthorizationRequest(
-                            action, resource.resourceArn(), resource.conditionContext()))
-                    .toList();
-        }
-        if ("ec2:CreateLaunchTemplate".equals(action) && hasRequestTags(conditionContext)) {
-            Map<String, List<String>> createTagsContext = new LinkedHashMap<>(conditionContext);
-            createTagsContext.put("ec2:CreateAction", List.of("CreateLaunchTemplate"));
-            return List.of(new AuthorizationRequest(
-                    "ec2:CreateTags", primaryResource, Map.copyOf(createTagsContext)));
-        }
-        if (!hasRequestTags(conditionContext)) {
-            return List.of();
-        }
-        Map<String, List<String>> addTagsContext = new LinkedHashMap<>(conditionContext);
-        if ("elasticloadbalancing:CreateTargetGroup".equals(action)) {
-            addTagsContext.put("elasticloadbalancing:CreateAction", List.of("CreateTargetGroup"));
-            return List.of(new AuthorizationRequest(
-                    "elasticloadbalancing:AddTags", primaryResource, Map.copyOf(addTagsContext)));
-        }
-        if ("elasticloadbalancing:CreateListener".equals(action)) {
-            addTagsContext.put("elasticloadbalancing:CreateAction", List.of("CreateListener"));
-            return List.of(new AuthorizationRequest(
-                    "elasticloadbalancing:AddTags",
-                    futureListenerArn(primaryResource),
-                    Map.copyOf(addTagsContext)));
-        }
-        return List.of();
-    }
-
-    private String buildEc2Arn(ContainerRequestContext ctx, String region, String accountId) {
-        String action = formRequestResolver.firstParameter(ctx, "Action");
-        if ("CreateLaunchTemplate".equals(action)) {
-            return AwsArnUtils.Arn.of("ec2", region, accountId,
-                    "launch-template/lt-00000000000000000").toString();
-        }
-        if (!"CreateLaunchTemplateVersion".equals(action)
-                && !"ModifyLaunchTemplate".equals(action)
-                && !"DeleteLaunchTemplate".equals(action)) {
-            return "*";
-        }
-        String id = formRequestResolver.firstParameter(ctx, "LaunchTemplateId");
-        String name = formRequestResolver.firstParameter(ctx, "LaunchTemplateName");
-        try {
-            String resolvedId = ec2Service.resolveLaunchTemplate(region, id, name).getLaunchTemplateId();
-            return AwsArnUtils.Arn.of(
-                    "ec2", region, accountId, "launch-template/" + resolvedId).toString();
-        } catch (AwsException e) {
-            LOG.debugv("Unable to resolve EC2 launch template resource {0}: {1}",
-                    id != null ? id : name, e.getMessage());
-            return id == null || id.isBlank()
-                    ? "*"
-                    : AwsArnUtils.Arn.of(
-                             "ec2", region, accountId, "launch-template/" + id).toString();
-        }
-    }
-
-    private static boolean hasRequestTags(Map<String, List<String>> conditionContext) {
-        return conditionContext != null && conditionContext.keySet().stream()
-                .anyMatch(key -> key.regionMatches(true, 0, "aws:RequestTag/", 0, 15));
-    }
-
-    public record AuthorizationRequest(
-            String action, String resource, Map<String, List<String>> conditionContext) {}
 
     // ── S3 ──────────────────────────────────────────────────────────────────────
     private String buildS3Arn(String path) {
@@ -364,23 +364,6 @@ public class ResourceArnBuilder {
         return AwsArnUtils.Arn.of("kms", region, accountId, "key/" + keyId).toString();
     }
 
-    private boolean isKmsAction(ContainerRequestContext ctx, String action) {
-        String target = ctx.getHeaderString("X-Amz-Target");
-        return target != null && target.endsWith("." + action);
-    }
-
-    private String resolveKmsKeyArn(String keyId, String region, String accountId) {
-        try {
-            return kmsService.describeKey(keyId, region).getArn();
-        } catch (AwsException e) {
-            LOG.debugv("Unable to resolve KMS key resource {0}: {1}", keyId, e.getMessage());
-            if (keyId.startsWith("arn:")) {
-                return keyId;
-            }
-            return AwsArnUtils.Arn.of("kms", region, accountId, "key/" + keyId).toString();
-        }
-    }
-
     // ── IAM ─────────────────────────────────────────────────────────────────────
     private String buildIamArn(ContainerRequestContext ctx, String accountId) {
         String action = formRequestResolver.firstParameter(ctx, "Action");
@@ -441,18 +424,20 @@ public class ResourceArnBuilder {
         }
     }
 
-    private String existingInstanceProfileArn(ContainerRequestContext ctx, String accountId) {
-        String instanceProfileName = formRequestResolver.firstParameter(ctx, "InstanceProfileName");
-        if (instanceProfileName == null || instanceProfileName.isBlank()) {
-            return "*";
-        }
+    private boolean isKmsAction(ContainerRequestContext ctx, String action) {
+        String target = ctx.getHeaderString("X-Amz-Target");
+        return target != null && target.endsWith("." + action);
+    }
+
+    private String resolveKmsKeyArn(String keyId, String region, String accountId) {
         try {
-            return iamService.getInstanceProfile(instanceProfileName).getArn();
+            return kmsService.describeKey(keyId, region).getArn();
         } catch (AwsException e) {
-            LOG.debugv("Unable to resolve IAM instance profile resource {0}: {1}",
-                    instanceProfileName, e.getMessage());
-            return AwsArnUtils.Arn.of(
-                    "iam", "", accountId, "instance-profile/" + instanceProfileName).toString();
+            LOG.debugv("Unable to resolve KMS key resource {0}: {1}", keyId, e.getMessage());
+            if (keyId.startsWith("arn:")) {
+                return keyId;
+            }
+            return AwsArnUtils.Arn.of("kms", region, accountId, "key/" + keyId).toString();
         }
     }
 
@@ -563,7 +548,9 @@ public class ResourceArnBuilder {
             return exactAutoScalingGroupArn(
                     formRequestResolver.firstParameter(ctx, "Tags.member.1.ResourceId"), region, accountId);
         }
-        if ("DeleteAutoScalingGroup".equals(action)
+        if ("UpdateAutoScalingGroup".equals(action)
+                || "StartInstanceRefresh".equals(action)
+                || "DeleteAutoScalingGroup".equals(action)
                 || "PutLifecycleHook".equals(action)
                 || "DeleteLifecycleHook".equals(action)
                 || "PutScalingPolicy".equals(action)
@@ -592,6 +579,21 @@ public class ResourceArnBuilder {
                 : AwsArnUtils.Arn.of("autoscaling", region, accountId,
                         "autoScalingGroup:00000000-0000-0000-0000-000000000000:"
                                 + "autoScalingGroupName/" + name).toString();
+    }
+
+    private String existingInstanceProfileArn(ContainerRequestContext ctx, String accountId) {
+        String instanceProfileName = formRequestResolver.firstParameter(ctx, "InstanceProfileName");
+        if (instanceProfileName == null || instanceProfileName.isBlank()) {
+            return "*";
+        }
+        try {
+            return iamService.getInstanceProfile(instanceProfileName).getArn();
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve IAM instance profile resource {0}: {1}",
+                    instanceProfileName, e.getMessage());
+            return AwsArnUtils.Arn.of(
+                    "iam", "", accountId, "instance-profile/" + instanceProfileName).toString();
+        }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────────

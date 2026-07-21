@@ -19,15 +19,15 @@ import static org.mockito.Mockito.when;
 class IamConditionContextResolverTest {
 
     private final IamConditionContextResolver resolver =
-            new IamConditionContextResolver(
-                    new AwsFormRequestResolver(),
-                    new AwsJsonRequestResolver(new ObjectMapper()),
-                    mock(KmsService.class),
-                    null,
-                    null,
-                    null,
-                    null,
-                    null);
+             new IamConditionContextResolver(
+                     new AwsFormRequestResolver(),
+                     new AwsJsonRequestResolver(new ObjectMapper()),
+                     mock(KmsService.class),
+                     null,
+                     null,
+                     null,
+                     null,
+                     null);
 
     @Test
     void resolvesS3ListBucketQueryConditionContext() {
