@@ -28,6 +28,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.anyList;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.eq;
@@ -222,6 +223,171 @@ class AutoScalingReconcilerTest {
         verify(fixture.asgService()).failInstanceRefresh(
                 eq(fixture.refresh()), org.mockito.ArgumentMatchers.contains("deregistration denied"),
                 eq(Instant.parse("2026-07-19T12:00:00Z")));
+    }
+
+    @Test
+    void autoRollbackRestoresPartialRefreshMemberIdentityAndGroupSource() {
+        RefreshFixture fixture = refreshFixture(2, 100, 100, 0);
+        fixture.refresh().setAutoRollback(true);
+        Reservation firstForward = reservation("i-forward-1", null);
+        when(fixture.ec2Service().runInstancesWithUserData(
+                eq("us-east-1"), eq("ami-refresh"), eq("t3.small"), eq(1), eq(1),
+                eq(null), eq(List.of()), eq(null), anyString(), eq(List.of()),
+                isNull(Ec2UserData.class), eq(null)))
+                .thenReturn(firstForward)
+                .thenThrow(new IllegalStateException("forward capacity unavailable"));
+        when(fixture.ec2Service().runInstancesWithUserData(
+                eq("us-east-1"), eq("ami-source"), eq("t3.micro"), eq(1), eq(1),
+                eq(null), eq(List.of()), eq(null), anyString(), eq(List.of()),
+                isNull(Ec2UserData.class), eq(null)))
+                .thenReturn(reservation("i-rollback-1", null));
+
+        fixture.reconciler().reconcile(fixture.asg());
+        AsgInstance forward = fixture.asg().getInstances().stream()
+                .filter(instance -> "i-forward-1".equals(instance.getInstanceId()))
+                .findFirst().orElseThrow();
+        forward.setLifecycleState("InService");
+        when(fixture.ec2Service().isInstanceContainerRunning("i-forward-1")).thenReturn(true);
+        fixture.reconciler().reconcile(fixture.asg());
+        fixture.reconciler().reconcile(fixture.asg());
+        fixture.reconciler().reconcile(fixture.asg());
+
+        assertEquals("RollbackInProgress", fixture.refresh().getStatus());
+        assertTrue(fixture.refresh().getRollbackReason().contains("forward capacity unavailable"));
+        assertEquals(1, fixture.refresh().getInstancesToUpdateOnRollback());
+        assertEquals("1", fixture.asg().getLaunchTemplateVersion());
+
+        fixture.reconciler().reconcile(fixture.asg());
+        AsgInstance rollback = fixture.asg().getInstances().stream()
+                .filter(instance -> "i-rollback-1".equals(instance.getInstanceId()))
+                .findFirst().orElseThrow();
+        rollback.setLifecycleState("InService");
+        when(fixture.ec2Service().isInstanceContainerRunning("i-rollback-1")).thenReturn(true);
+        fixture.reconciler().reconcile(fixture.asg());
+        fixture.reconciler().reconcile(fixture.asg());
+        fixture.reconciler().reconcile(fixture.asg());
+
+        assertEquals("RollbackSuccessful", fixture.refresh().getStatus());
+        assertEquals(100, fixture.refresh().getPercentageCompleteOnRollback());
+        assertEquals(0, fixture.refresh().getInstancesToUpdateOnRollback());
+        assertEquals(2, fixture.asg().getInstances().size());
+        assertTrue(fixture.asg().getInstances().stream()
+                .allMatch(instance -> "1".equals(instance.getLaunchTemplateVersion())));
+        assertTrue(fixture.asg().getInstances().stream()
+                .noneMatch(instance -> "i-forward-1".equals(instance.getInstanceId())));
+        assertEquals(2, fixture.asg().getDesiredCapacity());
+        assertEquals("lt-source", fixture.asg().getLaunchTemplateId());
+        assertEquals("1", fixture.asg().getLaunchTemplateVersion());
+        verify(fixture.ec2Service()).terminateInstances("us-east-1", List.of("i-original"));
+        verify(fixture.ec2Service()).terminateInstances("us-east-1", List.of("i-forward-1"));
+    }
+
+    @Test
+    void rollbackLaunchFailureIsTerminalAndDoesNotLeakAMember() {
+        RefreshFixture fixture = refreshFixture(1, 100, 100, 0);
+        fixture.refresh().setAutoRollback(true);
+        fixture.refresh().setStatus("RollbackInProgress");
+        fixture.refresh().setRollbackReason("forward failure");
+        fixture.refresh().setRollbackStartTime(Instant.parse("2026-07-19T11:55:00Z"));
+        InstanceRefreshReplacement pair = fixture.refresh().getReplacements().getFirst();
+        pair.setPhase("Completed");
+        pair.setReplacementInstanceId("i-forward");
+        pair.setRollbackPhase("Pending");
+        fixture.asg().getInstances().clear();
+        AsgInstance forward = instance("i-forward", "InService");
+        forward.setLaunchTemplateId("lt-refresh");
+        forward.setLaunchTemplateVersion("2");
+        fixture.asg().getInstances().add(forward);
+        when(fixture.ec2Service().isInstanceContainerRunning("i-forward")).thenReturn(true);
+        when(fixture.ec2Service().runInstancesWithUserData(
+                eq("us-east-1"), eq("ami-source"), eq("t3.micro"), eq(1), eq(1),
+                eq(null), eq(List.of()), eq(null), anyString(), eq(List.of()),
+                isNull(Ec2UserData.class), eq(null)))
+                .thenThrow(new IllegalStateException("rollback capacity unavailable"));
+
+        fixture.reconciler().reconcile(fixture.asg());
+
+        assertEquals("RollbackFailed", fixture.refresh().getStatus());
+        assertTrue(fixture.refresh().getRollbackFailureReason().contains("rollback capacity unavailable"));
+        assertEquals(List.of("i-forward"), fixture.asg().getInstances().stream()
+                .map(AsgInstance::getInstanceId).toList());
+        assertEquals(null, pair.getRollbackReplacementInstanceId());
+    }
+
+    @Test
+    void rollbackReadinessFailureCleansUpLaunchedRollbackMember() {
+        RefreshFixture fixture = refreshFixture(1, 100, 100, 0);
+        fixture.refresh().setAutoRollback(true);
+        fixture.refresh().setStatus("RollbackInProgress");
+        fixture.refresh().setRollbackReason("forward failure");
+        fixture.refresh().setRollbackStartTime(Instant.parse("2026-07-19T11:55:00Z"));
+        InstanceRefreshReplacement pair = fixture.refresh().getReplacements().getFirst();
+        pair.setPhase("Completed");
+        pair.setReplacementInstanceId("i-forward");
+        pair.setRollbackPhase("Pending");
+        pair.setRollbackReplacementInstanceId("i-rollback");
+        fixture.asg().getInstances().clear();
+        AsgInstance forward = instance("i-forward", "InService");
+        forward.setLaunchTemplateId("lt-refresh");
+        forward.setLaunchTemplateVersion("2");
+        AsgInstance rollback = instance("i-rollback", "InService");
+        rollback.setLaunchTemplateId("lt-source");
+        rollback.setLaunchTemplateVersion("1");
+        fixture.asg().getInstances().addAll(List.of(forward, rollback));
+        String targetGroupArn = "arn:aws:elasticloadbalancing:us-east-1:000000000000:targetgroup/app/123";
+        fixture.asg().setTargetGroupARNs(List.of(targetGroupArn));
+        when(fixture.ec2Service().isInstanceContainerRunning("i-forward")).thenReturn(true);
+        when(fixture.ec2Service().isInstanceContainerRunning("i-rollback")).thenReturn(true);
+        TargetHealth unhealthy = targetHealth("i-rollback");
+        unhealthy.setState("unhealthy");
+        when(fixture.elbV2Service().describeTargetHealth("us-east-1", targetGroupArn, List.of()))
+                .thenReturn(List.of(unhealthy));
+
+        fixture.reconciler().reconcile(fixture.asg());
+
+        assertEquals("RollbackFailed", fixture.refresh().getStatus());
+        assertTrue(fixture.refresh().getRollbackFailureReason().contains("is unhealthy"));
+        assertEquals(List.of("i-forward"), fixture.asg().getInstances().stream()
+                .map(AsgInstance::getInstanceId).toList());
+        assertEquals(null, pair.getRollbackReplacementInstanceId());
+        verify(fixture.ec2Service()).terminateInstances("us-east-1", List.of("i-rollback"));
+    }
+
+    @Test
+    void rollbackRecoversPersistedLaunchAfterRestartWithoutDuplicate() {
+        RefreshFixture fixture = refreshFixture(1, 100, 100, 0);
+        fixture.refresh().setAutoRollback(true);
+        fixture.refresh().setStatus("RollbackInProgress");
+        fixture.refresh().setRollbackReason("forward failure");
+        fixture.refresh().setRollbackStartTime(Instant.parse("2026-07-19T11:55:00Z"));
+        InstanceRefreshReplacement pair = fixture.refresh().getReplacements().getFirst();
+        pair.setPhase("Completed");
+        pair.setReplacementInstanceId("i-forward");
+        pair.setRollbackPhase("Launching");
+        pair.setRollbackLaunchClientToken("refresh-1:rollback:i-original");
+        fixture.asg().getInstances().clear();
+        AsgInstance forward = instance("i-forward", "InService");
+        forward.setLaunchTemplateId("lt-refresh");
+        forward.setLaunchTemplateVersion("2");
+        fixture.asg().getInstances().add(forward);
+        when(fixture.ec2Service().isInstanceContainerRunning("i-forward")).thenReturn(true);
+        Instance recovered = new Instance();
+        recovered.setInstanceId("i-rollback-recovered");
+        recovered.setClientToken(pair.getRollbackLaunchClientToken());
+        Reservation recoveredReservation = new Reservation();
+        recoveredReservation.setInstances(List.of(recovered));
+        when(fixture.ec2Service().describeInstances("us-east-1", List.of(), Map.of()))
+                .thenReturn(List.of(recoveredReservation));
+
+        fixture.reconciler().reconcile(fixture.asg());
+
+        assertEquals("i-rollback-recovered", pair.getRollbackReplacementInstanceId());
+        assertEquals(List.of("i-forward", "i-rollback-recovered"), fixture.asg().getInstances().stream()
+                .map(AsgInstance::getInstanceId).toList());
+        verify(fixture.ec2Service(), never()).runInstancesWithUserData(
+                eq("us-east-1"), eq("ami-source"), eq("t3.micro"), eq(1), eq(1),
+                eq(null), eq(List.of()), eq(null), anyString(), eq(List.of()),
+                isNull(Ec2UserData.class), eq(null));
     }
 
     @Test
@@ -672,11 +838,19 @@ class AutoScalingReconcilerTest {
         refresh.setInstanceWarmup(warmup);
         refresh.setDesiredLaunchTemplateId("lt-refresh");
         refresh.setDesiredLaunchTemplateVersion("2");
+        refresh.setSourceLaunchTemplateId("lt-source");
+        refresh.setSourceLaunchTemplateVersion("1");
         refresh.setCandidateInstanceIds(asg.getInstances().stream().map(AsgInstance::getInstanceId).toList());
         refresh.setReplacements(refresh.getCandidateInstanceIds().stream().map(id -> {
+            AsgInstance original = asg.getInstances().stream()
+                    .filter(instance -> id.equals(instance.getInstanceId())).findFirst().orElseThrow();
             InstanceRefreshReplacement replacement = new InstanceRefreshReplacement();
             replacement.setOriginalInstanceId(id);
             replacement.setPhase("Pending");
+            replacement.setOriginalLaunchTemplateId(original.getLaunchTemplateId());
+            replacement.setOriginalLaunchTemplateVersion(original.getLaunchTemplateVersion());
+            replacement.setOriginalInstanceType(original.getInstanceType());
+            replacement.setOriginalAvailabilityZone(original.getAvailabilityZone());
             return replacement;
         }).toList());
         refresh.setInstancesToUpdate(desired);
@@ -694,6 +868,16 @@ class AutoScalingReconcilerTest {
                 .thenReturn(List.of(template));
         when(ec2Service.describeLaunchTemplateVersions("us-east-1", "lt-refresh", null, List.of("2")))
                 .thenReturn(List.of(version));
+        LaunchTemplate sourceTemplate = new LaunchTemplate();
+        sourceTemplate.setLaunchTemplateId("lt-source");
+        LaunchTemplate sourceVersion = new LaunchTemplate();
+        sourceVersion.setLatestVersionNumber("1");
+        sourceVersion.setImageId("ami-source");
+        sourceVersion.setInstanceType("t3.micro");
+        when(ec2Service.describeLaunchTemplates("us-east-1", List.of("lt-source"), List.of(), Map.of()))
+                .thenReturn(List.of(sourceTemplate));
+        when(ec2Service.describeLaunchTemplateVersions("us-east-1", "lt-source", null, List.of("1")))
+                .thenReturn(List.of(sourceVersion));
         Instance launched = new Instance();
         launched.setInstanceId("i-replacement");
         Reservation reservation = new Reservation();
@@ -704,6 +888,15 @@ class AutoScalingReconcilerTest {
                 isNull(Ec2UserData.class), eq(null)))
                 .thenReturn(reservation);
         return new RefreshFixture(asgService, ec2Service, elbV2Service, reconciler, asg, refresh);
+    }
+
+    private static Reservation reservation(String instanceId, String clientToken) {
+        Instance instance = new Instance();
+        instance.setInstanceId(instanceId);
+        instance.setClientToken(clientToken);
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(instance));
+        return reservation;
     }
 
     private record RefreshFixture(AutoScalingService asgService, Ec2Service ec2Service,

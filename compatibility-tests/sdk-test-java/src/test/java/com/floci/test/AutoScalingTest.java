@@ -315,6 +315,59 @@ class AutoScalingTest {
     }
 
     @Test
+    @DisplayName("StartInstanceRefresh accepts AutoRollback through the official SDK")
+    void startInstanceRefreshAcceptsAutoRollback() {
+        String launchTemplateName = TestFixtures.uniqueName("sdk-refresh-auto-rollback");
+        String autoScalingGroupName = TestFixtures.uniqueName("sdk-refresh-auto-rollback-asg");
+        boolean groupCreated = false;
+        try {
+            ec2.createLaunchTemplate(CreateLaunchTemplateRequest.builder()
+                    .launchTemplateName(launchTemplateName)
+                    .launchTemplateData(RequestLaunchTemplateData.builder()
+                            .imageId("ami-12345678")
+                            .instanceType("t3.micro")
+                            .build())
+                    .build());
+            autoScaling.createAutoScalingGroup(CreateAutoScalingGroupRequest.builder()
+                    .autoScalingGroupName(autoScalingGroupName)
+                    .launchTemplate(LaunchTemplateSpecification.builder()
+                            .launchTemplateName(launchTemplateName)
+                            .version("1")
+                            .build())
+                    .minSize(0)
+                    .maxSize(1)
+                    .desiredCapacity(0)
+                    .availabilityZones("us-east-1a")
+                    .build());
+            groupCreated = true;
+
+            var started = autoScaling.startInstanceRefresh(StartInstanceRefreshRequest.builder()
+                    .autoScalingGroupName(autoScalingGroupName)
+                    .preferences(RefreshPreferences.builder().autoRollback(true).build())
+                    .build());
+            var described = awaitInstanceRefresh(autoScalingGroupName, started.instanceRefreshId());
+
+            assertThat(described.statusAsString()).isEqualTo("Successful");
+            assertThat(described.preferences().autoRollback()).isTrue();
+            assertThat(described.rollbackDetails()).isNull();
+        } finally {
+            if (groupCreated) {
+                autoScaling.deleteAutoScalingGroup(DeleteAutoScalingGroupRequest.builder()
+                        .autoScalingGroupName(autoScalingGroupName)
+                        .forceDelete(true)
+                        .build());
+            }
+            try {
+                ec2.deleteLaunchTemplate(DeleteLaunchTemplateRequest.builder()
+                        .launchTemplateName(launchTemplateName)
+                        .build());
+            } catch (RuntimeException ignored) {
+                // The primary assertions above retain any meaningful failure.
+            }
+        }
+    }
+
+    @Test
     @DisplayName("Reconciler restores a missing target at the target group's effective port")
     void reconcilerRestoresMissingTargetWithEffectivePort() throws InterruptedException {
         String launchTemplateName = TestFixtures.uniqueName("sdk-target-reconciliation-lt");

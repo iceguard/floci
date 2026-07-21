@@ -2,11 +2,13 @@ package io.github.hectorvent.floci.services.autoscaling;
 
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
+import io.github.hectorvent.floci.services.autoscaling.model.InstanceRefresh;
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -79,6 +81,34 @@ class AutoScalingQueryHandlerTest {
         assertTrue(describeXml.contains("<Preferences>"));
         assertTrue(describeXml.contains("<MinHealthyPercentage>90</MinHealthyPercentage>"));
         assertTrue(describeXml.contains("<SkipMatching>true</SkipMatching>"));
+    }
+
+    @Test
+    void describeInstanceRefreshesEmitsAwsRollbackDetailsShape() {
+        AutoScalingService service = new AutoScalingService();
+        service.regionResolver = new RegionResolver(REGION, "000000000000");
+        service.createAutoScalingGroup(REGION, "rollback-asg", null, "lt-original", null, "1", null,
+                0, 1, 0, 300, List.of("us-east-1a"), List.of(), List.of(), List.of(), "EC2", 0,
+                List.of("Default"), java.util.Map.of(), java.util.Map.of());
+        var refresh = service.startInstanceRefresh(REGION, "rollback-asg", new InstanceRefresh());
+        refresh.setStatus("RollbackSuccessful");
+        refresh.setRollbackReason("replacement failed");
+        refresh.setRollbackStartTime(Instant.parse("2026-07-21T10:00:00Z"));
+        refresh.setPercentageCompleteOnRollback(100);
+        refresh.setInstancesToUpdateOnRollback(0);
+        service.saveInstanceRefresh(refresh);
+
+        MultivaluedHashMap<String, String> describe = new MultivaluedHashMap<>();
+        describe.add("AutoScalingGroupName", "rollback-asg");
+        describe.add("InstanceRefreshIds.member.1", refresh.getInstanceRefreshId());
+        String xml = (String) new AutoScalingQueryHandler(service)
+                .handle("DescribeInstanceRefreshes", describe, REGION).getEntity();
+
+        assertTrue(xml.contains("<RollbackDetails>"));
+        assertTrue(xml.contains("<RollbackReason>replacement failed</RollbackReason>"));
+        assertTrue(xml.contains("<RollbackStartTime>2026-07-21T10:00:00.000Z</RollbackStartTime>"));
+        assertTrue(xml.contains("<PercentageCompleteOnRollback>100</PercentageCompleteOnRollback>"));
+        assertTrue(xml.contains("<InstancesToUpdateOnRollback>0</InstancesToUpdateOnRollback>"));
     }
 
     @Test

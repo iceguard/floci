@@ -36,6 +36,11 @@ public class InstanceRefresh {
     private List<InstanceRefreshReplacement> replacements = new ArrayList<>();
     private String phase;
     private String failureReason;
+    private String rollbackReason;
+    private Instant rollbackStartTime;
+    private int percentageCompleteOnRollback;
+    private int instancesToUpdateOnRollback;
+    private String rollbackFailureReason;
 
     private Integer minHealthyPercentage;
     private Integer maxHealthyPercentage;
@@ -122,6 +127,21 @@ public class InstanceRefresh {
 
     public String getFailureReason() { return failureReason; }
     public void setFailureReason(String v) { this.failureReason = v; }
+
+    public String getRollbackReason() { return rollbackReason; }
+    public void setRollbackReason(String v) { this.rollbackReason = v; }
+
+    public Instant getRollbackStartTime() { return rollbackStartTime; }
+    public void setRollbackStartTime(Instant v) { this.rollbackStartTime = v; }
+
+    public int getPercentageCompleteOnRollback() { return percentageCompleteOnRollback; }
+    public void setPercentageCompleteOnRollback(int v) { this.percentageCompleteOnRollback = v; }
+
+    public int getInstancesToUpdateOnRollback() { return instancesToUpdateOnRollback; }
+    public void setInstancesToUpdateOnRollback(int v) { this.instancesToUpdateOnRollback = v; }
+
+    public String getRollbackFailureReason() { return rollbackFailureReason; }
+    public void setRollbackFailureReason(String v) { this.rollbackFailureReason = v; }
 
     public Integer getMinHealthyPercentage() { return minHealthyPercentage; }
     public void setMinHealthyPercentage(Integer v) { this.minHealthyPercentage = v; }
