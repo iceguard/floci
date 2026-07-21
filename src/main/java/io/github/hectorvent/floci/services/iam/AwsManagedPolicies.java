@@ -2,11 +2,7 @@ package io.github.hectorvent.floci.services.iam;
 
 import java.util.List;
 
-/**
- * Catalog of commonly-used AWS managed policies seeded at startup.
- * Policy documents use a permissive wildcard because floci does not
- * enforce IAM policy evaluation.
- */
+/** Catalog of commonly-used AWS managed policies seeded at startup. */
 final class AwsManagedPolicies {
 
     static final String ARN_PREFIX = "arn:aws:iam::aws:policy";
@@ -15,7 +11,62 @@ final class AwsManagedPolicies {
             "{\"Version\":\"2012-10-17\",\"Statement\":"
             + "[{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}]}";
 
-    record ManagedPolicyDef(String name, String path, String description) {
+    static final String AMAZON_SSM_MANAGED_INSTANCE_CORE_DOCUMENT = """
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ssm:DescribeAssociation",
+                    "ssm:GetDeployablePatchSnapshotForInstance",
+                    "ssm:GetDocument",
+                    "ssm:DescribeDocument",
+                    "ssm:GetManifest",
+                    "ssm:GetParameter",
+                    "ssm:GetParameters",
+                    "ssm:ListAssociations",
+                    "ssm:ListInstanceAssociations",
+                    "ssm:PutInventory",
+                    "ssm:PutComplianceItems",
+                    "ssm:PutConfigurePackageResult",
+                    "ssm:UpdateAssociationStatus",
+                    "ssm:UpdateInstanceAssociationStatus",
+                    "ssm:UpdateInstanceInformation"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ssmmessages:CreateControlChannel",
+                    "ssmmessages:CreateDataChannel",
+                    "ssmmessages:OpenControlChannel",
+                    "ssmmessages:OpenDataChannel"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2messages:AcknowledgeMessage",
+                    "ec2messages:DeleteMessage",
+                    "ec2messages:FailMessage",
+                    "ec2messages:GetEndpoint",
+                    "ec2messages:GetMessages",
+                    "ec2messages:SendReply"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+            """;
+
+    record ManagedPolicyDef(String name, String path, String description, String document) {
+        ManagedPolicyDef(String name, String path, String description) {
+            this(name, path, description, PERMISSIVE_DOCUMENT);
+        }
+
         String arn() {
             return ARN_PREFIX + path + name;
         }
@@ -130,7 +181,8 @@ final class AwsManagedPolicies {
         new ManagedPolicyDef("AWS-SSM-RemediationAutomation-ExecutionRolePolicy", "/",
                 "Provides permissions for AWS Systems Manager remediation automation execution."),
         new ManagedPolicyDef("AmazonSSMManagedInstanceCore", "/",
-                "Provides permissions required for instances to use AWS Systems Manager core service functionality."),
+                "Provides permissions required for instances to use AWS Systems Manager core service functionality.",
+                AMAZON_SSM_MANAGED_INSTANCE_CORE_DOCUMENT),
 
         // SageMaker execution role policies
         new ManagedPolicyDef("AmazonSageMakerGeospatialExecutionRole", "/service-role/",
