@@ -511,14 +511,57 @@ class AutoScalingServiceTest {
     }
 
     @Test
-    void rejectsAutoRollbackUntilRollbackCanBeCompletedSafely() {
+    void autoRollbackCapturesActualMemberIdentityWhenGroupPointerAlreadyMoved() {
+        var group = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
+        group.setLaunchTemplateVersion("2");
+        AutoScalingGroupFixture.addInstance(
+                service, REGION, "test-asg", "i-original", "InService", "lt-original", "1", "t3.micro");
+        InstanceRefresh request = new InstanceRefresh();
+        request.setAutoRollback(true);
+        request.setDesiredLaunchTemplateId("lt-original");
+        request.setDesiredLaunchTemplateVersion("2");
+
+        InstanceRefresh refresh = service.startInstanceRefresh(REGION, "test-asg", request);
+
+        assertEquals("InProgress", refresh.getStatus());
+        assertEquals(Boolean.TRUE, refresh.getAutoRollback());
+        assertEquals("lt-original", refresh.getSourceLaunchTemplateId());
+        assertEquals("1", refresh.getSourceLaunchTemplateVersion());
+        assertEquals("1", refresh.getReplacements().getFirst().getOriginalLaunchTemplateVersion());
+        assertEquals("t3.micro", refresh.getReplacements().getFirst().getOriginalInstanceType());
+    }
+
+    @Test
+    void autoRollbackPreservesMixedPolicyWhileRestoringActualMemberVersion() {
+        MixedInstancesPolicy policy = mixedInstancesPolicy("lt-mixed", "2", "t3.small");
+        MixedInstancesPolicy.InstancesDistribution distribution =
+                new MixedInstancesPolicy.InstancesDistribution();
+        distribution.setOnDemandBaseCapacity(1);
+        distribution.setOnDemandPercentageAboveBaseCapacity(25);
+        distribution.setSpotAllocationStrategy("capacity-optimized");
+        policy.setInstancesDistribution(distribution);
+        createWithMixedInstancesPolicy("mixed-rollback", policy);
+        AutoScalingGroupFixture.addInstance(service, REGION, "mixed-rollback", "i-original",
+                "InService", "lt-mixed", "1", "t3.small");
         InstanceRefresh request = new InstanceRefresh();
         request.setAutoRollback(true);
 
-        AwsException error = assertThrows(AwsException.class,
-                () -> service.startInstanceRefresh(REGION, "test-asg", request));
+        InstanceRefresh refresh = service.startInstanceRefresh(REGION, "mixed-rollback", request);
 
-        assertEquals("ValidationError", error.getErrorCode());
+        MixedInstancesPolicy sourcePolicy = refresh.getSourceMixedInstancesPolicy();
+        assertNotNull(sourcePolicy);
+        assertEquals("1", sourcePolicy.getLaunchTemplate().getLaunchTemplateSpecification().getVersion());
+        assertEquals("t3.small", sourcePolicy.getLaunchTemplate().getOverrides().getFirst().getInstanceType());
+        assertEquals(25, sourcePolicy.getInstancesDistribution().getOnDemandPercentageAboveBaseCapacity());
+
+        var group = service.describeAutoScalingGroups(REGION, List.of("mixed-rollback")).getFirst();
+        AutoScalingService.restoreSourceConfiguration(group, refresh);
+        assertEquals("1", group.getMixedInstancesPolicy().getLaunchTemplate()
+                .getLaunchTemplateSpecification().getVersion());
+        assertEquals("t3.small", group.getMixedInstancesPolicy().getLaunchTemplate()
+                .getOverrides().getFirst().getInstanceType());
+        assertEquals("capacity-optimized",
+                group.getMixedInstancesPolicy().getInstancesDistribution().getSpotAllocationStrategy());
     }
 
     @Test

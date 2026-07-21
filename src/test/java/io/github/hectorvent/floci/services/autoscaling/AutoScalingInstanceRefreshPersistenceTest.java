@@ -36,7 +36,16 @@ class AutoScalingInstanceRefreshPersistenceTest {
         InstanceRefresh request = new InstanceRefresh();
         request.setDesiredLaunchTemplateId("lt-refresh");
         request.setDesiredLaunchTemplateVersion("2");
+        request.setAutoRollback(true);
         InstanceRefresh started = first.startInstanceRefresh("us-east-1", "persisted-asg", request);
+        started.setStatus("RollbackInProgress");
+        started.setRollbackReason("forward failure");
+        started.setRollbackStartTime(java.time.Instant.parse("2026-07-21T10:00:00Z"));
+        started.setPercentageCompleteOnRollback(50);
+        started.setInstancesToUpdateOnRollback(1);
+        started.getReplacements().getFirst().setRollbackPhase("Launching");
+        started.getReplacements().getFirst().setRollbackLaunchClientToken("refresh:rollback:i-original");
+        first.saveInstanceRefresh(started);
 
         AutoScalingService reloaded = serviceWithStorage(storage);
         InstanceRefresh restored = reloaded.activeInstanceRefresh("us-east-1", "persisted-asg").orElseThrow();
@@ -46,6 +55,12 @@ class AutoScalingInstanceRefreshPersistenceTest {
         assertEquals("i-original", restored.getReplacements().getFirst().getOriginalInstanceId());
         assertEquals("lt-source", restored.getSourceLaunchTemplateId());
         assertEquals("lt-refresh", restored.getDesiredLaunchTemplateId());
+        assertEquals("RollbackInProgress", restored.getStatus());
+        assertEquals("forward failure", restored.getRollbackReason());
+        assertEquals(50, restored.getPercentageCompleteOnRollback());
+        assertEquals("Launching", restored.getReplacements().getFirst().getRollbackPhase());
+        assertEquals("refresh:rollback:i-original",
+                restored.getReplacements().getFirst().getRollbackLaunchClientToken());
         assertEquals("InService", reloaded.describeAutoScalingGroups("us-east-1", List.of("persisted-asg"))
                 .getFirst().getInstances().getFirst().getLifecycleState());
     }

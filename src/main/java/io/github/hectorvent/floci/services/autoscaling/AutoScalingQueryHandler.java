@@ -376,7 +376,22 @@ public class AutoScalingQueryHandler {
         }
         appendDesiredConfigurationXml(xml, refresh);
         appendPreferencesXml(xml, refresh);
+        appendRollbackDetailsXml(xml, refresh);
         xml.end("member");
+    }
+
+    private void appendRollbackDetailsXml(XmlBuilder xml, InstanceRefresh refresh) {
+        if (refresh.getRollbackStartTime() == null) {
+            return;
+        }
+        xml.start("RollbackDetails")
+                .elem("RollbackReason", refresh.getRollbackReason())
+                .elem("RollbackStartTime", ISO_FMT.format(refresh.getRollbackStartTime()))
+                .elem("PercentageCompleteOnRollback",
+                        String.valueOf(refresh.getPercentageCompleteOnRollback()))
+                .elem("InstancesToUpdateOnRollback",
+                        String.valueOf(refresh.getInstancesToUpdateOnRollback()))
+                .end("RollbackDetails");
     }
 
     private void appendDesiredConfigurationXml(XmlBuilder xml, InstanceRefresh refresh) {

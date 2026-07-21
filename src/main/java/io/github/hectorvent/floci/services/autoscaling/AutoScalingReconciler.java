@@ -120,6 +120,10 @@ public class AutoScalingReconciler {
 
     private void reconcileInstanceRefresh(AutoScalingGroup asg, InstanceRefresh refresh) {
         Instant now = clock.instant();
+        if ("RollbackInProgress".equals(refresh.getStatus())) {
+            reconcileInstanceRefreshRollback(asg, refresh, now);
+            return;
+        }
         InstanceRefreshReplacement pair = refresh.getReplacements().stream()
                 .filter(replacement -> !"Completed".equals(replacement.getPhase()))
                 .filter(replacement -> !"Failed".equals(replacement.getPhase()))
@@ -345,12 +349,294 @@ public class AutoScalingReconciler {
         pair.setFailureReason(reason);
         updateRefreshProgress(refresh);
         asgService.saveAutoScalingGroup(asg);
-        asgService.failInstanceRefresh(refresh, reason, now);
+        if (Boolean.TRUE.equals(refresh.getAutoRollback())) {
+            beginInstanceRefreshRollback(asg, refresh, reason, now);
+        } else {
+            asgService.failInstanceRefresh(refresh, reason, now);
+        }
+    }
+
+    private void beginInstanceRefreshRollback(AutoScalingGroup asg, InstanceRefresh refresh,
+                                              String reason, Instant now) {
+        AutoScalingService.restoreSourceConfiguration(asg, refresh);
+        refresh.setStatus("RollbackInProgress");
+        refresh.setPhase("Rollback");
+        refresh.setFailureReason(reason);
+        refresh.setRollbackReason(reason);
+        refresh.setRollbackStartTime(now);
+        refresh.setRollbackFailureReason(null);
+        for (InstanceRefreshReplacement replacement : refresh.getReplacements()) {
+            if (replacement.getRollbackPhase() == null) {
+                boolean originalStillPresent = findAsgInstance(asg, replacement.getOriginalInstanceId()).isPresent();
+                Optional<AsgInstance> forward = findForwardReplacement(asg, replacement);
+                if (replacement.getReplacementInstanceId() == null && forward.isPresent()) {
+                    replacement.setReplacementInstanceId(forward.get().getInstanceId());
+                }
+                boolean forwardPresent = forward.isPresent();
+                replacement.setRollbackPhase(originalStillPresent && !forwardPresent ? "Completed" : "Pending");
+            }
+        }
+        updateRollbackProgress(refresh);
+        refresh.setStatusReason("Instance refresh failed. Auto rollback in progress: " + reason);
+        asgService.saveAutoScalingGroup(asg);
+        asgService.saveInstanceRefresh(refresh);
+    }
+
+    private void reconcileInstanceRefreshRollback(AutoScalingGroup asg, InstanceRefresh refresh, Instant now) {
+        InstanceRefreshReplacement pair = refresh.getReplacements().stream()
+                .filter(replacement -> !"Completed".equals(replacement.getRollbackPhase()))
+                .findFirst()
+                .orElse(null);
+        if (pair == null) {
+            completeInstanceRefreshRollback(asg, refresh, now);
+            return;
+        }
+
+        AsgInstance original = findAsgInstance(asg, pair.getOriginalInstanceId()).orElse(null);
+        AsgInstance forward = findForwardReplacement(asg, pair).orElse(null);
+        if (original != null) {
+            restoreOriginal(original);
+            try {
+                if (forward != null) {
+                    terminateRollbackMember(asg, forward);
+                }
+            } catch (Exception e) {
+                failInstanceRefreshRollback(asg, refresh, pair,
+                        "Failed to remove forward replacement " + forward.getInstanceId() + ": " + message(e), now);
+                return;
+            }
+            pair.setRollbackPhase("Completed");
+            pair.setRollbackFailureReason(null);
+            updateRollbackProgress(refresh);
+            asgService.saveAutoScalingGroup(asg);
+            asgService.saveInstanceRefresh(refresh);
+            return;
+        }
+        if (forward == null) {
+            failInstanceRefreshRollback(asg, refresh, pair,
+                    "Original instance " + pair.getOriginalInstanceId()
+                            + " and its forward replacement are no longer available.", now);
+            return;
+        }
+
+        if (pair.getRollbackReplacementInstanceId() == null) {
+            try {
+                AsgInstance rollback = recoverRollbackReplacement(asg, pair).orElse(null);
+                if (rollback == null) {
+                    if (pair.getRollbackLaunchClientToken() == null) {
+                        pair.setRollbackLaunchClientToken(
+                                refresh.getInstanceRefreshId() + ":rollback:" + pair.getOriginalInstanceId());
+                    }
+                    pair.setRollbackPhase("Launching");
+                    asgService.saveInstanceRefresh(refresh);
+                    rollback = launchRollbackReplacement(asg, pair);
+                }
+                pair.setRollbackReplacementInstanceId(rollback.getInstanceId());
+                pair.setRollbackPhase("Pending");
+                pair.setRollbackReadyTime(null);
+                updateRollbackProgress(refresh);
+                asgService.saveInstanceRefresh(refresh);
+            } catch (Exception e) {
+                failInstanceRefreshRollback(asg, refresh, pair,
+                        "Rollback replacement launch failed: " + message(e), now);
+            }
+            return;
+        }
+
+        AsgInstance rollback = findAsgInstance(asg, pair.getRollbackReplacementInstanceId()).orElse(null);
+        if (rollback == null) {
+            failInstanceRefreshRollback(asg, refresh, pair,
+                    "Rollback replacement instance " + pair.getRollbackReplacementInstanceId()
+                            + " failed before becoming ready.", now);
+            return;
+        }
+        if (!"InService".equals(rollback.getLifecycleState())
+                || !"Healthy".equals(rollback.getHealthStatus())) {
+            pair.setRollbackReadyTime(null);
+            pair.setRollbackPhase("Pending");
+            asgService.saveInstanceRefresh(refresh);
+            return;
+        }
+        TargetReadiness targetReadiness = targetReadiness(asg, rollback.getInstanceId());
+        if (targetReadiness.failureReason() != null) {
+            failInstanceRefreshRollback(asg, refresh, pair, targetReadiness.failureReason(), now);
+            return;
+        }
+        if (!targetReadiness.ready()) {
+            pair.setRollbackReadyTime(null);
+            pair.setRollbackPhase("Pending");
+            asgService.saveInstanceRefresh(refresh);
+            return;
+        }
+        if (pair.getRollbackReadyTime() == null) {
+            pair.setRollbackReadyTime(now);
+            pair.setRollbackPhase("Warming");
+            asgService.saveInstanceRefresh(refresh);
+            return;
+        }
+        int warmupSeconds = refresh.getInstanceWarmup() != null ? refresh.getInstanceWarmup() : 0;
+        if (Duration.between(pair.getRollbackReadyTime(), now).getSeconds() < warmupSeconds) {
+            return;
+        }
+
+        try {
+            terminateRollbackMember(asg, forward);
+        } catch (Exception e) {
+            String cleanupFailure = cleanupFailedRollbackReplacement(asg, rollback);
+            String reason = "Failed to remove forward replacement " + forward.getInstanceId() + ": " + message(e);
+            if (cleanupFailure != null) {
+                reason += "; rollback replacement cleanup failed: " + cleanupFailure;
+            }
+            failInstanceRefreshRollback(asg, refresh, pair, reason, now);
+            return;
+        }
+        pair.setRollbackPhase("Completed");
+        pair.setRollbackFailureReason(null);
+        updateRollbackProgress(refresh);
+        asgService.saveAutoScalingGroup(asg);
+        asgService.saveInstanceRefresh(refresh);
+    }
+
+    private AsgInstance launchRollbackReplacement(AutoScalingGroup asg, InstanceRefreshReplacement pair) {
+        LaunchSource launchSource = rollbackLaunchSource(asg, pair);
+        String az = pair.getOriginalAvailabilityZone() != null
+                ? pair.getOriginalAvailabilityZone()
+                : asg.getAvailabilityZones().isEmpty() ? asg.getRegion() + "a" : asg.getAvailabilityZones().getFirst();
+        String subnetId = asg.getSubnetIds().isEmpty() ? null : asg.getSubnetIds().getFirst();
+        Reservation reservation = ec2Service.runInstancesWithUserData(
+                asg.getRegion(), launchSource.imageId(), launchSource.instanceType(), 1, 1,
+                launchSource.keyName(), launchSource.securityGroupIds(), subnetId,
+                pair.getRollbackLaunchClientToken(), propagatedInstanceTags(asg, launchSource),
+                launchSource.userData(), launchSource.iamInstanceProfile());
+        if (reservation.getInstances() == null || reservation.getInstances().size() != 1) {
+            throw new IllegalStateException("Rollback launch did not return exactly one instance");
+        }
+        AsgInstance rollback = attachRefreshReplacement(asg, launchSource,
+                reservation.getInstances().getFirst(), az, pair.getRollbackLaunchClientToken());
+        rollback.setProtectedFromScaleIn(pair.isOriginalProtectedFromScaleIn());
+        asgService.saveAutoScalingGroup(asg);
+        return rollback;
+    }
+
+    private Optional<AsgInstance> recoverRollbackReplacement(AutoScalingGroup asg,
+                                                             InstanceRefreshReplacement pair) {
+        if (!"Launching".equals(pair.getRollbackPhase()) || pair.getRollbackLaunchClientToken() == null) {
+            return Optional.empty();
+        }
+        Optional<AsgInstance> existingMember = asg.getInstances().stream()
+                .filter(instance -> pair.getRollbackLaunchClientToken().equals(instance.getLaunchClientToken()))
+                .findFirst();
+        if (existingMember.isPresent()) {
+            return existingMember;
+        }
+        LaunchSource launchSource = rollbackLaunchSource(asg, pair);
+        return ec2Service.describeInstances(asg.getRegion(), List.of(), Map.of()).stream()
+                .flatMap(reservation -> reservation.getInstances().stream())
+                .filter(instance -> pair.getRollbackLaunchClientToken().equals(instance.getClientToken()))
+                .findFirst()
+                .map(instance -> {
+                    AsgInstance recovered = attachRefreshReplacement(asg, launchSource, instance,
+                            instance.getPlacement() != null ? instance.getPlacement().getAvailabilityZone()
+                                    : pair.getOriginalAvailabilityZone(),
+                            pair.getRollbackLaunchClientToken());
+                    recovered.setProtectedFromScaleIn(pair.isOriginalProtectedFromScaleIn());
+                    asgService.saveAutoScalingGroup(asg);
+                    return recovered;
+                });
+    }
+
+    private LaunchSource rollbackLaunchSource(AutoScalingGroup asg, InstanceRefreshReplacement pair) {
+        AutoScalingGroup source = new AutoScalingGroup();
+        source.setRegion(asg.getRegion());
+        source.setAutoScalingGroupName(asg.getAutoScalingGroupName());
+        source.setLaunchConfigurationName(pair.getOriginalLaunchConfigurationName());
+        source.setLaunchTemplateId(pair.getOriginalLaunchTemplateId());
+        source.setLaunchTemplateName(pair.getOriginalLaunchTemplateName());
+        source.setLaunchTemplateVersion(pair.getOriginalLaunchTemplateVersion());
+        LaunchSource launchSource = resolveLaunchSource(source);
+        if (launchSource == null) {
+            throw new IllegalStateException("No original launch source is available");
+        }
+        return launchSource;
+    }
+
+    private void terminateRollbackMember(AutoScalingGroup asg, AsgInstance member) {
+        deregisterRefreshOriginal(asg, member.getInstanceId());
+        ec2Service.terminateInstances(asg.getRegion(), List.of(member.getInstanceId()));
+        asg.getInstances().remove(member);
+    }
+
+    private String cleanupFailedRollbackReplacement(AutoScalingGroup asg, AsgInstance rollback) {
+        try {
+            terminateRollbackMember(asg, rollback);
+            asgService.saveAutoScalingGroup(asg);
+            return null;
+        } catch (Exception e) {
+            return message(e);
+        }
+    }
+
+    private void completeInstanceRefreshRollback(AutoScalingGroup asg, InstanceRefresh refresh, Instant now) {
+        AutoScalingService.restoreSourceConfiguration(asg, refresh);
+        refresh.setStatus("RollbackSuccessful");
+        refresh.setPhase("Completed");
+        refresh.setStatusReason("Instance refresh rollback completed.");
+        refresh.setPercentageCompleteOnRollback(100);
+        refresh.setInstancesToUpdateOnRollback(0);
+        refresh.setEndTime(now);
+        asgService.saveAutoScalingGroup(asg);
+        asgService.saveInstanceRefresh(refresh);
+    }
+
+    private void failInstanceRefreshRollback(AutoScalingGroup asg, InstanceRefresh refresh,
+                                             InstanceRefreshReplacement pair, String reason, Instant now) {
+        AsgInstance rollback = findAsgInstance(asg, pair.getRollbackReplacementInstanceId()).orElse(null);
+        if (rollback != null) {
+            String cleanupFailure = cleanupFailedRollbackReplacement(asg, rollback);
+            if (cleanupFailure == null) {
+                pair.setRollbackReplacementInstanceId(null);
+            } else {
+                reason += "; rollback replacement cleanup failed: " + cleanupFailure;
+            }
+        }
+        pair.setRollbackPhase("Failed");
+        pair.setRollbackFailureReason(reason);
+        refresh.setStatus("RollbackFailed");
+        refresh.setPhase("Failed");
+        refresh.setRollbackFailureReason(reason);
+        refresh.setStatusReason("Instance refresh rollback failed: " + reason);
+        refresh.setEndTime(now);
+        updateRollbackProgress(refresh);
+        asgService.saveAutoScalingGroup(asg);
+        asgService.saveInstanceRefresh(refresh);
+    }
+
+    private static void updateRollbackProgress(InstanceRefresh refresh) {
+        long completed = refresh.getReplacements().stream()
+                .filter(replacement -> "Completed".equals(replacement.getRollbackPhase()))
+                .count();
+        int total = refresh.getReplacements().size();
+        refresh.setInstancesToUpdateOnRollback(total - (int) completed);
+        refresh.setPercentageCompleteOnRollback(total == 0 ? 100 : (int) (completed * 100 / total));
     }
 
     private static Optional<AsgInstance> findAsgInstance(AutoScalingGroup asg, String instanceId) {
+        if (instanceId == null) {
+            return Optional.empty();
+        }
         return asg.getInstances().stream()
                 .filter(instance -> instanceId.equals(instance.getInstanceId()))
+                .findFirst();
+    }
+
+    private static Optional<AsgInstance> findForwardReplacement(AutoScalingGroup asg,
+                                                                InstanceRefreshReplacement pair) {
+        Optional<AsgInstance> byId = findAsgInstance(asg, pair.getReplacementInstanceId());
+        if (byId.isPresent() || pair.getLaunchClientToken() == null) {
+            return byId;
+        }
+        return asg.getInstances().stream()
+                .filter(instance -> pair.getLaunchClientToken().equals(instance.getLaunchClientToken()))
                 .findFirst();
     }
 

@@ -452,14 +452,18 @@ public class AutoScalingService {
             copyDesiredConfiguration(requestedRefresh, refresh);
             copyPreferences(requestedRefresh, refresh);
             applyRefreshDefaults(refresh);
-            snapshotSourceConfiguration(asg, refresh);
-
             List<String> candidates = selectRefreshCandidates(asg, refresh);
+            snapshotSourceConfiguration(asg, refresh, candidates);
             refresh.setCandidateInstanceIds(candidates);
             refresh.setReplacements(candidates.stream().map(instanceId -> {
+                AsgInstance original = asg.getInstances().stream()
+                        .filter(instance -> instanceId.equals(instance.getInstanceId()))
+                        .findFirst()
+                        .orElseThrow();
                 InstanceRefreshReplacement replacement = new InstanceRefreshReplacement();
                 replacement.setOriginalInstanceId(instanceId);
                 replacement.setPhase("Pending");
+                snapshotOriginalInstance(original, replacement);
                 return replacement;
             }).toList());
             refresh.setInstancesToUpdate(candidates.size());
@@ -1049,10 +1053,6 @@ public class AutoScalingService {
         if (refresh.getInstanceWarmup() != null && refresh.getInstanceWarmup() < 0) {
             throw new AwsException("ValidationError", "InstanceWarmup must not be negative.", 400);
         }
-        if (Boolean.TRUE.equals(refresh.getAutoRollback())) {
-            throw new AwsException("ValidationError",
-                    "AutoRollback is not supported for this instance refresh implementation.", 400);
-        }
         if (!"Rolling".equals(normalizeRefreshStrategy(refresh.getStrategy()))) {
             throw new AwsException("ValidationError",
                     "Only the Rolling instance refresh strategy is supported.", 400);
@@ -1082,12 +1082,58 @@ public class AutoScalingService {
         if (refresh.getSkipMatching() == null) { refresh.setSkipMatching(false); }
     }
 
-    private static void snapshotSourceConfiguration(AutoScalingGroup asg, InstanceRefresh refresh) {
+    private static void snapshotSourceConfiguration(AutoScalingGroup asg, InstanceRefresh refresh,
+                                                    List<String> candidateInstanceIds) {
         refresh.setSourceLaunchConfigurationName(asg.getLaunchConfigurationName());
         refresh.setSourceLaunchTemplateId(asg.getLaunchTemplateId());
         refresh.setSourceLaunchTemplateName(asg.getLaunchTemplateName());
         refresh.setSourceLaunchTemplateVersion(asg.getLaunchTemplateVersion());
         refresh.setSourceMixedInstancesPolicy(copyMixedInstancesPolicy(asg.getMixedInstancesPolicy()));
+
+        AsgInstance representative = asg.getInstances().stream()
+                .filter(instance -> candidateInstanceIds.contains(instance.getInstanceId()))
+                .filter(AutoScalingService::hasLaunchIdentity)
+                .findFirst()
+                .orElse(null);
+        if (representative != null) {
+            MixedInstancesPolicy sourceMixedPolicy = refresh.getSourceMixedInstancesPolicy();
+            if (sourceMixedPolicy != null) {
+                MixedInstancesPolicy.LaunchTemplateSpecification specification =
+                        mixedInstancesLaunchTemplateSpecification(sourceMixedPolicy);
+                specification.setLaunchTemplateId(representative.getLaunchTemplateId());
+                specification.setLaunchTemplateName(representative.getLaunchTemplateName());
+                specification.setVersion(representative.getLaunchTemplateVersion());
+            } else {
+                refresh.setSourceLaunchConfigurationName(representative.getLaunchConfigurationName());
+                refresh.setSourceLaunchTemplateId(representative.getLaunchTemplateId());
+                refresh.setSourceLaunchTemplateName(representative.getLaunchTemplateName());
+                refresh.setSourceLaunchTemplateVersion(representative.getLaunchTemplateVersion());
+            }
+        }
+    }
+
+    private static boolean hasLaunchIdentity(AsgInstance instance) {
+        return instance.getLaunchConfigurationName() != null
+                || instance.getLaunchTemplateId() != null
+                || instance.getLaunchTemplateName() != null;
+    }
+
+    private static void snapshotOriginalInstance(AsgInstance original, InstanceRefreshReplacement replacement) {
+        replacement.setOriginalLaunchConfigurationName(original.getLaunchConfigurationName());
+        replacement.setOriginalLaunchTemplateId(original.getLaunchTemplateId());
+        replacement.setOriginalLaunchTemplateName(original.getLaunchTemplateName());
+        replacement.setOriginalLaunchTemplateVersion(original.getLaunchTemplateVersion());
+        replacement.setOriginalInstanceType(original.getInstanceType());
+        replacement.setOriginalAvailabilityZone(original.getAvailabilityZone());
+        replacement.setOriginalProtectedFromScaleIn(original.isProtectedFromScaleIn());
+    }
+
+    static void restoreSourceConfiguration(AutoScalingGroup asg, InstanceRefresh refresh) {
+        asg.setLaunchConfigurationName(refresh.getSourceLaunchConfigurationName());
+        asg.setLaunchTemplateId(refresh.getSourceLaunchTemplateId());
+        asg.setLaunchTemplateName(refresh.getSourceLaunchTemplateName());
+        asg.setLaunchTemplateVersion(refresh.getSourceLaunchTemplateVersion());
+        asg.setMixedInstancesPolicy(copyMixedInstancesPolicy(refresh.getSourceMixedInstancesPolicy()));
     }
 
     static AutoScalingGroup desiredLaunchSource(AutoScalingGroup asg, InstanceRefresh refresh) {
