@@ -552,9 +552,15 @@ public class ElbV2Service {
             listener.setPort(port);
             restartDataPlane = true;
         }
-        if (protocol != null)      listener.setProtocol(protocol);
+        if (protocol != null && !Objects.equals(listener.getProtocol(), protocol)) {
+            listener.setProtocol(protocol);
+            restartDataPlane = true;
+        }
         if (sslPolicy != null)     listener.setSslPolicy(sslPolicy);
-        if (certificates != null)  listener.setCertificates(new ArrayList<>(certificates));
+        if (certificates != null && !Objects.equals(listener.getCertificates(), certificates)) {
+            listener.setCertificates(new ArrayList<>(certificates));
+            restartDataPlane = true;
+        }
         if (alpnPolicy != null)    listener.setAlpnPolicy(new ArrayList<>(alpnPolicy));
         if (defaultActions != null) {
             listener.setDefaultActions(new ArrayList<>(defaultActions));
@@ -824,12 +830,14 @@ public class ElbV2Service {
             }
         }
         persistRegion(listeners, region);
+        dataPlane.restartListener(listener, region, getListenerRules(region, listenerArn));
     }
 
     public void removeListenerCertificates(String region, String listenerArn, List<String> certArns) {
         Listener listener = requireListener(region, listenerArn);
         listener.getCertificates().removeAll(certArns);
         persistRegion(listeners, region);
+        dataPlane.restartListener(listener, region, getListenerRules(region, listenerArn));
     }
 
     public List<String> describeListenerCertificates(String region, String listenerArn) {
