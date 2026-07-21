@@ -4,11 +4,23 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
+import software.amazon.awssdk.services.autoscaling.model.AutoScalingException;
 
+import java.net.URI;
 import java.util.Map;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
@@ -373,8 +385,178 @@ class AutoScalingRuntimeAuthorizationIntegrationTest {
                 .body(containsString("autoscaling:DeleteLifecycleHook"));
     }
 
+    @Test
+    void authorizesGroupUpdatesAgainstExactArnAndPersistedTagsWithSdk() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String launchConfigurationName = "update-runtime-lc-" + suffix;
+        String allowedName = "team-a-update-allowed-" + suffix;
+        String wrongTagName = "team-a-update-wrong-tag-" + suffix;
+        String missingPermissionName = "team-a-update-missing-permission-" + suffix;
+        createLaunchConfiguration(launchConfigurationName);
+        createAutoScalingGroup(ACCOUNT_ID, launchConfigurationName, allowedName, "floci")
+                .statusCode(200);
+        createAutoScalingGroup(ACCOUNT_ID, launchConfigurationName, wrongTagName, "other")
+                .statusCode(200);
+        createAutoScalingGroup(ACCOUNT_ID, launchConfigurationName, missingPermissionName, "floci")
+                .statusCode(200);
+
+        SessionCredentials allowed = createUpdateSession(true);
+        SessionCredentials missingPermission = createUpdateSession(false);
+        try (AutoScalingClient root = autoScalingClient(ACCOUNT_ID, "test-secret-key", null);
+                AutoScalingClient allowedClient = autoScalingClient(allowed);
+                AutoScalingClient missingPermissionClient = autoScalingClient(missingPermission)) {
+            allowedClient.updateAutoScalingGroup(request -> request
+                    .autoScalingGroupName(allowedName)
+                    .maxSize(3)
+                    .defaultCooldown(120)
+                    .healthCheckGracePeriod(45)
+                    .terminationPolicies("OldestInstance"));
+            var updated = describeAutoScalingGroup(root, allowedName);
+            assertEquals(3, updated.maxSize());
+            assertEquals(120, updated.defaultCooldown());
+            assertEquals(45, updated.healthCheckGracePeriod());
+            assertEquals("OldestInstance", updated.terminationPolicies().getFirst());
+
+            var wrongTagBefore = describeAutoScalingGroup(root, wrongTagName);
+            AutoScalingException wrongTag = assertThrows(AutoScalingException.class,
+                    () -> allowedClient.updateAutoScalingGroup(request -> request
+                            .autoScalingGroupName(wrongTagName)
+                            .maxSize(4)
+                            .defaultCooldown(30)));
+            assertAccessDenied(wrongTag, "autoscaling:UpdateAutoScalingGroup");
+            assertEquals(wrongTagBefore, describeAutoScalingGroup(root, wrongTagName));
+
+            var missingPermissionBefore = describeAutoScalingGroup(root, missingPermissionName);
+            AutoScalingException denied = assertThrows(AutoScalingException.class,
+                    () -> missingPermissionClient.updateAutoScalingGroup(request -> request
+                            .autoScalingGroupName(missingPermissionName)
+                            .maxSize(4)
+                            .defaultCooldown(30)));
+            assertAccessDenied(denied, "autoscaling:UpdateAutoScalingGroup");
+            assertEquals(missingPermissionBefore, describeAutoScalingGroup(root, missingPermissionName));
+        }
+    }
+
+    @Test
+    void authorizesInstanceRefreshAgainstExactArnAndPersistedTagsWithSdk() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String launchConfigurationName = "refresh-runtime-lc-" + suffix;
+        String allowedName = "team-a-refresh-allowed-" + suffix;
+        String wrongTagName = "team-a-refresh-wrong-tag-" + suffix;
+        String missingPermissionName = "team-a-refresh-missing-permission-" + suffix;
+        createLaunchConfiguration(launchConfigurationName);
+        createAutoScalingGroup(ACCOUNT_ID, launchConfigurationName, allowedName, "floci")
+                .statusCode(200);
+        createAutoScalingGroup(ACCOUNT_ID, launchConfigurationName, wrongTagName, "other")
+                .statusCode(200);
+        createAutoScalingGroup(ACCOUNT_ID, launchConfigurationName, missingPermissionName, "floci")
+                .statusCode(200);
+
+        SessionCredentials allowed = createRefreshSession(true);
+        SessionCredentials missingPermission = createRefreshSession(false);
+        try (AutoScalingClient root = autoScalingClient(ACCOUNT_ID, "test-secret-key", null);
+                AutoScalingClient allowedClient = autoScalingClient(allowed);
+                AutoScalingClient missingPermissionClient = autoScalingClient(missingPermission)) {
+            String refreshId = allowedClient.startInstanceRefresh(request -> request
+                            .autoScalingGroupName(allowedName)
+                            .preferences(preferences -> preferences
+                                    .minHealthyPercentage(100)
+                                    .maxHealthyPercentage(100)
+                                    .skipMatching(true)))
+                    .instanceRefreshId();
+            assertNotNull(refreshId);
+            var refreshes = describeInstanceRefreshes(root, allowedName);
+            assertEquals(1, refreshes.size());
+            assertEquals(refreshId, refreshes.getFirst().instanceRefreshId());
+
+            var wrongTagBefore = describeAutoScalingGroup(root, wrongTagName);
+            AutoScalingException wrongTag = assertThrows(AutoScalingException.class,
+                    () -> allowedClient.startInstanceRefresh(request -> request
+                            .autoScalingGroupName(wrongTagName)));
+            assertAccessDenied(wrongTag, "autoscaling:StartInstanceRefresh");
+            assertTrue(describeInstanceRefreshes(root, wrongTagName).isEmpty());
+            assertEquals(wrongTagBefore, describeAutoScalingGroup(root, wrongTagName));
+
+            var missingPermissionBefore = describeAutoScalingGroup(root, missingPermissionName);
+            AutoScalingException denied = assertThrows(AutoScalingException.class,
+                    () -> missingPermissionClient.startInstanceRefresh(request -> request
+                            .autoScalingGroupName(missingPermissionName)));
+            assertAccessDenied(denied, "autoscaling:StartInstanceRefresh");
+            assertTrue(describeInstanceRefreshes(root, missingPermissionName).isEmpty());
+            assertEquals(missingPermissionBefore, describeAutoScalingGroup(root, missingPermissionName));
+        }
+    }
+
     private static Fixture createFixture() {
         return createFixture(true, true);
+    }
+
+    private static SessionCredentials createUpdateSession(boolean allowUpdate) {
+        String roleName = "AutoScalingUpdateOperator" + UUID.randomUUID().toString().substring(0, 8);
+        createRole(roleName);
+        if (allowUpdate) {
+            given()
+                    .formParam("Action", "PutRolePolicy")
+                    .formParam("RoleName", roleName)
+                    .formParam("PolicyName", "ScopedAutoScalingGroupUpdate")
+                    .formParam("PolicyDocument", """
+                            {
+                              "Version": "2012-10-17",
+                              "Statement": [{
+                                "Effect": "Allow",
+                                "Action": "autoscaling:UpdateAutoScalingGroup",
+                                "Resource": "arn:aws:autoscaling:%s:%s:autoScalingGroup:*:autoScalingGroupName/team-a-*",
+                                "Condition": {
+                                  "StringEquals": {
+                                    "aws:ResourceTag/example.io:definition-id": "example",
+                                    "aws:ResourceTag/example.io:managed-by": "floci",
+                                    "aws:RequestedRegion": "%s"
+                                  }
+                                }
+                              }]
+                            }
+                            """.formatted(REGION, ACCOUNT_ID, REGION))
+                    .header("Authorization", auth(ACCOUNT_ID, "iam"))
+            .when()
+                    .post("/")
+            .then()
+                    .statusCode(200);
+        }
+        return assumeRole(roleName);
+    }
+
+    private static SessionCredentials createRefreshSession(boolean allowRefresh) {
+        String roleName = "AutoScalingRefreshOperator" + UUID.randomUUID().toString().substring(0, 8);
+        createRole(roleName);
+        if (allowRefresh) {
+            given()
+                    .formParam("Action", "PutRolePolicy")
+                    .formParam("RoleName", roleName)
+                    .formParam("PolicyName", "ScopedAutoScalingInstanceRefresh")
+                    .formParam("PolicyDocument", """
+                            {
+                              "Version": "2012-10-17",
+                              "Statement": [{
+                                "Effect": "Allow",
+                                "Action": "autoscaling:StartInstanceRefresh",
+                                "Resource": "arn:aws:autoscaling:%s:%s:autoScalingGroup:*:autoScalingGroupName/team-a-*",
+                                "Condition": {
+                                  "StringEquals": {
+                                    "aws:ResourceTag/example.io:definition-id": "example",
+                                    "aws:ResourceTag/example.io:managed-by": "floci",
+                                    "aws:RequestedRegion": "%s"
+                                  }
+                                }
+                              }]
+                            }
+                            """.formatted(REGION, ACCOUNT_ID, REGION))
+                    .header("Authorization", auth(ACCOUNT_ID, "iam"))
+            .when()
+                    .post("/")
+            .then()
+                    .statusCode(200);
+        }
+        return assumeRole(roleName);
     }
 
     private static Fixture createFixture(boolean allowTagUpdates) {
@@ -527,7 +709,46 @@ class AutoScalingRuntimeAuthorizationIntegrationTest {
                 .response();
         return new SessionCredentials(
                 response.path("AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId"),
+                response.path("AssumeRoleResponse.AssumeRoleResult.Credentials.SecretAccessKey"),
                 response.path("AssumeRoleResponse.AssumeRoleResult.Credentials.SessionToken"));
+    }
+
+    private static AutoScalingClient autoScalingClient(SessionCredentials credentials) {
+        return autoScalingClient(
+                credentials.accessKeyId(), credentials.secretAccessKey(), credentials.sessionToken());
+    }
+
+    private static AutoScalingClient autoScalingClient(
+            String accessKeyId, String secretAccessKey, String sessionToken) {
+        var credentials = sessionToken == null
+                ? AwsBasicCredentials.create(accessKeyId, secretAccessKey)
+                : AwsSessionCredentials.create(accessKeyId, secretAccessKey, sessionToken);
+        return AutoScalingClient.builder()
+                .endpointOverride(URI.create("http://localhost:" + io.restassured.RestAssured.port))
+                .httpClientBuilder(UrlConnectionHttpClient.builder())
+                .region(Region.of(REGION))
+                .credentialsProvider(StaticCredentialsProvider.create(credentials))
+                .build();
+    }
+
+    private static software.amazon.awssdk.services.autoscaling.model.AutoScalingGroup
+            describeAutoScalingGroup(AutoScalingClient client, String name) {
+        return client.describeAutoScalingGroups(request -> request.autoScalingGroupNames(name))
+                .autoScalingGroups().getFirst();
+    }
+
+    private static java.util.List<software.amazon.awssdk.services.autoscaling.model.InstanceRefresh>
+            describeInstanceRefreshes(AutoScalingClient client, String name) {
+        return client.describeInstanceRefreshes(request -> request.autoScalingGroupName(name))
+                .instanceRefreshes();
+    }
+
+    private static void assertAccessDenied(AutoScalingException exception, String action) {
+        assertEquals(403, exception.statusCode());
+        assertEquals("AccessDenied", exception.awsErrorDetails().errorCode());
+        assertTrue(exception.getMessage().contains(action));
+        assertTrue(exception.getMessage().contains("SDK Attempt Count: 1"));
+        assertNotNull(exception.requestId());
     }
 
     private static io.restassured.response.ValidatableResponse createAutoScalingGroup(
@@ -720,7 +941,8 @@ class AutoScalingRuntimeAuthorizationIntegrationTest {
                 .header("X-Amz-Security-Token", credentials.sessionToken());
     }
 
-    private record SessionCredentials(String accessKeyId, String sessionToken) {}
+    private record SessionCredentials(
+            String accessKeyId, String secretAccessKey, String sessionToken) {}
 
     private record Fixture(
             String launchConfigurationName, String allowedName,

@@ -42,7 +42,9 @@ public class IamConditionContextResolver {
         boolean createGroup = "autoscaling:CreateAutoScalingGroup".equals(action);
         boolean updateTags = "autoscaling:CreateOrUpdateTags".equals(action);
         boolean deleteGroup = "autoscaling:DeleteAutoScalingGroup".equals(action);
-        boolean mutateGroupConfiguration = "autoscaling:PutLifecycleHook".equals(action)
+        boolean mutateGroupConfiguration = "autoscaling:UpdateAutoScalingGroup".equals(action)
+                || "autoscaling:StartInstanceRefresh".equals(action)
+                || "autoscaling:PutLifecycleHook".equals(action)
                 || "autoscaling:DeleteLifecycleHook".equals(action)
                 || "autoscaling:PutScalingPolicy".equals(action)
                 || "autoscaling:DeletePolicy".equals(action);
