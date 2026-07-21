@@ -206,7 +206,9 @@ public class ResourceArnBuilder {
             return AwsArnUtils.Arn.of("ec2", region, accountId,
                     "launch-template/lt-00000000000000000").toString();
         }
-        if (!"DeleteLaunchTemplate".equals(action)) {
+        if (!"CreateLaunchTemplateVersion".equals(action)
+                && !"ModifyLaunchTemplate".equals(action)
+                && !"DeleteLaunchTemplate".equals(action)) {
             return "*";
         }
         String id = formRequestResolver.firstParameter(ctx, "LaunchTemplateId");
