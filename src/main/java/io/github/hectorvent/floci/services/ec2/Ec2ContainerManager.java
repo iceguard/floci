@@ -144,7 +144,7 @@ public class Ec2ContainerManager {
                         .withName(containerName)
                         .withEmbeddedDns()
                         .withDockerNetwork(Optional.empty())
-                        .withEnv(localAwsEnvironment(region, serviceEndpoint, imdsEndpoint))
+                        .withEnv(localAwsEnvironment(instance, region, serviceEndpoint, imdsEndpoint))
                         .withEnv("AWS_EC2_INSTANCE_ID", instanceId)
                         .withPortBinding(22, sshHostPort)
                         .withHostDockerInternalOnLinux()
@@ -641,15 +641,19 @@ public class Ec2ContainerManager {
                 "exit 1")};
     }
 
-    static List<String> localAwsEnvironment(String region, String serviceEndpoint, String imdsEndpoint) {
-        return List.of(
+    static List<String> localAwsEnvironment(Instance instance, String region, String serviceEndpoint, String imdsEndpoint) {
+        List<String> environment = new ArrayList<>(List.of(
                 "AWS_EC2_METADATA_SERVICE_ENDPOINT=" + imdsEndpoint,
                 "AWS_ENDPOINT_URL=" + serviceEndpoint,
                 "AWS_DEFAULT_REGION=" + region,
-                "AWS_REGION=" + region,
+                "AWS_REGION=" + region));
+        if (instance.getIamInstanceProfileArn() == null || instance.getIamInstanceProfileArn().isBlank()) {
+            environment.addAll(List.of(
                 "AWS_ACCESS_KEY_ID=test",
                 "AWS_SECRET_ACCESS_KEY=test",
-                "AWS_SESSION_TOKEN=test-session-token");
+                "AWS_SESSION_TOKEN=test-session-token"));
+        }
+        return List.copyOf(environment);
     }
 
     private static String summarizeUserDataOutput(ByteArrayOutputStream output) {
