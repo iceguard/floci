@@ -53,6 +53,13 @@ public class ResourceArnBuilder {
     public List<AuthorizationRequest> resourceAuthorizations(
             String credentialScope, String action, ContainerRequestContext ctx,
             String region, String accountId) {
+        if ("iam".equals(credentialScope)
+                && ("iam:AddRoleToInstanceProfile".equals(action)
+                        || "iam:RemoveRoleFromInstanceProfile".equals(action))) {
+            return List.of(
+                    new AuthorizationRequest(action, existingRoleArn(ctx, accountId), null),
+                    new AuthorizationRequest(action, existingInstanceProfileArn(ctx, accountId), null));
+        }
         return List.of();
     }
 
@@ -147,7 +154,11 @@ public class ResourceArnBuilder {
         String action = formRequestResolver.firstParameter(ctx, "Action");
         return switch (action == null ? "" : action) {
             case "CreateRole" -> requestedRoleArn(ctx, accountId);
-            case "AttachRolePolicy", "DetachRolePolicy" -> existingRoleArn(ctx, accountId);
+            case "DeleteRole" -> existingRoleArn(ctx, accountId);
+            case "CreateInstanceProfile" -> requestedInstanceProfileArn(ctx, accountId);
+            case "DeleteInstanceProfile" -> existingInstanceProfileArn(ctx, accountId);
+            case "AttachRolePolicy", "DetachRolePolicy", "PutRolePolicy", "DeleteRolePolicy" ->
+                    existingRoleArn(ctx, accountId);
             default -> "*";
         };
     }
@@ -168,6 +179,23 @@ public class ResourceArnBuilder {
         return AwsArnUtils.Arn.of("iam", "", accountId, "role" + normalizedPath + roleName).toString();
     }
 
+    private String requestedInstanceProfileArn(ContainerRequestContext ctx, String accountId) {
+        String instanceProfileName = formRequestResolver.firstParameter(ctx, "InstanceProfileName");
+        if (instanceProfileName == null || instanceProfileName.isBlank()) {
+            return "*";
+        }
+        String path = formRequestResolver.firstParameter(ctx, "Path");
+        String normalizedPath = path == null || path.isBlank() ? "/" : path;
+        if (!normalizedPath.startsWith("/")) {
+            normalizedPath = "/" + normalizedPath;
+        }
+        if (!normalizedPath.endsWith("/")) {
+            normalizedPath += "/";
+        }
+        return AwsArnUtils.Arn.of(
+                "iam", "", accountId, "instance-profile" + normalizedPath + instanceProfileName).toString();
+    }
+
     private String existingRoleArn(ContainerRequestContext ctx, String accountId) {
         String roleName = formRequestResolver.firstParameter(ctx, "RoleName");
         if (roleName == null || roleName.isBlank()) {
@@ -178,6 +206,21 @@ public class ResourceArnBuilder {
         } catch (AwsException e) {
             LOG.debugv("Unable to resolve IAM role resource {0}: {1}", roleName, e.getMessage());
             return AwsArnUtils.Arn.of("iam", "", accountId, "role/" + roleName).toString();
+        }
+    }
+
+    private String existingInstanceProfileArn(ContainerRequestContext ctx, String accountId) {
+        String instanceProfileName = formRequestResolver.firstParameter(ctx, "InstanceProfileName");
+        if (instanceProfileName == null || instanceProfileName.isBlank()) {
+            return "*";
+        }
+        try {
+            return iamService.getInstanceProfile(instanceProfileName).getArn();
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve IAM instance profile resource {0}: {1}",
+                    instanceProfileName, e.getMessage());
+            return AwsArnUtils.Arn.of(
+                    "iam", "", accountId, "instance-profile/" + instanceProfileName).toString();
         }
     }
 

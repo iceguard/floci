@@ -859,6 +859,38 @@ class IamServiceTest {
     }
 
     @Test
+    void instanceProfileTagsLifecycle() {
+        iamService.createInstanceProfile("MyProfile", "/",
+                Map.of("owner", "platform", "stage", "initial"));
+
+        assertEquals(Map.of("owner", "platform", "stage", "initial"),
+                iamService.listInstanceProfileTags("MyProfile"));
+
+        iamService.tagInstanceProfile("MyProfile", Map.of("owner", "platform", "env", "test"));
+        iamService.untagInstanceProfile("MyProfile", List.of("stage", "absent"));
+
+        assertEquals(Map.of("owner", "platform", "env", "test"),
+                iamService.getInstanceProfile("MyProfile").getTags());
+    }
+
+    @Test
+    void instanceProfileTagFailuresDoNotMutateExistingProfile() {
+        iamService.createInstanceProfile("control", "/", Map.of("owner", "platform"));
+
+        AwsException listError = assertThrows(AwsException.class,
+                () -> iamService.listInstanceProfileTags("missing"));
+        AwsException tagError = assertThrows(AwsException.class,
+                () -> iamService.tagInstanceProfile("missing", Map.of("owner", "wrong")));
+        AwsException untagError = assertThrows(AwsException.class,
+                () -> iamService.untagInstanceProfile("missing", List.of("owner")));
+
+        assertEquals("NoSuchEntity", listError.getErrorCode());
+        assertEquals("NoSuchEntity", tagError.getErrorCode());
+        assertEquals("NoSuchEntity", untagError.getErrorCode());
+        assertEquals(Map.of("owner", "platform"), iamService.listInstanceProfileTags("control"));
+    }
+
+    @Test
     void addAndRemoveRoleFromInstanceProfile() {
         iamService.createRole("LambdaExec", "/", "{}", null, 0, null);
         iamService.createInstanceProfile("MyProfile", "/");

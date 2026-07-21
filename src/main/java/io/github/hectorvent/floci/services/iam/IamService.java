@@ -917,6 +917,11 @@ public class IamService implements SessionAccountLookup {
     // =========================================================================
 
     public InstanceProfile createInstanceProfile(String instanceProfileName, String path) {
+        return createInstanceProfile(instanceProfileName, path, Map.of());
+    }
+
+    public InstanceProfile createInstanceProfile(String instanceProfileName, String path,
+                                                 Map<String, String> tags) {
         if (instanceProfiles.get(instanceProfileName).isPresent()) {
             throw new AwsException("EntityAlreadyExists",
                     "Instance profile " + instanceProfileName + " already exists.", 409);
@@ -925,6 +930,9 @@ public class IamService implements SessionAccountLookup {
         String normalizedPath = normalizePath(path);
         String arn = iamArn("instance-profile", normalizedPath, instanceProfileName);
         InstanceProfile profile = new InstanceProfile(profileId, instanceProfileName, normalizedPath, arn);
+        if (tags != null) {
+            profile.getTags().putAll(tags);
+        }
         instanceProfiles.put(instanceProfileName, profile);
         LOG.infov("Created instance profile: {0}", instanceProfileName);
         return profile;
@@ -950,6 +958,22 @@ public class IamService implements SessionAccountLookup {
         return instanceProfiles.scan(k -> true).stream()
                 .filter(p -> p.getPath().startsWith(prefix))
                 .toList();
+    }
+
+    public void tagInstanceProfile(String instanceProfileName, Map<String, String> newTags) {
+        InstanceProfile profile = getInstanceProfile(instanceProfileName);
+        profile.getTags().putAll(newTags);
+        instanceProfiles.put(instanceProfileName, profile);
+    }
+
+    public void untagInstanceProfile(String instanceProfileName, List<String> tagKeys) {
+        InstanceProfile profile = getInstanceProfile(instanceProfileName);
+        tagKeys.forEach(profile.getTags()::remove);
+        instanceProfiles.put(instanceProfileName, profile);
+    }
+
+    public Map<String, String> listInstanceProfileTags(String instanceProfileName) {
+        return getInstanceProfile(instanceProfileName).getTags();
     }
 
     public void addRoleToInstanceProfile(String instanceProfileName, String roleName) {
