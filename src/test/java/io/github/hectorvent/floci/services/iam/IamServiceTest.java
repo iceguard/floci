@@ -598,10 +598,14 @@ class IamServiceTest {
         IamPolicy ssm = iamService.getPolicy("arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore");
         assertEquals("AmazonSSMManagedInstanceCore", ssm.getPolicyName());
         assertEquals("/", ssm.getPath());
+        assertEquals(AwsManagedPolicies.AMAZON_SSM_MANAGED_INSTANCE_CORE_DOCUMENT,
+                ssm.getDefaultDocument());
+        assertFalse(ssm.getDefaultDocument().contains("secretsmanager:"));
 
         IamPolicy cloudWatchAgent = iamService.getPolicy("arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy");
         assertEquals("CloudWatchAgentServerPolicy", cloudWatchAgent.getPolicyName());
         assertEquals("/", cloudWatchAgent.getPath());
+        assertEquals(AwsManagedPolicies.PERMISSIVE_DOCUMENT, cloudWatchAgent.getDefaultDocument());
 
         IamPolicy ecrReadOnly = iamService.getPolicy("arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly");
         assertEquals("AmazonEC2ContainerRegistryReadOnly", ecrReadOnly.getPolicyName());
