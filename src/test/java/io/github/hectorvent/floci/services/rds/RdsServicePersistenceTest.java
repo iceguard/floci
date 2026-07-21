@@ -14,6 +14,8 @@ import io.github.hectorvent.floci.services.rds.model.DbInstance;
 import io.github.hectorvent.floci.services.rds.model.DbParameterGroup;
 import io.github.hectorvent.floci.services.rds.model.DbSubnetGroup;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyManager;
+import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
+import io.github.hectorvent.floci.services.secretsmanager.model.Secret;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -23,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
@@ -146,7 +149,32 @@ class RdsServicePersistenceTest {
         assertEquals(true, service.getDbInstance("legacy").isAutoMinorVersionUpgrade());
     }
 
+    @Test
+    void resolvedDefaultManagedMasterSecretKmsKeySurvivesRestart(@TempDir Path dir) {
+        SecretsManagerService secretsManager = mock(SecretsManagerService.class);
+        Secret secret = new Secret();
+        secret.setArn("arn:aws:secretsmanager:us-west-2:123456789012:secret:rds!managed");
+        when(secretsManager.createSecret(any(), any(), eq(null), any(), eq(null), eq(null), eq("us-west-2")))
+                .thenReturn(secret);
+        RdsService first = newService(dir, secretsManager);
+
+        DbInstance created = first.createDbInstance(
+                "managed", "postgres", "16.3", "admin", null, "app",
+                "db.t3.micro", 20, false, null, null, null, null, false,
+                true, null, Map.of(), List.of(), "us-west-2", true);
+        RdsService restarted = newService(dir);
+
+        assertEquals(created.getMasterUserSecretKmsKeyId(),
+                restarted.getDbInstance("managed").getMasterUserSecretKmsKeyId());
+        assertTrue(created.getMasterUserSecretKmsKeyId()
+                .startsWith("arn:aws:kms:us-west-2:123456789012:key/"));
+    }
+
     private RdsService newService(Path dir) {
+        return newService(dir, null);
+    }
+
+    private RdsService newService(Path dir, SecretsManagerService secretsManagerService) {
         Ec2Service ec2Service = mock(Ec2Service.class);
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
@@ -179,7 +207,9 @@ class RdsServicePersistenceTest {
                 load(dir, "rds-parameter-groups.json", new TypeReference<Map<String, DbParameterGroup>>() {}),
                 load(dir, "rds-cluster-parameter-groups.json",
                         new TypeReference<Map<String, DbClusterParameterGroup>>() {}),
-                load(dir, "rds-subnet-groups.json", new TypeReference<Map<String, DbSubnetGroup>>() {}));
+                load(dir, "rds-subnet-groups.json", new TypeReference<Map<String, DbSubnetGroup>>() {}),
+                secretsManagerService,
+                null);
     }
 
     private static Subnet subnet(String id, String availabilityZone) {

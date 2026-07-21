@@ -222,6 +222,80 @@ class RdsServiceTest {
     }
 
     @Test
+    void deleteDbInstanceDeletesManagedMasterPasswordSecret() {
+        SecretsManagerService secretsManager = mock(SecretsManagerService.class);
+        Secret secret = new Secret();
+        String secretArn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:rds!db-secret";
+        when(ec2Service.describeSubnets(eq("us-west-2"), anyList(), any()))
+                .thenReturn(List.of(
+                        subnet("subnet-west-a", "vpc-west", "us-west-2a"),
+                        subnet("subnet-west-b", "vpc-west", "us-west-2b")));
+        secret.setArn(secretArn);
+        when(secretsManager.createSecret(any(), any(), eq(null), any(), eq(null), eq(null), eq("us-west-2")))
+                .thenReturn(secret);
+        RdsService service = newService(containerManager, proxyManager,
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                secretsManager);
+
+        service.createDbInstance("mydb", "postgres", "13",
+                "admin", null, "dbname", "db.t3.micro",
+                20, true, null, null, null, null, false, true, null,
+                Map.of(), "us-west-2");
+
+        service.deleteDbInstance("mydb");
+
+        verify(secretsManager).deleteSecret(secretArn, null, true, "us-west-2");
+        assertEquals(0, service.listDbInstances(null).size());
+    }
+
+    @Test
+    void deleteDbInstanceDoesNotDeleteSecretsForUnmanagedPassword() {
+        SecretsManagerService secretsManager = mock(SecretsManagerService.class);
+        RdsService service = newService(containerManager, proxyManager,
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                secretsManager);
+
+        service.createDbInstance("mydb", "postgres", "13",
+                "admin", "password", "dbname", "db.t3.micro",
+                20, true, null, null, null);
+
+        service.deleteDbInstance("mydb");
+
+        verify(secretsManager, never()).deleteSecret(any(), any(), anyBoolean(), any());
+        assertEquals(0, service.listDbInstances(null).size());
+    }
+
+    @Test
+    void createDbInstanceWithManagedMasterPasswordResolvesDefaultKmsKeyForRdsOnly() {
+        SecretsManagerService secretsManager = mock(SecretsManagerService.class);
+        when(secretsManager.createSecret(any(), any(), eq(null), any(), eq(null), eq(null), eq("us-east-1")))
+                .thenAnswer(invocation -> {
+                    Secret secret = new Secret();
+                    secret.setArn("arn:aws:secretsmanager:us-east-1:123456789012:secret:" + invocation.getArgument(0));
+                    return secret;
+                });
+        RdsService service = newService(containerManager, proxyManager,
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
+                secretsManager);
+
+        DbInstance first = service.createDbInstance("first", "postgres", "13",
+                "admin", null, "dbname", "db.t3.micro",
+                20, true, null, null, null, true, null);
+        DbInstance second = service.createDbInstance("second", "postgres", "13",
+                "admin", null, "dbname", "db.t3.micro",
+                20, true, null, null, null, true, null);
+
+        assertTrue(first.getMasterUserSecretKmsKeyId()
+                .matches("arn:aws:kms:us-east-1:123456789012:key/[0-9a-f-]{36}"));
+        assertEquals(first.getMasterUserSecretKmsKeyId(), second.getMasterUserSecretKmsKeyId());
+        verify(secretsManager, org.mockito.Mockito.times(2)).createSecret(
+                any(), any(), eq(null), any(), eq(null), eq(null), eq("us-east-1"));
+    }
+
+    @Test
     void createDbInstanceRejectsUnknownParameterGroup() {
         AwsException exception = assertThrows(AwsException.class, () -> rdsService.createDbInstance("mydb", "postgres", "13",
                 "admin", "password", "dbname", "db.t3.micro",
