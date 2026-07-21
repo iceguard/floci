@@ -122,7 +122,9 @@ public class IamConditionContextResolver {
         }
         if ("ec2:CreateLaunchTemplate".equals(action)) {
             readLaunchTemplateRequestTags(ctx, conditions);
-        } else if ("ec2:DeleteLaunchTemplate".equals(action)) {
+        } else if ("ec2:CreateLaunchTemplateVersion".equals(action)
+                || "ec2:ModifyLaunchTemplate".equals(action)
+                || "ec2:DeleteLaunchTemplate".equals(action)) {
             addLaunchTemplateResourceTags(ctx, region, conditions);
         } else {
             return null;
