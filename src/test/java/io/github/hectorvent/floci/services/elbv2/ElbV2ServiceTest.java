@@ -124,6 +124,49 @@ class ElbV2ServiceTest {
     }
 
     @Test
+    void modifyListenerProtocolAndCertificateRestartsListener() {
+        String lbArn = service.createLoadBalancer(
+                REGION, "tls-lb", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of("sg-a"), Map.of()).getLoadBalancerArn();
+        String listenerArn = service.createListener(
+                REGION, lbArn, "HTTP", 9443, null, List.of(),
+                List.of(), List.of(), Map.of()).getListenerArn();
+        clearInvocations(dataPlane);
+
+        service.modifyListener(
+                REGION, listenerArn, "HTTPS", null, "ELBSecurityPolicy-TLS13-1-2-2021-06",
+                List.of("arn:aws:acm:us-west-2:000000000000:certificate/first"), null, null);
+
+        ArgumentCaptor<Listener> listenerCaptor = ArgumentCaptor.captor();
+        verify(dataPlane).restartListener(listenerCaptor.capture(), eq(REGION), anyList());
+        assertEquals("HTTPS", listenerCaptor.getValue().getProtocol());
+        assertEquals(List.of("arn:aws:acm:us-west-2:000000000000:certificate/first"),
+                listenerCaptor.getValue().getCertificates());
+        verify(dataPlane, never()).recompileRules(anyString(), anyList());
+    }
+
+    @Test
+    void listenerCertificateLifecycleRefreshesDataPlane() {
+        String lbArn = service.createLoadBalancer(
+                REGION, "certificate-lb", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of("sg-a"), Map.of()).getLoadBalancerArn();
+        String firstCertificate = "arn:aws:acm:us-west-2:000000000000:certificate/first";
+        String secondCertificate = "arn:aws:acm:us-west-2:000000000000:certificate/second";
+        String listenerArn = service.createListener(
+                REGION, lbArn, "HTTPS", 9443, null, List.of(firstCertificate),
+                List.of(), List.of(), Map.of()).getListenerArn();
+        clearInvocations(dataPlane);
+
+        service.addListenerCertificates(REGION, listenerArn, List.of(secondCertificate));
+        service.removeListenerCertificates(REGION, listenerArn, List.of(firstCertificate));
+
+        verify(dataPlane, org.mockito.Mockito.times(2))
+                .restartListener(any(Listener.class), eq(REGION), anyList());
+        assertEquals(List.of(secondCertificate),
+                service.describeListenerCertificates(REGION, listenerArn));
+    }
+
+    @Test
     void createLoadBalancerUsesConfiguredHostnameForDnsSuffix() {
         EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.hostname()).thenReturn(Optional.of("floci"));
@@ -209,6 +252,29 @@ class ElbV2ServiceTest {
         ArgumentCaptor<Listener> listenerCaptor = ArgumentCaptor.captor();
         verify(reloadedDataPlane).startListener(listenerCaptor.capture(), eq(REGION), anyList());
         assertEquals(listenerArn, listenerCaptor.getValue().getListenerArn());
+    }
+
+    @Test
+    void initializeStorageRestoresHttpsListenerCertificate() {
+        SharedStorageFactory storageFactory = new SharedStorageFactory();
+        ElbV2Service first = serviceWithStorage(
+                storageFactory, mock(ElbV2DataPlane.class), mock(ElbV2HealthChecker.class));
+        String lbArn = first.createLoadBalancer(
+                REGION, "persisted-https-lb", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of("sg-a"), Map.of()).getLoadBalancerArn();
+        String certificateArn = "arn:aws:acm:us-west-2:000000000000:certificate/persisted";
+        String listenerArn = first.createListener(
+                REGION, lbArn, "HTTPS", 9443, "ELBSecurityPolicy-TLS13-1-2-2021-06",
+                List.of(certificateArn), List.of(), List.of(), Map.of()).getListenerArn();
+
+        ElbV2DataPlane reloadedDataPlane = mock(ElbV2DataPlane.class);
+        serviceWithStorage(storageFactory, reloadedDataPlane, mock(ElbV2HealthChecker.class));
+
+        ArgumentCaptor<Listener> listenerCaptor = ArgumentCaptor.captor();
+        verify(reloadedDataPlane).startListener(listenerCaptor.capture(), eq(REGION), anyList());
+        assertEquals(listenerArn, listenerCaptor.getValue().getListenerArn());
+        assertEquals("HTTPS", listenerCaptor.getValue().getProtocol());
+        assertEquals(List.of(certificateArn), listenerCaptor.getValue().getCertificates());
     }
 
     @Test
