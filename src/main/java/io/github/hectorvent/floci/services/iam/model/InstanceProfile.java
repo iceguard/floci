@@ -5,6 +5,8 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 @RegisterForReflection
@@ -16,6 +18,7 @@ public class InstanceProfile {
     private String path;
     private String arn;
     private Instant createDate;
+    private Map<String, String> tags = new ConcurrentHashMap<>();
     private List<String> roleNames = new CopyOnWriteArrayList<>();
 
     public InstanceProfile() {}
@@ -43,6 +46,11 @@ public class InstanceProfile {
 
     public Instant getCreateDate() { return createDate; }
     public void setCreateDate(Instant createDate) { this.createDate = createDate; }
+
+    public Map<String, String> getTags() { return tags; }
+    public void setTags(Map<String, String> tags) {
+        this.tags = new ConcurrentHashMap<>(tags);
+    }
 
     public List<String> getRoleNames() { return roleNames; }
     public void setRoleNames(List<String> roleNames) {
