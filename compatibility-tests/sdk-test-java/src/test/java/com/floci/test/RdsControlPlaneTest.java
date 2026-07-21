@@ -16,11 +16,14 @@ import software.amazon.awssdk.services.rds.model.CreateDbSubnetGroupResponse;
 import software.amazon.awssdk.services.rds.model.DescribeDbSubnetGroupsResponse;
 import software.amazon.awssdk.services.rds.model.DescribeOrderableDbInstanceOptionsResponse;
 import software.amazon.awssdk.services.rds.model.Tag;
+import software.amazon.awssdk.services.secretsmanager.SecretsManagerClient;
+import software.amazon.awssdk.services.secretsmanager.model.ResourceNotFoundException;
 
 import java.net.URI;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @DisplayName("RDS Control Plane")
 class RdsControlPlaneTest {
@@ -231,6 +234,59 @@ class RdsControlPlaneTest {
                             .dbInstanceIdentifier(instanceName)
                             .autoMinorVersionUpgrade(true))
                     .dbInstance().autoMinorVersionUpgrade()).isTrue();
+        } finally {
+            if (created) {
+                rds.deleteDBInstance(b -> b
+                        .dbInstanceIdentifier(instanceName)
+                        .skipFinalSnapshot(true));
+            }
+        }
+    }
+
+    @Test
+    void sdkResolvesDefaultManagedMasterSecretKmsKeyWhenOmitted() {
+        String instanceName = TestFixtures.uniqueName("rds-managed-secret");
+        boolean created = false;
+        try {
+            var createdInstance = rds.createDBInstance(b -> b
+                            .dbInstanceIdentifier(instanceName)
+                            .dbInstanceClass("db.t3.micro")
+                            .engine("postgres")
+                            .masterUsername("admin")
+                            .dbName("app")
+                            .allocatedStorage(20)
+                            .manageMasterUserPassword(true))
+                    .dbInstance();
+            created = true;
+
+            assertThat(createdInstance.masterUserSecret()).isNotNull();
+            assertThat(createdInstance.masterUserSecret().secretArn()).isNotBlank();
+            String secretArn = createdInstance.masterUserSecret().secretArn();
+            assertThat(createdInstance.masterUserSecret().secretStatus()).isEqualTo("active");
+            assertThat(createdInstance.masterUserSecret().kmsKeyId())
+                    .matches("arn:aws:kms:us-east-1:000000000000:key/[0-9a-f-]{36}");
+
+            var describedInstance = rds.describeDBInstances(b -> b.dbInstanceIdentifier(instanceName))
+                    .dbInstances().getFirst();
+            assertThat(describedInstance.masterUserSecret()).isEqualTo(createdInstance.masterUserSecret());
+
+            try (SecretsManagerClient secretsManager = TestFixtures.secretsManagerClient()) {
+                assertThat(secretsManager.describeSecret(b -> b
+                                .secretId(secretArn))
+                        .kmsKeyId()).isNull();
+            }
+
+            rds.deleteDBInstance(b -> b
+                    .dbInstanceIdentifier(instanceName)
+                    .skipFinalSnapshot(true));
+            created = false;
+
+            String deletedSecretArn = secretArn;
+            try (SecretsManagerClient secretsManager = TestFixtures.secretsManagerClient()) {
+                assertThatThrownBy(() -> secretsManager.describeSecret(b -> b.secretId(deletedSecretArn)))
+                        .isInstanceOf(ResourceNotFoundException.class)
+                        .satisfies(error -> assertThat(((ResourceNotFoundException) error).statusCode()).isEqualTo(400));
+            }
         } finally {
             if (created) {
                 rds.deleteDBInstance(b -> b

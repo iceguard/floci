@@ -32,6 +32,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -42,6 +43,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -514,6 +516,9 @@ public class RdsService implements Resettable {
             throw new AwsException("InvalidParameterCombination",
                     "ManageMasterUserPassword requires Secrets Manager support.", 400);
         }
+        String effectiveKmsKeyId = kmsKeyId != null
+                ? kmsKeyId
+                : defaultManagedMasterSecretKmsKeyArn(region);
         String secretName = "rds!" + instance.getDbiResourceId();
         Secret secret = secretsManagerService.createSecret(
                 secretName,
@@ -525,7 +530,14 @@ public class RdsService implements Resettable {
                 region);
         instance.setMasterUserSecretArn(secret.getArn());
         instance.setMasterUserSecretStatus("active");
-        instance.setMasterUserSecretKmsKeyId(kmsKeyId);
+        instance.setMasterUserSecretKmsKeyId(effectiveKmsKeyId);
+    }
+
+    private String defaultManagedMasterSecretKmsKeyArn(String region) {
+        String accountId = regionResolver.getAccountId();
+        String seed = accountId + "|" + region + "|alias/aws/secretsmanager";
+        String keyId = UUID.nameUUIDFromBytes(seed.getBytes(StandardCharsets.UTF_8)).toString();
+        return AwsArnUtils.Arn.of("kms", region, accountId, "key/" + keyId).toString();
     }
 
     private static String managedMasterSecretString(DbInstance instance) {
@@ -706,6 +718,12 @@ public class RdsService implements Resettable {
                 cluster.getDbClusterMembers().remove(id);
                 clusters.put(clusterId, cluster);
             }
+        }
+
+        String masterUserSecretArn = instance.getMasterUserSecretArn();
+        if (secretsManagerService != null && masterUserSecretArn != null && !masterUserSecretArn.isBlank()) {
+            String secretRegion = AwsArnUtils.parse(masterUserSecretArn).region();
+            secretsManagerService.deleteSecret(masterUserSecretArn, null, true, secretRegion);
         }
 
         releaseProxyPort(instance.getProxyPort());
