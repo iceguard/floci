@@ -564,7 +564,9 @@ public class ResourceArnBuilder {
             return exactAutoScalingGroupArn(
                     formRequestResolver.firstParameter(ctx, "Tags.member.1.ResourceId"), region, accountId);
         }
-        if ("DeleteAutoScalingGroup".equals(action)
+        if ("UpdateAutoScalingGroup".equals(action)
+                || "StartInstanceRefresh".equals(action)
+                || "DeleteAutoScalingGroup".equals(action)
                 || "PutLifecycleHook".equals(action)
                 || "DeleteLifecycleHook".equals(action)
                 || "PutScalingPolicy".equals(action)
