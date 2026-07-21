@@ -50,6 +50,7 @@ import software.amazon.awssdk.services.iam.model.ListGroupsForUserResponse;
 import software.amazon.awssdk.services.iam.model.ListInstanceProfilesResponse;
 import software.amazon.awssdk.services.iam.model.ListRolePoliciesRequest;
 import software.amazon.awssdk.services.iam.model.ListRolePoliciesResponse;
+import software.amazon.awssdk.services.iam.model.ListRoleTagsRequest;
 import software.amazon.awssdk.services.iam.model.ListRolesResponse;
 import software.amazon.awssdk.services.iam.model.ListUserTagsRequest;
 import software.amazon.awssdk.services.iam.model.ListUserTagsResponse;
@@ -60,7 +61,10 @@ import software.amazon.awssdk.services.iam.model.RemoveRoleFromInstanceProfileRe
 import software.amazon.awssdk.services.iam.model.RemoveUserFromGroupRequest;
 import software.amazon.awssdk.services.iam.model.SimulatePrincipalPolicyRequest;
 import software.amazon.awssdk.services.iam.model.StatusType;
+import software.amazon.awssdk.services.iam.model.Tag;
+import software.amazon.awssdk.services.iam.model.TagRoleRequest;
 import software.amazon.awssdk.services.iam.model.TagUserRequest;
+import software.amazon.awssdk.services.iam.model.UntagRoleRequest;
 import software.amazon.awssdk.services.iam.model.UntagUserRequest;
 import software.amazon.awssdk.services.iam.model.UpdateAccessKeyRequest;
 
@@ -283,6 +287,9 @@ class IamTest {
                 .roleName(ROLE_NAME)
                 .assumeRolePolicyDocument(TRUST_POLICY)
                 .description("SDK test role")
+                .tags(
+                        Tag.builder().key("owner").value("platform").build(),
+                        Tag.builder().key("xml-special").value("edge<&\"'").build())
                 .build());
 
         assertThat(response.role().roleName()).isEqualTo(ROLE_NAME);
@@ -296,6 +303,40 @@ class IamTest {
                 .roleName(ROLE_NAME).build());
 
         assertThat(response.role().roleName()).isEqualTo(ROLE_NAME);
+        assertThat(response.role().tags())
+                .extracting(Tag::key, Tag::value)
+                .containsExactlyInAnyOrder(
+                        tuple("owner", "platform"),
+                        tuple("xml-special", "edge<&\"'"));
+
+        iam.tagRole(TagRoleRequest.builder()
+                .roleName(ROLE_NAME)
+                .tags(Tag.builder().key("stage").value("runtime").build())
+                .build());
+
+        assertThat(iam.getRole(GetRoleRequest.builder().roleName(ROLE_NAME).build()).role().tags())
+                .extracting(Tag::key, Tag::value)
+                .containsExactlyInAnyOrder(
+                        tuple("owner", "platform"),
+                        tuple("xml-special", "edge<&\"'"),
+                        tuple("stage", "runtime"));
+        assertThat(iam.listRoleTags(ListRoleTagsRequest.builder().roleName(ROLE_NAME).build()).tags())
+                .extracting(Tag::key, Tag::value)
+                .containsExactlyInAnyOrder(
+                        tuple("owner", "platform"),
+                        tuple("xml-special", "edge<&\"'"),
+                        tuple("stage", "runtime"));
+
+        iam.untagRole(UntagRoleRequest.builder()
+                .roleName(ROLE_NAME)
+                .tagKeys("stage")
+                .build());
+
+        assertThat(iam.getRole(GetRoleRequest.builder().roleName(ROLE_NAME).build()).role().tags())
+                .extracting(Tag::key, Tag::value)
+                .containsExactlyInAnyOrder(
+                        tuple("owner", "platform"),
+                        tuple("xml-special", "edge<&\"'"));
     }
 
     @Test

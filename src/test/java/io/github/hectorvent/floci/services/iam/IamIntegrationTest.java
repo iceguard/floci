@@ -690,6 +690,10 @@ class IamIntegrationTest {
             .formParam("Path", "/")
             .formParam("AssumeRolePolicyDocument", TRUST_POLICY)
             .formParam("Description", "Integration test role")
+            .formParam("Tags.member.1.Key", "owner")
+            .formParam("Tags.member.1.Value", "platform")
+            .formParam("Tags.member.2.Key", "xml-special")
+            .formParam("Tags.member.2.Value", "edge<&\"'")
             .header("Authorization",
                     "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
         .when()
@@ -715,7 +719,12 @@ class IamIntegrationTest {
             .post("/")
         .then()
             .statusCode(200)
-            .body("GetRoleResponse.GetRoleResult.Role.RoleName", equalTo("TestRole"));
+            .body("GetRoleResponse.GetRoleResult.Role.RoleName", equalTo("TestRole"))
+            .body("GetRoleResponse.GetRoleResult.Role.Tags.member.size()", equalTo(2))
+            .body("GetRoleResponse.GetRoleResult.Role.Tags.member.find { it.Key == 'owner' }.Value",
+                    equalTo("platform"))
+            .body("GetRoleResponse.GetRoleResult.Role.Tags.member.find { it.Key == 'xml-special' }.Value",
+                    equalTo("edge<&\"'"));
     }
 
     @Test
@@ -1056,6 +1065,10 @@ class IamIntegrationTest {
         given()
             .formParam("Action", "CreateInstanceProfile")
             .formParam("InstanceProfileName", "test-profile")
+            .formParam("Tags.member.1.Key", "owner")
+            .formParam("Tags.member.1.Value", "platform")
+            .formParam("Tags.member.2.Key", "xml-special")
+            .formParam("Tags.member.2.Value", "edge<&\"'")
             .header("Authorization",
                     "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
         .when()
@@ -1090,7 +1103,118 @@ class IamIntegrationTest {
             .body("GetInstanceProfileResponse.GetInstanceProfileResult.InstanceProfile.InstanceProfileName",
                     equalTo("test-profile"))
             .body("GetInstanceProfileResponse.GetInstanceProfileResult.InstanceProfile.Roles.member.RoleName",
-                    equalTo("TestRole"));
+                    equalTo("TestRole"))
+            .body("GetInstanceProfileResponse.GetInstanceProfileResult.InstanceProfile.Tags.member.size()",
+                    equalTo(2))
+            .body("GetInstanceProfileResponse.GetInstanceProfileResult.InstanceProfile.Tags.member"
+                            + ".find { it.Key == 'owner' }.Value",
+                    equalTo("platform"))
+            .body("GetInstanceProfileResponse.GetInstanceProfileResult.InstanceProfile.Tags.member"
+                            + ".find { it.Key == 'xml-special' }.Value",
+                    equalTo("edge<&\"'"));
+
+        given()
+            .formParam("Action", "ListInstanceProfileTags")
+            .formParam("InstanceProfileName", "test-profile")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ListInstanceProfileTagsResponse.ListInstanceProfileTagsResult.Tags.member.size()",
+                    equalTo(2))
+            .body("ListInstanceProfileTagsResponse.ListInstanceProfileTagsResult.IsTruncated", equalTo("false"));
+
+        given()
+            .formParam("Action", "TagInstanceProfile")
+            .formParam("InstanceProfileName", "test-profile")
+            .formParam("Tags.member.1.Key", "owner")
+            .formParam("Tags.member.1.Value", "platform")
+            .formParam("Tags.member.2.Key", "stage")
+            .formParam("Tags.member.2.Value", "runtime")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "UntagInstanceProfile")
+            .formParam("InstanceProfileName", "test-profile")
+            .formParam("TagKeys.member.1", "stage")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "ListInstanceProfileTags")
+            .formParam("InstanceProfileName", "test-profile")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ListInstanceProfileTagsResponse.ListInstanceProfileTagsResult.Tags.member.size()",
+                    equalTo(2))
+            .body("ListInstanceProfileTagsResponse.ListInstanceProfileTagsResult.Tags.member"
+                            + ".find { it.Key == 'owner' }.Value",
+                    equalTo("platform"))
+            .body("ListInstanceProfileTagsResponse.ListInstanceProfileTagsResult.Tags.member"
+                            + ".findAll { it.Key == 'stage' }.size()",
+                    equalTo(0));
+
+        given()
+            .formParam("Action", "TagInstanceProfile")
+            .formParam("InstanceProfileName", "missing-profile")
+            .formParam("Tags.member.1.Key", "owner")
+            .formParam("Tags.member.1.Value", "wrong")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(404)
+            .body("ErrorResponse.Error.Code", equalTo("NoSuchEntity"));
+
+        given()
+            .formParam("Action", "CreateInstanceProfile")
+            .formParam("InstanceProfileName", "empty-profile")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .formParam("Action", "GetInstanceProfile")
+            .formParam("InstanceProfileName", "empty-profile")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("<Tags>")));
+
+        given()
+            .formParam("Action", "ListInstanceProfileTags")
+            .formParam("InstanceProfileName", "empty-profile")
+            .header("Authorization",
+                    "AWS4-HMAC-SHA256 Credential=test/20260227/us-east-1/iam/aws4_request")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ListInstanceProfileTagsResponse.ListInstanceProfileTagsResult.Tags.member.size()",
+                    equalTo(0))
+            .body("ListInstanceProfileTagsResponse.ListInstanceProfileTagsResult.IsTruncated", equalTo("false"));
     }
 
     // =========================================================================

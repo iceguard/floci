@@ -147,6 +147,9 @@ public class IamQueryHandler {
             case "GetInstanceProfile" -> handleGetInstanceProfile(params);
             case "DeleteInstanceProfile" -> handleDeleteInstanceProfile(params);
             case "ListInstanceProfiles" -> handleListInstanceProfiles(params);
+            case "TagInstanceProfile" -> handleTagInstanceProfile(params);
+            case "UntagInstanceProfile" -> handleUntagInstanceProfile(params);
+            case "ListInstanceProfileTags" -> handleListInstanceProfileTags(params);
             case "AddRoleToInstanceProfile" -> handleAddRoleToInstanceProfile(params);
             case "RemoveRoleFromInstanceProfile" -> handleRemoveRoleFromInstanceProfile(params);
             case "ListInstanceProfilesForRole" -> handleListInstanceProfilesForRole(params);
@@ -390,7 +393,7 @@ public class IamQueryHandler {
 
     private Response handleGetRole(MultivaluedMap<String, String> params) {
         IamRole role = iamService.getRole(getParam(params, "RoleName"));
-        String result = new XmlBuilder().start("Role").raw(roleXml(role)).end("Role").build();
+        String result = new XmlBuilder().start("Role").raw(roleXml(role, true)).end("Role").build();
         return Response.ok(AwsQueryResponse.envelope("GetRole", AwsNamespaces.IAM, result)).build();
     }
 
@@ -739,14 +742,14 @@ public class IamQueryHandler {
 
     private Response handleCreateInstanceProfile(MultivaluedMap<String, String> params) {
         InstanceProfile profile = iamService.createInstanceProfile(
-                getParam(params, "InstanceProfileName"), getParam(params, "Path"));
+                getParam(params, "InstanceProfileName"), getParam(params, "Path"), extractTags(params));
         String result = new XmlBuilder().start("InstanceProfile").raw(instanceProfileXml(profile)).end("InstanceProfile").build();
         return Response.ok(AwsQueryResponse.envelope("CreateInstanceProfile", AwsNamespaces.IAM, result)).build();
     }
 
     private Response handleGetInstanceProfile(MultivaluedMap<String, String> params) {
         InstanceProfile profile = iamService.getInstanceProfile(getParam(params, "InstanceProfileName"));
-        String result = new XmlBuilder().start("InstanceProfile").raw(instanceProfileXml(profile)).end("InstanceProfile").build();
+        String result = new XmlBuilder().start("InstanceProfile").raw(instanceProfileXml(profile, true)).end("InstanceProfile").build();
         return Response.ok(AwsQueryResponse.envelope("GetInstanceProfile", AwsNamespaces.IAM, result)).build();
     }
 
@@ -763,6 +766,25 @@ public class IamQueryHandler {
         }
         xml.end("InstanceProfiles").elem("IsTruncated", false);
         return Response.ok(AwsQueryResponse.envelope("ListInstanceProfiles", AwsNamespaces.IAM, xml.build())).build();
+    }
+
+    private Response handleTagInstanceProfile(MultivaluedMap<String, String> params) {
+        iamService.tagInstanceProfile(getParam(params, "InstanceProfileName"), extractTags(params));
+        return Response.ok(AwsQueryResponse.envelopeNoResult("TagInstanceProfile", AwsNamespaces.IAM)).build();
+    }
+
+    private Response handleUntagInstanceProfile(MultivaluedMap<String, String> params) {
+        iamService.untagInstanceProfile(getParam(params, "InstanceProfileName"), extractTagKeys(params));
+        return Response.ok(AwsQueryResponse.envelopeNoResult("UntagInstanceProfile", AwsNamespaces.IAM)).build();
+    }
+
+    private Response handleListInstanceProfileTags(MultivaluedMap<String, String> params) {
+        Map<String, String> tags = iamService.listInstanceProfileTags(
+                getParam(params, "InstanceProfileName"));
+        String result = new XmlBuilder().start("Tags").raw(tagsXml(tags)).end("Tags")
+                .elem("IsTruncated", false).build();
+        return Response.ok(AwsQueryResponse.envelope(
+                "ListInstanceProfileTags", AwsNamespaces.IAM, result)).build();
     }
 
     private Response handleAddRoleToInstanceProfile(MultivaluedMap<String, String> params) {
@@ -873,7 +895,11 @@ public class IamQueryHandler {
     }
 
     private String roleXml(IamRole r) {
-        return new XmlBuilder()
+        return roleXml(r, false);
+    }
+
+    private String roleXml(IamRole r, boolean includeTags) {
+        var xml = new XmlBuilder()
                 .elem("Path", r.getPath())
                 .elem("RoleName", r.getRoleName())
                 .elem("RoleId", r.getRoleId())
@@ -881,8 +907,11 @@ public class IamQueryHandler {
                 .elem("CreateDate", isoDate(r.getCreateDate()))
                 .elem("MaxSessionDuration", (long) r.getMaxSessionDuration())
                 .elem("AssumeRolePolicyDocument", r.getAssumeRolePolicyDocument())
-                .elem("Description", r.getDescription())
-                .build();
+                .elem("Description", r.getDescription());
+        if (includeTags && !r.getTags().isEmpty()) {
+            xml.start("Tags").raw(tagsXml(r.getTags())).end("Tags");
+        }
+        return xml.build();
     }
 
     private String policyXml(IamPolicy p) {
@@ -920,6 +949,10 @@ public class IamQueryHandler {
     }
 
     private String instanceProfileXml(InstanceProfile p) {
+        return instanceProfileXml(p, false);
+    }
+
+    private String instanceProfileXml(InstanceProfile p, boolean includeTags) {
         var xml = new XmlBuilder()
                 .elem("InstanceProfileName", p.getInstanceProfileName())
                 .elem("InstanceProfileId", p.getInstanceProfileId())
@@ -933,7 +966,11 @@ public class IamQueryHandler {
                 xml.start("member").raw(roleXml(role)).end("member");
             } catch (AwsException ignored) {}
         }
-        return xml.end("Roles").build();
+        xml.end("Roles");
+        if (includeTags && !p.getTags().isEmpty()) {
+            xml.start("Tags").raw(tagsXml(p.getTags())).end("Tags");
+        }
+        return xml.build();
     }
 
     private String attachedPoliciesXml(List<IamPolicy> policyList) {
