@@ -350,7 +350,9 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
-    void localAwsEnvironmentProvidesCliCredentialsAndFlociEndpoint() {
+    void localAwsEnvironmentProvidesCliCredentialsAndFlociEndpointWithoutInstanceProfile() {
+        Instance instance = instance("i-no-profile");
+
         assertEquals(
                 java.util.List.of(
                         "AWS_EC2_METADATA_SERVICE_ENDPOINT=http://floci:9169",
@@ -361,6 +363,25 @@ class Ec2ContainerManagerTest {
                         "AWS_SECRET_ACCESS_KEY=test",
                         "AWS_SESSION_TOKEN=test-session-token"),
                 Ec2ContainerManager.localAwsEnvironment(
+                        instance,
+                        "us-west-2",
+                        "http://floci:4566",
+                        "http://floci:9169"));
+    }
+
+    @Test
+    void localAwsEnvironmentLetsInstanceProfileCredentialsResolveFromImds() {
+        Instance instance = instance("i-profile");
+        instance.setIamInstanceProfileArn("arn:aws:iam::000000000000:instance-profile/worker-profile");
+
+        assertEquals(
+                java.util.List.of(
+                        "AWS_EC2_METADATA_SERVICE_ENDPOINT=http://floci:9169",
+                        "AWS_ENDPOINT_URL=http://floci:4566",
+                        "AWS_DEFAULT_REGION=us-west-2",
+                        "AWS_REGION=us-west-2"),
+                Ec2ContainerManager.localAwsEnvironment(
+                        instance,
                         "us-west-2",
                         "http://floci:4566",
                         "http://floci:9169"));
@@ -377,6 +398,7 @@ class Ec2ContainerManagerTest {
         when(inspect.exec()).thenReturn(withIp);
         harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
         Instance instance = instance("i-systemd");
+        instance.setIamInstanceProfileArn("arn:aws:iam::000000000000:instance-profile/worker-profile");
 
         harness.manager.launch(instance,
                 new ResolvedAmiImage("floci/ami-ubuntu:24.04-arm64", ResolvedAmiImage.SYSTEMD_RUNTIME, true),
@@ -384,6 +406,11 @@ class Ec2ContainerManagerTest {
                 "us-west-2");
 
         awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        verify(harness.builder).withEnv(List.of(
+                "AWS_EC2_METADATA_SERVICE_ENDPOINT=http://floci:9169",
+                "AWS_ENDPOINT_URL=http://floci:4566",
+                "AWS_DEFAULT_REGION=us-west-2",
+                "AWS_REGION=us-west-2"));
         verify(harness.builder).withCmd(List.of("/sbin/init"));
         verify(harness.builder).withCgroupnsMode("host");
         verify(harness.builder).withBind("/sys/fs/cgroup", "/sys/fs/cgroup");
