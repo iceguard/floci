@@ -594,6 +594,35 @@ class RdsQueryHandlerTest {
     }
 
     @Test
+    void createDbInstanceReturnsResolvedDefaultManagedMasterUserSecretKmsKey() {
+        DbInstance instance = makeInstance("mydb");
+        instance.setMasterUserSecretArn("arn:aws:secretsmanager:us-east-1:000000000000:secret:rds!db-123456");
+        instance.setMasterUserSecretStatus("active");
+        instance.setMasterUserSecretKmsKeyId(
+                "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555");
+        when(service.createDbInstance(eq("mydb"), eq("postgres"), eq("16.3"),
+                eq("admin"), eq(null), eq("dbname"), eq("db.t3.micro"),
+                eq(20), eq(false), eq(null), eq(null), eq(null), eq(null), eq(false), eq(true),
+                eq(null), eq(java.util.Map.of()), eq(List.of()), isNull(), eq(true)))
+                .thenReturn(instance);
+
+        MultivaluedMap<String, String> p = params();
+        p.add("DBInstanceIdentifier", "mydb");
+        p.add("Engine", "postgres");
+        p.add("MasterUsername", "admin");
+        p.add("DBName", "dbname");
+        p.add("ManageMasterUserPassword", "true");
+        Response response = handler.handle("CreateDBInstance", p);
+
+        String body = (String) response.getEntity();
+        assertTrue(body.contains("<KmsKeyId>arn:aws:kms:us-east-1:000000000000:key/"
+                + "11111111-2222-3333-4444-555555555555</KmsKeyId>"));
+        verify(service).createDbInstance("mydb", "postgres", "16.3",
+                "admin", null, "dbname", "db.t3.micro", 20, false, null, null, null, null, false, true,
+                null, java.util.Map.of(), List.of(), null, true);
+    }
+
+    @Test
     void createDbInstance_withPlacementInputsShouldReflectRequestedPlacement() {
         DbInstance instance = makeInstance("mydb");
         instance.setDbInstanceArn("arn:aws:rds:us-east-1:123456789012:db:mydb");
