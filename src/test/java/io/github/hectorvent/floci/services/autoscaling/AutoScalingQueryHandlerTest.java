@@ -12,11 +12,49 @@ import java.time.Instant;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class AutoScalingQueryHandlerTest {
 
     private static final String REGION = "us-east-1";
+
+    @Test
+    void suspendAndResumeProcessesUseAwsQueryXmlShape() {
+        AutoScalingService service = new AutoScalingService();
+        service.regionResolver = new RegionResolver(REGION, "000000000000");
+        service.createAutoScalingGroup(REGION, "query-asg", null, "lt-current", null, "$Latest", null,
+                0, 3, 1, 300, List.of("us-east-1a"), List.of(), List.of(), List.of(), "EC2", 0,
+                List.of("Default"), java.util.Map.of(), java.util.Map.of());
+        AutoScalingQueryHandler handler = new AutoScalingQueryHandler(service);
+
+        MultivaluedHashMap<String, String> suspend = new MultivaluedHashMap<>();
+        suspend.add("AutoScalingGroupName", "query-asg");
+        suspend.add("ScalingProcesses.member.1", "Launch");
+        suspend.add("ScalingProcesses.member.2", "Terminate");
+        Response suspendResponse = handler.handle("SuspendProcesses", suspend, REGION);
+
+        assertEquals(200, suspendResponse.getStatus());
+        assertTrue(((String) suspendResponse.getEntity()).contains("<SuspendProcessesResponse"));
+        MultivaluedHashMap<String, String> describe = new MultivaluedHashMap<>();
+        describe.add("AutoScalingGroupNames.member.1", "query-asg");
+        String suspendedXml = (String) handler.handle("DescribeAutoScalingGroups", describe, REGION).getEntity();
+        assertTrue(suspendedXml.contains("<SuspendedProcesses>"));
+        assertTrue(suspendedXml.contains("<ProcessName>Launch</ProcessName>"));
+        assertTrue(suspendedXml.contains("<ProcessName>Terminate</ProcessName>"));
+        assertTrue(suspendedXml.contains("<SuspensionReason>User suspended process.</SuspensionReason>"));
+
+        MultivaluedHashMap<String, String> resume = new MultivaluedHashMap<>();
+        resume.add("AutoScalingGroupName", "query-asg");
+        resume.add("ScalingProcesses.member.1", "Launch");
+        Response resumeResponse = handler.handle("ResumeProcesses", resume, REGION);
+
+        assertEquals(200, resumeResponse.getStatus());
+        assertTrue(((String) resumeResponse.getEntity()).contains("<ResumeProcessesResponse"));
+        String resumedXml = (String) handler.handle("DescribeAutoScalingGroups", describe, REGION).getEntity();
+        assertFalse(resumedXml.contains("<ProcessName>Launch</ProcessName>"));
+        assertTrue(resumedXml.contains("<ProcessName>Terminate</ProcessName>"));
+    }
 
     @Test
     void startAndDescribeInstanceRefreshUseAwsQueryXmlShape() {

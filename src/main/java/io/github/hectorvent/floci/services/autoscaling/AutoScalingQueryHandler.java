@@ -44,6 +44,8 @@ public class AutoScalingQueryHandler {
                 case "DeleteAutoScalingGroup"       -> handleDeleteAutoScalingGroup(p, region);
                 case "DescribeAutoScalingGroups"    -> handleDescribeAutoScalingGroups(p, region);
                 case "SetDesiredCapacity"           -> handleSetDesiredCapacity(p, region);
+                case "SuspendProcesses"             -> handleSuspendProcesses(p, region);
+                case "ResumeProcesses"              -> handleResumeProcesses(p, region);
                 case "StartInstanceRefresh"         -> handleStartInstanceRefresh(p, region);
                 case "DescribeInstanceRefreshes"    -> handleDescribeInstanceRefreshes(p, region);
                 case "CreateOrUpdateTags"           -> handleCreateOrUpdateTags(p, region);
@@ -311,6 +313,15 @@ public class AutoScalingQueryHandler {
         }
         xml.end("Tags");
 
+        xml.start("SuspendedProcesses");
+        for (SuspendedProcess process : asg.getSuspendedProcesses()) {
+            xml.start("member")
+               .elem("ProcessName", process.getProcessName())
+               .elem("SuspensionReason", process.getSuspensionReason())
+               .end("member");
+        }
+        xml.end("SuspendedProcesses");
+
         if (asg.getStatus() != null) { xml.elem("Status", asg.getStatus()); }
     }
 
@@ -322,6 +333,22 @@ public class AutoScalingQueryHandler {
                 .start("SetDesiredCapacityResponse", NS)
                   .raw(AwsQueryResponse.responseMetadata())
                 .end("SetDesiredCapacityResponse").build());
+    }
+
+    private Response handleSuspendProcesses(MultivaluedMap<String, String> p, String region) {
+        service.suspendProcesses(region, p.getFirst("AutoScalingGroupName"), memberList(p, "ScalingProcesses"));
+        return ok(new XmlBuilder()
+                .start("SuspendProcessesResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("SuspendProcessesResponse").build());
+    }
+
+    private Response handleResumeProcesses(MultivaluedMap<String, String> p, String region) {
+        service.resumeProcesses(region, p.getFirst("AutoScalingGroupName"), memberList(p, "ScalingProcesses"));
+        return ok(new XmlBuilder()
+                .start("ResumeProcessesResponse", NS)
+                  .raw(AwsQueryResponse.responseMetadata())
+                .end("ResumeProcessesResponse").build());
     }
 
     private Response handleStartInstanceRefresh(MultivaluedMap<String, String> p, String region) {
