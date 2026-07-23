@@ -637,6 +637,16 @@ class IamServiceTest {
     }
 
     @Test
+    void defaultCredentialIsAnImplicitRootCaller() {
+        assertEquals("test", iamService.findSigningSecret("test", null).orElseThrow());
+        assertEquals(
+                List.of(AwsManagedPolicies.PERMISSIVE_DOCUMENT),
+                iamService.resolveCallerContext("test").identityPolicies());
+        assertTrue(iamService.findAccessKey("test").isEmpty());
+        assertTrue(iamService.findUser("test").isEmpty());
+    }
+
+    @Test
     void providerOwnedSessionCanBeRevokedAtTeardown() {
         iamService.registerSession(
                 "ASIAINSTANCEPROFILE",

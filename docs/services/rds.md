@@ -200,7 +200,10 @@ CREATE USER app_user WITH LOGIN;
 GRANT rds_iam TO app_user;
 ```
 
-The IAM principal that generates the token must allow `rds-db:connect` on the exact database-user
+For local workflows, Floci's built-in `test`/`test` credential acts as an implicit root principal
+and can generate RDS IAM authentication tokens without creating an IAM user or policy.
+
+Other IAM principals that generate tokens must allow `rds-db:connect` on the exact database-user
 resource:
 
 ```json
