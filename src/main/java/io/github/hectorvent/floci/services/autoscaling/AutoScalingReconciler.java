@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
 import io.github.hectorvent.floci.services.autoscaling.model.LaunchConfiguration;
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
+import io.github.hectorvent.floci.services.autoscaling.model.SuspendedProcess;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
@@ -83,12 +84,28 @@ public class AutoScalingReconciler {
         int desired = asg.getDesiredCapacity();
 
         if (activeCapacity < desired) {
-            scaleOut(asg, (int) (desired - activeCapacity));
+            if (isProcessSuspended(asg, "Launch")) {
+                LOG.debugv("ASG {0}: Launch process is suspended, skipping scale out",
+                        asg.getAutoScalingGroupName());
+            } else {
+                scaleOut(asg, (int) (desired - activeCapacity));
+            }
         } else if (activeCapacity > desired) {
-            scaleIn(asg, (int) (activeCapacity - desired));
+            if (isProcessSuspended(asg, "Terminate")) {
+                LOG.debugv("ASG {0}: Terminate process is suspended, skipping scale in",
+                        asg.getAutoScalingGroupName());
+            } else {
+                scaleIn(asg, (int) (activeCapacity - desired));
+            }
         }
         asgService.saveAutoScalingGroup(asg);
         asgService.completeInstanceRefreshIfSettled(asg.getRegion(), asg.getAutoScalingGroupName());
+    }
+
+    private static boolean isProcessSuspended(AutoScalingGroup asg, String processName) {
+        return asg.getSuspendedProcesses().stream()
+                .map(SuspendedProcess::getProcessName)
+                .anyMatch(processName::equals);
     }
 
     static long activeCapacity(AutoScalingGroup asg) {

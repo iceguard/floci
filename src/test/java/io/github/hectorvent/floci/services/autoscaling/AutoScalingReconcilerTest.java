@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.autoscaling;
 import io.github.hectorvent.floci.services.autoscaling.model.AsgInstance;
 import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
 import io.github.hectorvent.floci.services.autoscaling.model.MixedInstancesPolicy;
+import io.github.hectorvent.floci.services.autoscaling.model.SuspendedProcess;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
@@ -21,12 +22,14 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.anyList;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class AutoScalingReconcilerTest {
@@ -369,6 +372,46 @@ class AutoScalingReconcilerTest {
                 eq("An instance was started in response to a desired capacity change."),
                 eq("Successful"));
         verify(asgService, times(2)).saveAutoScalingGroup(asg);
+    }
+
+    @Test
+    void reconcileDoesNotScaleOutWhenLaunchProcessIsSuspended() {
+        AutoScalingService asgService = mock(AutoScalingService.class);
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbV2Service elbV2Service = mock(ElbV2Service.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(asgService, ec2Service, elbV2Service);
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        asg.setDesiredCapacity(1);
+        asg.getSuspendedProcesses().add(new SuspendedProcess("Launch", "User suspended process."));
+
+        reconciler.reconcile(asg);
+
+        assertTrue(asg.getInstances().isEmpty());
+        verifyNoInteractions(ec2Service);
+        verify(asgService).saveAutoScalingGroup(asg);
+    }
+
+    @Test
+    void reconcileDoesNotScaleInWhenTerminateProcessIsSuspended() {
+        AutoScalingService asgService = mock(AutoScalingService.class);
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbV2Service elbV2Service = mock(ElbV2Service.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(asgService, ec2Service, elbV2Service);
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        asg.setDesiredCapacity(0);
+        asg.getInstances().add(instance("i-active", "InService"));
+        asg.getSuspendedProcesses().add(new SuspendedProcess("Terminate", "User suspended process."));
+        when(ec2Service.isInstanceContainerRunning("i-active")).thenReturn(true);
+
+        reconciler.reconcile(asg);
+
+        assertEquals(1, asg.getInstances().size());
+        verify(ec2Service, never()).terminateInstances(eq("us-east-1"), anyList());
+        verify(asgService).saveAutoScalingGroup(asg);
     }
 
     private static AsgInstance instance(String lifecycleState) {
