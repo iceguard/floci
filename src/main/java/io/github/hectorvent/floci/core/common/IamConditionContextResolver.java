@@ -44,6 +44,8 @@ public class IamConditionContextResolver {
         boolean deleteGroup = "autoscaling:DeleteAutoScalingGroup".equals(action);
         boolean mutateGroupConfiguration = "autoscaling:UpdateAutoScalingGroup".equals(action)
                 || "autoscaling:StartInstanceRefresh".equals(action)
+                || "autoscaling:SuspendProcesses".equals(action)
+                || "autoscaling:ResumeProcesses".equals(action)
                 || "autoscaling:PutLifecycleHook".equals(action)
                 || "autoscaling:DeleteLifecycleHook".equals(action)
                 || "autoscaling:PutScalingPolicy".equals(action)

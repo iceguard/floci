@@ -487,6 +487,58 @@ class AutoScalingRuntimeAuthorizationIntegrationTest {
         }
     }
 
+    @Test
+    void authorizesSuspendedProcessesAgainstExactArnAndPersistedTagsWithSdk() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String launchConfigurationName = "process-runtime-lc-" + suffix;
+        String allowedName = "team-a-process-allowed-" + suffix;
+        String wrongTagName = "team-a-process-wrong-tag-" + suffix;
+        String missingPermissionName = "team-a-process-missing-permission-" + suffix;
+        createLaunchConfiguration(launchConfigurationName);
+        createAutoScalingGroup(ACCOUNT_ID, launchConfigurationName, allowedName, "floci")
+                .statusCode(200);
+        createAutoScalingGroup(ACCOUNT_ID, launchConfigurationName, wrongTagName, "other")
+                .statusCode(200);
+        createAutoScalingGroup(ACCOUNT_ID, launchConfigurationName, missingPermissionName, "floci")
+                .statusCode(200);
+
+        SessionCredentials allowed = createProcessSession(true);
+        SessionCredentials missingPermission = createProcessSession(false);
+        try (AutoScalingClient root = autoScalingClient(ACCOUNT_ID, "test-secret-key", null);
+                AutoScalingClient allowedClient = autoScalingClient(allowed);
+                AutoScalingClient missingPermissionClient = autoScalingClient(missingPermission)) {
+            allowedClient.suspendProcesses(request -> request
+                    .autoScalingGroupName(allowedName)
+                    .scalingProcesses("Launch", "Terminate"));
+            assertEquals(
+                    java.util.List.of("Launch", "Terminate"),
+                    describeAutoScalingGroup(root, allowedName).suspendedProcesses().stream()
+                            .map(process -> process.processName())
+                            .toList());
+
+            var wrongTagBefore = describeAutoScalingGroup(root, wrongTagName);
+            AutoScalingException wrongTag = assertThrows(AutoScalingException.class,
+                    () -> allowedClient.suspendProcesses(request -> request
+                            .autoScalingGroupName(wrongTagName)
+                            .scalingProcesses("Launch")));
+            assertAccessDenied(wrongTag, "autoscaling:SuspendProcesses");
+            assertEquals(wrongTagBefore, describeAutoScalingGroup(root, wrongTagName));
+
+            var missingPermissionBefore = describeAutoScalingGroup(root, missingPermissionName);
+            AutoScalingException denied = assertThrows(AutoScalingException.class,
+                    () -> missingPermissionClient.suspendProcesses(request -> request
+                            .autoScalingGroupName(missingPermissionName)
+                            .scalingProcesses("Launch")));
+            assertAccessDenied(denied, "autoscaling:SuspendProcesses");
+            assertEquals(missingPermissionBefore, describeAutoScalingGroup(root, missingPermissionName));
+
+            allowedClient.resumeProcesses(request -> request
+                    .autoScalingGroupName(allowedName)
+                    .scalingProcesses("Launch", "Terminate"));
+            assertTrue(describeAutoScalingGroup(root, allowedName).suspendedProcesses().isEmpty());
+        }
+    }
+
     private static Fixture createFixture() {
         return createFixture(true, true);
     }
@@ -539,6 +591,43 @@ class AutoScalingRuntimeAuthorizationIntegrationTest {
                               "Statement": [{
                                 "Effect": "Allow",
                                 "Action": "autoscaling:StartInstanceRefresh",
+                                "Resource": "arn:aws:autoscaling:%s:%s:autoScalingGroup:*:autoScalingGroupName/team-a-*",
+                                "Condition": {
+                                  "StringEquals": {
+                                    "aws:ResourceTag/example.io:definition-id": "example",
+                                    "aws:ResourceTag/example.io:managed-by": "floci",
+                                    "aws:RequestedRegion": "%s"
+                                  }
+                                }
+                              }]
+                            }
+                            """.formatted(REGION, ACCOUNT_ID, REGION))
+                    .header("Authorization", auth(ACCOUNT_ID, "iam"))
+            .when()
+                    .post("/")
+            .then()
+                    .statusCode(200);
+        }
+        return assumeRole(roleName);
+    }
+
+    private static SessionCredentials createProcessSession(boolean allowProcesses) {
+        String roleName = "AutoScalingProcessOperator" + UUID.randomUUID().toString().substring(0, 8);
+        createRole(roleName);
+        if (allowProcesses) {
+            given()
+                    .formParam("Action", "PutRolePolicy")
+                    .formParam("RoleName", roleName)
+                    .formParam("PolicyName", "ScopedAutoScalingProcesses")
+                    .formParam("PolicyDocument", """
+                            {
+                              "Version": "2012-10-17",
+                              "Statement": [{
+                                "Effect": "Allow",
+                                "Action": [
+                                  "autoscaling:SuspendProcesses",
+                                  "autoscaling:ResumeProcesses"
+                                ],
                                 "Resource": "arn:aws:autoscaling:%s:%s:autoScalingGroup:*:autoScalingGroupName/team-a-*",
                                 "Condition": {
                                   "StringEquals": {

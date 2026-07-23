@@ -10,8 +10,11 @@ import software.amazon.awssdk.services.autoscaling.model.AutoScalingException;
 import software.amazon.awssdk.services.autoscaling.model.CreateAutoScalingGroupRequest;
 import software.amazon.awssdk.services.autoscaling.model.CreateLaunchConfigurationRequest;
 import software.amazon.awssdk.services.autoscaling.model.DesiredConfiguration;
+import software.amazon.awssdk.services.autoscaling.model.DescribeAutoScalingGroupsRequest;
+import software.amazon.awssdk.services.autoscaling.model.ResumeProcessesRequest;
 import software.amazon.awssdk.services.autoscaling.model.LaunchTemplateSpecification;
 import software.amazon.awssdk.services.autoscaling.model.StartInstanceRefreshRequest;
+import software.amazon.awssdk.services.autoscaling.model.SuspendProcessesRequest;
 import software.amazon.awssdk.services.autoscaling.model.UpdateAutoScalingGroupRequest;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.CreateLaunchTemplateRequest;
@@ -89,6 +92,55 @@ class AutoScalingTest {
                             "Request ID: ",
                             "SDK Attempt Count: 1");
                 });
+    }
+
+    @Test
+    @DisplayName("SuspendProcesses and ResumeProcesses round-trip through DescribeAutoScalingGroups")
+    void suspendedProcessesRoundTripThroughSdk() {
+        String launchTemplateName = TestFixtures.uniqueName("sdk-suspended-processes");
+        String autoScalingGroupName = TestFixtures.uniqueName("sdk-suspended-processes-asg");
+        String launchTemplateId = ec2.createLaunchTemplate(CreateLaunchTemplateRequest.builder()
+                .launchTemplateName(launchTemplateName)
+                .launchTemplateData(RequestLaunchTemplateData.builder()
+                        .imageId("ami-12345678")
+                        .instanceType("t3.micro")
+                        .build())
+                .build())
+                .launchTemplate()
+                .launchTemplateId();
+
+        autoScaling.createAutoScalingGroup(CreateAutoScalingGroupRequest.builder()
+                .autoScalingGroupName(autoScalingGroupName)
+                .launchTemplate(LaunchTemplateSpecification.builder()
+                        .launchTemplateId(launchTemplateId)
+                        .version("1")
+                        .build())
+                .minSize(0)
+                .maxSize(1)
+                .desiredCapacity(0)
+                .availabilityZones("us-east-1a")
+                .build());
+
+        autoScaling.suspendProcesses(SuspendProcessesRequest.builder()
+                .autoScalingGroupName(autoScalingGroupName)
+                .scalingProcesses("Launch", "Terminate")
+                .build());
+        var suspended = autoScaling.describeAutoScalingGroups(DescribeAutoScalingGroupsRequest.builder()
+                .autoScalingGroupNames(autoScalingGroupName)
+                .build()).autoScalingGroups().getFirst().suspendedProcesses();
+        assertThat(suspended).extracting(process -> process.processName())
+                .containsExactly("Launch", "Terminate");
+        assertThat(suspended).allSatisfy(process ->
+                assertThat(process.suspensionReason()).contains("User suspended"));
+
+        autoScaling.resumeProcesses(ResumeProcessesRequest.builder()
+                .autoScalingGroupName(autoScalingGroupName)
+                .scalingProcesses("Launch")
+                .build());
+        var resumed = autoScaling.describeAutoScalingGroups(DescribeAutoScalingGroupsRequest.builder()
+                .autoScalingGroupNames(autoScalingGroupName)
+                .build()).autoScalingGroups().getFirst().suspendedProcesses();
+        assertThat(resumed).extracting(process -> process.processName()).containsExactly("Terminate");
     }
 
     @Test

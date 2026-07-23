@@ -207,6 +207,8 @@ public class ResourceArnBuilder {
         }
         if ("UpdateAutoScalingGroup".equals(action)
                 || "StartInstanceRefresh".equals(action)
+                || "SuspendProcesses".equals(action)
+                || "ResumeProcesses".equals(action)
                 || "DeleteAutoScalingGroup".equals(action)
                 || "PutLifecycleHook".equals(action)
                 || "DeleteLifecycleHook".equals(action)

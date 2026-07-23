@@ -31,6 +31,16 @@ public class AutoScalingService {
                     + "or both the ImageId and InstanceType parameters.";
     static final String ACTIVE_INSTANCE_REFRESH_DESIRED_CONFIGURATION_MESSAGE =
             "An active instance refresh with a desired configuration exists. All configuration options derived from the desired configuration are not available for update while the instance refresh is active.";
+    private static final List<String> SCALING_PROCESSES = List.of(
+            "Launch",
+            "Terminate",
+            "HealthCheck",
+            "ReplaceUnhealthy",
+            "AZRebalance",
+            "AlarmNotification",
+            "ScheduledActions",
+            "AddToLoadBalancer",
+            "InstanceRefresh");
 
     @Inject
     RegionResolver regionResolver;
@@ -332,6 +342,35 @@ public class AutoScalingService {
                             + asg.getMinSize() + " and MaxSize=" + asg.getMaxSize() + ".", 400);
         }
         asg.setDesiredCapacity(desiredCapacity);
+        groups.put(asgKey(region, name), asg);
+    }
+
+    public void suspendProcesses(String region, String name, List<String> processNames) {
+        AutoScalingGroup asg = requireGroup(region, name);
+        Map<String, SuspendedProcess> suspended = asg.getSuspendedProcesses().stream()
+                .collect(Collectors.toMap(
+                        SuspendedProcess::getProcessName,
+                        process -> process,
+                        (left, right) -> right,
+                        LinkedHashMap::new));
+        for (String processName : effectiveProcessNames(processNames)) {
+            suspended.put(processName, new SuspendedProcess(processName, "User suspended process."));
+        }
+        asg.setSuspendedProcesses(new ArrayList<>(suspended.values()));
+        groups.put(asgKey(region, name), asg);
+    }
+
+    public void resumeProcesses(String region, String name, List<String> processNames) {
+        AutoScalingGroup asg = requireGroup(region, name);
+        if (processNames == null || processNames.isEmpty()) {
+            asg.setSuspendedProcesses(new ArrayList<>());
+        }
+        else {
+            Set<String> resumed = new HashSet<>(processNames);
+            asg.setSuspendedProcesses(asg.getSuspendedProcesses().stream()
+                    .filter(process -> !resumed.contains(process.getProcessName()))
+                    .collect(Collectors.toCollection(ArrayList::new)));
+        }
         groups.put(asgKey(region, name), asg);
     }
 
@@ -704,6 +743,13 @@ public class AutoScalingService {
 
     private static String policyKey(String region, String asgName, String policyName) {
         return region + "::" + asgName + "::" + policyName;
+    }
+
+    private static List<String> effectiveProcessNames(List<String> processNames) {
+        if (processNames == null || processNames.isEmpty()) {
+            return SCALING_PROCESSES;
+        }
+        return processNames;
     }
 
     private static void validateLaunchSource(String launchConfigName,

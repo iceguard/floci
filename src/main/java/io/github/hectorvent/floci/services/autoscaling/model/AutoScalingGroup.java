@@ -31,6 +31,7 @@ public class AutoScalingGroup {
     private String healthCheckType = "EC2";
     private int healthCheckGracePeriod = 0;
     private List<AsgInstance> instances = new ArrayList<>();
+    private List<SuspendedProcess> suspendedProcesses = new ArrayList<>();
     private List<String> terminationPolicies = new ArrayList<>();
     private Instant createdTime;
     private String region;
@@ -93,6 +94,9 @@ public class AutoScalingGroup {
 
     public List<AsgInstance> getInstances() { return instances; }
     public void setInstances(List<AsgInstance> v) { this.instances = v; }
+
+    public List<SuspendedProcess> getSuspendedProcesses() { return suspendedProcesses; }
+    public void setSuspendedProcesses(List<SuspendedProcess> v) { this.suspendedProcesses = v; }
 
     public List<String> getTerminationPolicies() { return terminationPolicies; }
     public void setTerminationPolicies(List<String> v) { this.terminationPolicies = v; }
