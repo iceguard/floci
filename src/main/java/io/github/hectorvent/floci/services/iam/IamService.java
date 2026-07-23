@@ -54,6 +54,8 @@ public class IamService implements SessionAccountLookup {
     private static final Logger LOG = Logger.getLogger(IamService.class);
     private static final String CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     private static final String TEMPORARY_ACCESS_KEY_PREFIX = "ASIA";
+    private static final String DEFAULT_ACCESS_KEY_ID = "test";
+    private static final String DEFAULT_SECRET_ACCESS_KEY = "test";
     private static final String DEFAULT_DEPLOYER_USER = "floci-deployer";
     private static final String DEFAULT_DEPLOYER_ACCESS_KEY_ID = "floci";
     private static final String DEFAULT_DEPLOYER_SECRET_ACCESS_KEY = "floci";
@@ -1023,9 +1025,12 @@ public class IamService implements SessionAccountLookup {
      * Resolves the signing secret used by presigned data-plane authentication.
      * Temporary credentials are usable only when their session token is present,
      * matches the stored credential, and has not expired. Long-term credentials
-     * must resolve to a persisted IAM access key.
+     * must resolve to the built-in default credential or a persisted IAM access key.
      */
     public Optional<String> findSigningSecret(String accessKeyId, String sessionToken) {
+        if (DEFAULT_ACCESS_KEY_ID.equals(accessKeyId)) {
+            return Optional.of(DEFAULT_SECRET_ACCESS_KEY);
+        }
         if (isTemporaryAccessKey(accessKeyId)) {
             return findActiveSession(accessKeyId, sessionToken)
                     .map(SessionCredential::getSecretAccessKey);
@@ -1344,6 +1349,10 @@ public class IamService implements SessionAccountLookup {
      * <p>Returns {@code null} if the access key is unknown (bypass — backward-compatible).
      */
     public CallerContext resolveCallerContext(String accessKeyId) {
+        if (DEFAULT_ACCESS_KEY_ID.equals(accessKeyId)) {
+            return CallerContext.of(List.of(AwsManagedPolicies.PERMISSIVE_DOCUMENT));
+        }
+
         // Check user access keys
         Optional<AccessKey> akOpt = accessKeys.get(accessKeyId)
                 .filter(key -> "Active".equals(key.getStatus()));

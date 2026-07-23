@@ -386,6 +386,17 @@ class RdsSigV4ValidatorTest {
     }
 
     @Test
+    void authorizeAcceptsTokenSignedWithDefaultCredential() throws Exception {
+        IamService iamService = IamServiceTestHelper.emptyIamService();
+        RdsSigV4Validator validator = authorizedValidator(iamService);
+        String token = SigV4TokenTestHelper.createRdsToken(
+                "db.example.local", 5432, "app_user", "test", "test",
+                Instant.now().minusSeconds(60), 900);
+
+        assertTrue(authorize(validator, token));
+    }
+
+    @Test
     void authorizeAcceptsTokenWithExactRdsDbConnectPermission() throws Exception {
         IamService iamService = IamServiceTestHelper.emptyIamService();
         iamService.createUser("application", "/");

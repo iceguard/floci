@@ -7,6 +7,8 @@ import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.rds.RdsClient;
 import software.amazon.awssdk.services.rds.model.CreateDbInstanceRequest;
@@ -40,6 +42,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class RdsIamTokenCompatTest {
 
     private static final Region REGION = Region.US_EAST_1;
+    private static final StaticCredentialsProvider DEFAULT_CREDENTIALS =
+            StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
     private static final String USERNAME = "admin";
     private static final String APPLICATION_USERNAME = "application_user";
     private static final String NON_IAM_USERNAME = "password_only_user";
@@ -103,6 +107,29 @@ class RdsIamTokenCompatTest {
 
     @Test
     @Order(1)
+    @DisplayName("SDK-generated IAM token with default credentials is accepted by the proxy")
+    void sdkGeneratedTokenWithDefaultCredentialsIsAccepted() throws Exception {
+        String token = rds.utilities().generateAuthenticationToken(
+                GenerateAuthenticationTokenRequest.builder()
+                        .hostname(endpointHost)
+                        .port(proxyPort)
+                        .username(APPLICATION_USERNAME)
+                        .region(REGION)
+                        .credentialsProvider(DEFAULT_CREDENTIALS)
+                        .build());
+
+        Connection connection = awaitPostgresConnection(APPLICATION_USERNAME, token);
+        try {
+            assertThat(selectOne(connection)).isEqualTo(1);
+            assertThat(databaseIdentity(connection))
+                    .containsExactly(APPLICATION_USERNAME, APPLICATION_USERNAME);
+        } finally {
+            connection.close();
+        }
+    }
+
+    @Test
+    @Order(2)
     @DisplayName("SDK-generated IAM token is accepted by the proxy")
     void sdkGeneratedTokenIsAccepted() throws Exception {
         String token = rds.utilities().generateAuthenticationToken(
@@ -124,7 +151,7 @@ class RdsIamTokenCompatTest {
     }
 
     @Test
-    @Order(2)
+    @Order(3)
     @DisplayName("Token signed for a different user is rejected")
     void tokenForDifferentUserIsRejected() {
         String token = rds.utilities().generateAuthenticationToken(
@@ -142,7 +169,7 @@ class RdsIamTokenCompatTest {
     }
 
     @Test
-    @Order(3)
+    @Order(4)
     @DisplayName("Token with tampered signature is rejected")
     void tokenWithTamperedSignatureIsRejected() {
         String token = rds.utilities().generateAuthenticationToken(
@@ -163,7 +190,7 @@ class RdsIamTokenCompatTest {
     }
 
     @Test
-    @Order(4)
+    @Order(5)
     @DisplayName("Token missing X-Amz-Signature parameter is rejected")
     void tokenMissingSignatureIsRejected() {
         String token = rds.utilities().generateAuthenticationToken(
@@ -182,7 +209,7 @@ class RdsIamTokenCompatTest {
     }
 
     @Test
-    @Order(5)
+    @Order(6)
     @DisplayName("IAM token is rejected when PostgreSQL role lacks rds_iam membership")
     void tokenForRoleWithoutRdsIamMembershipIsRejected() {
         String token = rds.utilities().generateAuthenticationToken(
@@ -200,7 +227,7 @@ class RdsIamTokenCompatTest {
     }
 
     @Test
-    @Order(6)
+    @Order(7)
     @DisplayName("Application login without an IAM token or password is rejected")
     void applicationLoginWithoutValidCredentialIsRejected() {
         assertThatThrownBy(() -> openPostgresConnection(APPLICATION_USERNAME, ""))
@@ -208,7 +235,7 @@ class RdsIamTokenCompatTest {
     }
 
     @Test
-    @Order(7)
+    @Order(8)
     @DisplayName("PostgreSQL password cannot bypass rds_iam authentication")
     void rdsIamRoleCannotBypassIamWithPassword() {
         assertThatThrownBy(() -> openPostgresConnection(APPLICATION_USERNAME, APPLICATION_PASSWORD))
@@ -217,7 +244,7 @@ class RdsIamTokenCompatTest {
     }
 
     @Test
-    @Order(8)
+    @Order(9)
     @DisplayName("Concurrent IAM logins for the same PostgreSQL role both succeed")
     void concurrentIamLoginsAreSerialized() throws Exception {
         String token = rds.utilities().generateAuthenticationToken(
@@ -240,7 +267,7 @@ class RdsIamTokenCompatTest {
     }
 
     @Test
-    @Order(9)
+    @Order(10)
     @DisplayName("IAM login preserves the PostgreSQL role password verifier")
     void iamLoginPreservesOriginalRolePassword() throws Exception {
         try (Connection administrator = awaitPostgresConnection(USERNAME, PASSWORD);
