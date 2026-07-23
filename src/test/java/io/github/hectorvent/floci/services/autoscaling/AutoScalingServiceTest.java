@@ -64,6 +64,30 @@ class AutoScalingServiceTest {
     }
 
     @Test
+    void suspendAndResumeProcessesPreserveGroupState() {
+        service.suspendProcesses(REGION, "test-asg", List.of("Launch", "Terminate"));
+
+        var group = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
+        assertEquals(List.of("Launch", "Terminate"), group.getSuspendedProcesses().stream()
+                .map(process -> process.getProcessName())
+                .toList());
+        assertTrue(group.getSuspendedProcesses().stream()
+                .allMatch(process -> process.getSuspensionReason().contains("User suspended")));
+
+        service.resumeProcesses(REGION, "test-asg", List.of("Launch"));
+
+        group = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
+        assertEquals(List.of("Terminate"), group.getSuspendedProcesses().stream()
+                .map(process -> process.getProcessName())
+                .toList());
+
+        service.resumeProcesses(REGION, "test-asg", List.of());
+
+        group = service.describeAutoScalingGroups(REGION, List.of("test-asg")).getFirst();
+        assertTrue(group.getSuspendedProcesses().isEmpty());
+    }
+
+    @Test
     void startInstanceRefreshStoresCompletedRefreshAndAppliesDesiredLaunchTemplate() {
         InstanceRefresh request = new InstanceRefresh();
         request.setStrategy("Rolling");

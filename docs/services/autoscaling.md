@@ -35,6 +35,8 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 |---|---|
 | `DescribeAutoScalingInstances` | Returns all ASG-tracked instances with lifecycle state and health status |
 | `SetDesiredCapacity` | Updates desired count; reconciler handles scale-out / scale-in within 10 s |
+| `SuspendProcesses` | Suspends selected scaling processes, or all supported processes when none are specified |
+| `ResumeProcesses` | Resumes selected scaling processes, or all suspended processes when none are specified |
 | `AttachInstances` | Attaches existing EC2 instances to a group; sets lifecycle state to `InService` |
 | `DetachInstances` | Detaches instances from a group; optionally decrements desired capacity |
 | `TerminateInstanceInAutoScalingGroup` | Terminates a specific instance; optionally decrements desired capacity |
