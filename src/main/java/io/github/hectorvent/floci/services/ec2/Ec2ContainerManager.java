@@ -217,7 +217,7 @@ public class Ec2ContainerManager {
 
                 if (!running) {
                     LOG.warnv("EC2 instance {0} container {1} did not reach running state", instanceId, containerId);
-                    instance.setState(InstanceState.terminated());
+                    cleanupFailedLaunch(instance, containerId, null, sshHostPort);
                     return;
                 }
 
@@ -1148,15 +1148,36 @@ public class Ec2ContainerManager {
     }
 
     private void cleanupFailedLaunch(Instance instance, String containerId, String containerIp, int sshHostPort) {
-        portForwardManager.unpublishAll(instance);
+        try {
+            portForwardManager.unpublishAll(instance);
+        }
+        catch (Exception e) {
+            LOG.warnv("Error removing port forwards for failed EC2 instance {0}: {1}",
+                    instance.getInstanceId(), e.getMessage());
+        }
         if (containerId != null && !containerId.isBlank()) {
-            lifecycleManager.stopAndRemove(containerId, null);
+            try {
+                lifecycleManager.stopAndRemove(containerId, null);
+            }
+            catch (Exception e) {
+                LOG.warnv("Error removing container for failed EC2 instance {0}: {1}",
+                        instance.getInstanceId(), e.getMessage());
+            }
         }
         if (sshHostPort > 0) {
             portAllocator.release(sshHostPort);
         }
-        metadataServer.unregisterContainer(containerIp, instance);
-        metadataServer.unregisterInstance(instance);
+        try {
+            metadataServer.unregisterContainer(containerIp, instance);
+            metadataServer.unregisterInstance(instance);
+        }
+        catch (Exception e) {
+            LOG.warnv("Error unregistering metadata for failed EC2 instance {0}: {1}",
+                    instance.getInstanceId(), e.getMessage());
+        }
+        instance.setDockerContainerId(null);
+        instance.setContainerBridgeIp(null);
+        instance.setSshHostPort(0);
         instance.setState(InstanceState.terminated());
         instance.setTerminatedAt(System.currentTimeMillis());
         if (instance.getBootstrapResult() != null

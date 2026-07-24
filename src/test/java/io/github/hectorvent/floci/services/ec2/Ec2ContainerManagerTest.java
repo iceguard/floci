@@ -38,6 +38,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.zip.GZIPOutputStream;
@@ -45,12 +46,16 @@ import java.util.zip.GZIPOutputStream;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Answers.RETURNS_SELF;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
@@ -606,8 +611,60 @@ class Ec2ContainerManagerTest {
         harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
 
         awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
-        assertEquals(TEST_CONTAINER_ID, instance.getDockerContainerId());
+        assertNull(instance.getDockerContainerId());
+        assertEquals(0, instance.getSshHostPort());
+        verify(harness.lifecycleManager).stopAndRemove(TEST_CONTAINER_ID, null);
+        verify(harness.portAllocator).release(2201);
+        verify(harness.metadataServer).unregisterInstance(instance);
         verify(harness.metadataServer, never()).registerContainer(anyString(), anyString(), any());
+    }
+
+    @Test
+    void failedContainerStartCleansPartialLaunchAndAllowsImmediatePortReuse() throws Exception {
+        AtomicBoolean portReserved = new AtomicBoolean();
+        PortAllocator portAllocator = mock(PortAllocator.class);
+        when(portAllocator.allocate(anyInt(), anyInt())).thenAnswer(invocation -> {
+            if (!portReserved.compareAndSet(false, true)) {
+                throw new IllegalStateException("SSH port is still reserved");
+            }
+            return 2201;
+        });
+        doAnswer(invocation -> {
+            portReserved.set(false);
+            return null;
+        }).when(portAllocator).release(2201);
+
+        Ec2ContainerManager.containerBridgeIpAttempts = 1;
+        Ec2ContainerManager.containerBridgeIpPollMillis = 1;
+        LaunchHarness harness = launchHarness(portAllocator);
+        doThrow(new RuntimeException("failed to bind host port"))
+                .doReturn(null)
+                .when(harness.lifecycleManager)
+                .startCreated(eq(TEST_CONTAINER_ID), any(ContainerSpec.class));
+
+        Instance failed = instance("i-failed-start");
+        harness.manager.launch(failed, "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> "terminated".equals(failed.getState().getName()), Duration.ofSeconds(2));
+        assertNull(failed.getDockerContainerId());
+        assertEquals(0, failed.getSshHostPort());
+        verify(harness.lifecycleManager).stopAndRemove(TEST_CONTAINER_ID, null);
+        verify(harness.metadataServer).unregisterInstance(failed);
+
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse replacementResponse = inspectResponse("172.18.0.12");
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(replacementResponse);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+        Instance replacement = instance("i-replacement");
+
+        harness.manager.launch(replacement, "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> "running".equals(replacement.getState().getName()), Duration.ofSeconds(2));
+        assertEquals(2201, replacement.getSshHostPort());
+        assertTrue(portReserved.get());
+        verify(portAllocator, times(2)).allocate(anyInt(), anyInt());
+        verify(portAllocator).release(2201);
     }
 
     @Test
@@ -675,6 +732,12 @@ class Ec2ContainerManagerTest {
     }
 
     private static LaunchHarness launchHarness() {
+        PortAllocator portAllocator = mock(PortAllocator.class);
+        when(portAllocator.allocate(anyInt(), anyInt())).thenReturn(2201);
+        return launchHarness(portAllocator);
+    }
+
+    private static LaunchHarness launchHarness(PortAllocator portAllocator) {
         ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
         ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, withSettings().defaultAnswer(RETURNS_SELF));
         when(containerBuilder.newContainer(anyString())).thenReturn(builder);
@@ -686,8 +749,6 @@ class Ec2ContainerManagerTest {
 
         DockerHostResolver dockerHostResolver = mock(DockerHostResolver.class);
         when(dockerHostResolver.resolve()).thenReturn("floci");
-        PortAllocator portAllocator = mock(PortAllocator.class);
-        when(portAllocator.allocate(anyInt(), anyInt())).thenReturn(2201);
 
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
