@@ -68,8 +68,10 @@ public class CloudWatchLogsHandler {
         String name = request.path("logGroupName").asText();
         Integer retentionInDays = request.has("retentionInDays")
                 ? request.path("retentionInDays").asInt() : null;
+        String kmsKeyId = request.has("kmsKeyId")
+                ? request.path("kmsKeyId").asText() : null;
         Map<String, String> tags = extractTags(request.path("tags"));
-        logsService.createLogGroup(name, retentionInDays, tags, region);
+        logsService.createLogGroup(name, retentionInDays, kmsKeyId, tags, region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -92,6 +94,9 @@ public class CloudWatchLogsHandler {
             node.put("arn", logsService.buildArn(g.getLogGroupName(), region));
             if (g.getRetentionInDays() != null) {
                 node.put("retentionInDays", g.getRetentionInDays());
+            }
+            if (g.getKmsKeyId() != null) {
+                node.put("kmsKeyId", g.getKmsKeyId());
             }
             node.put("storedBytes", 0);
             node.put("metricFilterCount", 0);

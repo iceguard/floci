@@ -46,6 +46,15 @@ class CloudWatchLogsServiceTest {
     }
 
     @Test
+    void createLogGroupPreservesKmsKeyId() {
+        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/observability";
+        service.createLogGroup("/app/logs", null, kmsKeyId, null, REGION);
+
+        LogGroup group = service.describeLogGroups("/app/logs", REGION).getFirst();
+        assertEquals(kmsKeyId, group.getKmsKeyId());
+    }
+
+    @Test
     void createLogGroupDuplicateThrows() {
         service.createLogGroup("/app/logs", null, null, REGION);
         assertThrows(AwsException.class, () ->

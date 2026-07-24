@@ -126,6 +126,10 @@ public class CloudWatchLogsService {
     // ──────────────────────────── Log Groups ────────────────────────────
 
     public void createLogGroup(String name, Integer retentionInDays, Map<String, String> tags, String region) {
+        createLogGroup(name, retentionInDays, null, tags, region);
+    }
+
+    public void createLogGroup(String name, Integer retentionInDays, String kmsKeyId, Map<String, String> tags, String region) {
         if (name == null || name.isBlank()) {
             throw new AwsException("InvalidParameterException", "logGroupName is required.", 400);
         }
@@ -138,6 +142,7 @@ public class CloudWatchLogsService {
         group.setLogGroupName(name);
         group.setCreatedTime(System.currentTimeMillis());
         group.setRetentionInDays(retentionInDays);
+        group.setKmsKeyId(kmsKeyId);
         if (tags != null) {
             group.setTags(new HashMap<>(tags));
         }

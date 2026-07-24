@@ -72,6 +72,25 @@ class CloudWatchLogsHandlerTest {
         assertEquals(STREAM, streams.get(0).path("logStreamName").asText());
     }
 
+    @Test
+    void createAndDescribeLogGroupPreservesKmsKeyId() {
+        String groupName = GROUP + "-kms";
+        String kmsKeyId = "arn:aws:kms:" + REGION + ":" + ACCOUNT + ":key/observability";
+        ObjectNode create = MAPPER.createObjectNode();
+        create.put("logGroupName", groupName);
+        create.put("kmsKeyId", kmsKeyId);
+
+        assertEquals(200, handler.handle("CreateLogGroup", create, REGION).getStatus());
+
+        ObjectNode describe = MAPPER.createObjectNode();
+        describe.put("logGroupNamePrefix", groupName);
+        JsonNode group = ((ObjectNode) handler.handle("DescribeLogGroups", describe, REGION).getEntity())
+                .path("logGroups")
+                .get(0);
+        assertEquals(groupName, group.path("logGroupName").asText());
+        assertEquals(kmsKeyId, group.path("kmsKeyId").asText());
+    }
+
     // ──────────────────────────── GetDataProtectionPolicy ────────────────────────────
 
     @Test
