@@ -147,7 +147,9 @@ public class Ec2ContainerManager {
                 // IMDS endpoint that this container should use
                 String flociHost = dockerHostResolver.resolve();
                 int imdsPort = config.services().ec2().imdsPort();
-                String imdsEndpoint = "http://" + flociHost + ":" + imdsPort;
+                String imdsEndpoint = image.systemd() && image.cloudInit()
+                        ? "http://169.254.169.254"
+                        : "http://" + flociHost + ":" + imdsPort;
                 String serviceEndpoint = "http://" + flociHost + ":4566";
 
                 // Build container spec — minimal images keep the historic tail
@@ -241,7 +243,7 @@ public class Ec2ContainerManager {
                 }
 
                 boolean metadataReady = image.systemd() && image.cloudInit()
-                        ? configureNativeCloudInitMetadata(containerId, instanceId, flociHost, imdsPort)
+                        ? configureNativeCloudInitMetadata(containerId, instance, flociHost)
                         : configureLinkLocalMetadataEndpoint(containerId, instanceId, flociHost, imdsPort);
                 if (!metadataReady) {
                     cleanupFailedLaunch(instance, containerId, containerIp, sshHostPort);
@@ -380,7 +382,7 @@ public class Ec2ContainerManager {
                 String flociHost = dockerHostResolver.resolve();
                 int imdsPort = config.services().ec2().imdsPort();
                 boolean metadataReady = instance.isNativeCloudInit()
-                        ? configureNativeCloudInitMetadata(containerId, instanceId, flociHost, imdsPort)
+                        ? configureNativeCloudInitMetadata(containerId, instance, flociHost)
                         : configureLinkLocalMetadataEndpoint(containerId, instanceId, flociHost, imdsPort);
                 if (!metadataReady) {
                     cleanupFailedLaunch(instance, containerId, containerIp, instance.getSshHostPort());
@@ -525,7 +527,7 @@ public class Ec2ContainerManager {
                 String flociHost = dockerHostResolver.resolve();
                 int imdsPort = config.services().ec2().imdsPort();
                 boolean metadataReady = instance.isNativeCloudInit()
-                        ? configureNativeCloudInitMetadata(containerId, instanceId, flociHost, imdsPort)
+                        ? configureNativeCloudInitMetadata(containerId, instance, flociHost)
                         : configureLinkLocalMetadataEndpoint(containerId, instanceId, flociHost, imdsPort);
                 if (!metadataReady) {
                     cleanupFailedLaunch(instance, containerId, containerIp, instance.getSshHostPort());
@@ -822,8 +824,10 @@ public class Ec2ContainerManager {
     }
 
     private boolean configureNativeCloudInitMetadata(
-            String containerId, String instanceId, String flociHost, int imdsPort) {
+            String containerId, Instance instance, String flociHost) {
+        String instanceId = instance.getInstanceId();
         try {
+            int imdsPort = metadataServer.registerInstanceEndpoint(instance);
             ContainerExecResult install = execInContainerForResult(
                     containerId, nativeMetadataProxyInstallCommand(), metadataProxyInstallTimeoutSeconds);
             if (install.exitCode() != 0) {
@@ -1091,6 +1095,7 @@ public class Ec2ContainerManager {
             portAllocator.release(sshHostPort);
         }
         metadataServer.unregisterContainer(containerIp, instance);
+        metadataServer.unregisterInstance(instance);
         instance.setState(InstanceState.terminated());
         instance.setTerminatedAt(System.currentTimeMillis());
         if (instance.getBootstrapResult() != null

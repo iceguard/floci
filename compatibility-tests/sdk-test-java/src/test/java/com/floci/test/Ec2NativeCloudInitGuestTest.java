@@ -5,6 +5,7 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.DescribeImagesRequest;
 import software.amazon.awssdk.services.ec2.model.Filter;
+import software.amazon.awssdk.services.ec2.model.IamInstanceProfileSpecification;
 import software.amazon.awssdk.services.ec2.model.InstanceType;
 import software.amazon.awssdk.services.ec2.model.RunInstancesRequest;
 
@@ -135,6 +136,9 @@ class Ec2NativeCloudInitGuestTest {
         return ec2.runInstances(RunInstancesRequest.builder()
                         .imageId(stockUbuntuImageId(ec2))
                         .instanceType(InstanceType.fromValue("t4g.small"))
+                        .iamInstanceProfile(IamInstanceProfileSpecification.builder()
+                                .arn("arn:aws:iam::000000000000:instance-profile/native-cloud-init-test")
+                                .build())
                         .minCount(1)
                         .maxCount(1)
                         .userData(Base64.getEncoder().encodeToString(userData.getBytes(StandardCharsets.UTF_8)))

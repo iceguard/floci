@@ -445,7 +445,7 @@ class Ec2ContainerManagerTest {
 
         awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
         verify(harness.builder).withEnv(List.of(
-                "AWS_EC2_METADATA_SERVICE_ENDPOINT=http://floci:9169",
+                "AWS_EC2_METADATA_SERVICE_ENDPOINT=http://169.254.169.254",
                 "AWS_ENDPOINT_URL=http://floci:4566",
                 "AWS_DEFAULT_REGION=us-west-2",
                 "AWS_REGION=us-west-2"));
@@ -674,6 +674,7 @@ class Ec2ContainerManagerTest {
 
         DockerClient dockerClient = mock(DockerClient.class);
         Ec2MetadataServer metadataServer = mock(Ec2MetadataServer.class);
+        when(metadataServer.registerInstanceEndpoint(any())).thenReturn(9169);
         Ec2PortForwardManager portForwardManager = mock(Ec2PortForwardManager.class);
         Ec2ContainerManager manager = new Ec2ContainerManager(
                 containerBuilder,

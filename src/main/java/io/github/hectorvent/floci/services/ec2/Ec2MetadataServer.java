@@ -62,8 +62,13 @@ public class Ec2MetadataServer {
     private final Map<String, Instance> containerIpToInstance = new ConcurrentHashMap<>();
     /** Instance ID → current credential plus every still-overlapping issued credential. */
     private final Map<String, InstanceCredentialState> instanceCredentials = new ConcurrentHashMap<>();
+    /** Native guest instance ID → isolated metadata listener. */
+    private final Map<String, InstanceMetadataEndpoint> instanceEndpoints = new ConcurrentHashMap<>();
+    /** Isolated metadata listener port → Instance. */
+    private final Map<Integer, Instance> endpointPortToInstance = new ConcurrentHashMap<>();
 
     private volatile HttpServer httpServer;
+    private volatile Router router;
 
     @Inject
     public Ec2MetadataServer(Vertx vertx, EmulatorConfig config, IamService iamService) {
@@ -95,6 +100,11 @@ public class Ec2MetadataServer {
         }
         containerIpToInstance.entrySet().removeIf(entry -> entry.getValue() == instance);
         tokenToInstance.entrySet().removeIf(entry -> entry.getValue() == instance);
+        InstanceMetadataEndpoint endpoint = instanceEndpoints.remove(instance.getInstanceId());
+        if (endpoint != null) {
+            endpointPortToInstance.remove(endpoint.port(), instance);
+            endpoint.server().close();
+        }
         InstanceCredentialState state = instanceCredentials.remove(instance.getInstanceId());
         if (state != null && iamService != null) {
             state.issuedCredentials().keySet().forEach(iamService::unregisterSession);
@@ -105,71 +115,118 @@ public class Ec2MetadataServer {
         return Optional.ofNullable(containerIpToInstance.get(containerIp));
     }
 
+    /**
+     * Creates an isolated metadata listener for a native guest.
+     *
+     * Docker Desktop and OrbStack can NAT every container-to-host request to loopback,
+     * which makes the normal source-IP lookup ambiguous. A dedicated listener preserves
+     * per-instance IMDS isolation without changing the guest-visible EC2 endpoint.
+     */
+    public synchronized int registerInstanceEndpoint(Instance instance) {
+        if (instance == null || instance.getInstanceId() == null || instance.getInstanceId().isBlank()) {
+            throw new IllegalArgumentException("Instance identity is required for an isolated metadata endpoint");
+        }
+        InstanceMetadataEndpoint existing = instanceEndpoints.get(instance.getInstanceId());
+        if (existing != null) {
+            endpointPortToInstance.put(existing.port(), instance);
+            return existing.port();
+        }
+        Router currentRouter = router;
+        if (currentRouter == null) {
+            throw new IllegalStateException("IMDS server has not started");
+        }
+
+        CompletableFuture<HttpServer> started = new CompletableFuture<>();
+        HttpServer endpointServer = vertx.createHttpServer();
+        endpointServer.requestHandler(currentRouter).listen(0, result -> {
+            if (result.succeeded()) {
+                started.complete(result.result());
+            }
+            else {
+                started.completeExceptionally(result.cause());
+            }
+        });
+        try {
+            HttpServer listeningServer = started.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            int port = listeningServer.actualPort();
+            instanceEndpoints.put(instance.getInstanceId(), new InstanceMetadataEndpoint(port, listeningServer));
+            endpointPortToInstance.put(port, instance);
+            LOG.debugv("IMDS: opened isolated listener {0} for instance {1}", port, instance.getInstanceId());
+            return port;
+        }
+        catch (Exception e) {
+            endpointServer.close();
+            throw new IllegalStateException(
+                    "Could not open isolated IMDS listener for instance " + instance.getInstanceId(), e);
+        }
+    }
+
     public CompletableFuture<Void> start() {
         CompletableFuture<Void> future = new CompletableFuture<>();
         int port = config.services().ec2().imdsPort();
 
-        Router router = Router.router(vertx);
-        router.route().handler(BodyHandler.create());
+        Router serverRouter = Router.router(vertx);
+        serverRouter.route().handler(BodyHandler.create());
 
-        router.routeWithRegex(METADATA_VERSION_PATTERN).handler(ctx ->
+        serverRouter.routeWithRegex(METADATA_VERSION_PATTERN).handler(ctx ->
                 ctx.reroute(versionedPath(ctx.request().path())));
 
-        router.get("/").handler(ctx -> handleDirectory(ctx,
+        serverRouter.get("/").handler(ctx -> handleDirectory(ctx,
                 "1.0\n2009-04-04\n2014-11-05\n2021-03-23\nlatest"));
-        router.get("/latest").handler(ctx -> handleDirectory(ctx, "dynamic/\nmeta-data/\nuser-data"));
-        router.get("/latest/").handler(ctx -> handleDirectory(ctx, "dynamic/\nmeta-data/\nuser-data"));
-        router.get("/latest/meta-data").handler(this::handleMetadataRoot);
-        router.get("/latest/meta-data/").handler(this::handleMetadataRoot);
-        router.get("/latest/meta-data/iam").handler(ctx -> handleDirectory(ctx, "info\nsecurity-credentials/"));
-        router.get("/latest/meta-data/iam/").handler(ctx -> handleDirectory(ctx, "info\nsecurity-credentials/"));
-        router.get("/latest/meta-data/placement").handler(ctx -> handleDirectory(ctx, "availability-zone\nregion"));
-        router.get("/latest/meta-data/placement/").handler(ctx -> handleDirectory(ctx, "availability-zone\nregion"));
-        router.get("/latest/meta-data/network").handler(ctx -> handleDirectory(ctx, "interfaces/"));
-        router.get("/latest/meta-data/network/").handler(ctx -> handleDirectory(ctx, "interfaces/"));
-        router.get("/latest/meta-data/network/interfaces").handler(ctx -> handleDirectory(ctx, "macs/"));
-        router.get("/latest/meta-data/network/interfaces/").handler(ctx -> handleDirectory(ctx, "macs/"));
-        router.get("/latest/meta-data/network/interfaces/macs").handler(this::handleNetworkMacs);
-        router.get("/latest/meta-data/network/interfaces/macs/").handler(this::handleNetworkMacs);
-        router.getWithRegex("/latest/meta-data/network/interfaces/macs/[^/]+/?")
+        serverRouter.get("/latest").handler(ctx -> handleDirectory(ctx, "dynamic/\nmeta-data/\nuser-data"));
+        serverRouter.get("/latest/").handler(ctx -> handleDirectory(ctx, "dynamic/\nmeta-data/\nuser-data"));
+        serverRouter.get("/latest/meta-data").handler(this::handleMetadataRoot);
+        serverRouter.get("/latest/meta-data/").handler(this::handleMetadataRoot);
+        serverRouter.get("/latest/meta-data/iam").handler(ctx -> handleDirectory(ctx, "info\nsecurity-credentials/"));
+        serverRouter.get("/latest/meta-data/iam/").handler(ctx -> handleDirectory(ctx, "info\nsecurity-credentials/"));
+        serverRouter.get("/latest/meta-data/placement").handler(ctx -> handleDirectory(ctx, "availability-zone\nregion"));
+        serverRouter.get("/latest/meta-data/placement/").handler(ctx -> handleDirectory(ctx, "availability-zone\nregion"));
+        serverRouter.get("/latest/meta-data/network").handler(ctx -> handleDirectory(ctx, "interfaces/"));
+        serverRouter.get("/latest/meta-data/network/").handler(ctx -> handleDirectory(ctx, "interfaces/"));
+        serverRouter.get("/latest/meta-data/network/interfaces").handler(ctx -> handleDirectory(ctx, "macs/"));
+        serverRouter.get("/latest/meta-data/network/interfaces/").handler(ctx -> handleDirectory(ctx, "macs/"));
+        serverRouter.get("/latest/meta-data/network/interfaces/macs").handler(this::handleNetworkMacs);
+        serverRouter.get("/latest/meta-data/network/interfaces/macs/").handler(this::handleNetworkMacs);
+        serverRouter.getWithRegex("/latest/meta-data/network/interfaces/macs/[^/]+/?")
                 .handler(this::handleNetworkInterfaceDirectory);
-        router.getWithRegex("/latest/meta-data/network/interfaces/macs/[^/]+/[^/]+")
+        serverRouter.getWithRegex("/latest/meta-data/network/interfaces/macs/[^/]+/[^/]+")
                 .handler(this::handleNetworkInterfaceValue);
-        router.get("/latest/meta-data/tags").handler(ctx -> handleDirectory(ctx, "instance/"));
-        router.get("/latest/meta-data/tags/").handler(ctx -> handleDirectory(ctx, "instance/"));
-        router.get("/latest/dynamic").handler(ctx -> handleDirectory(ctx, "instance-identity/"));
-        router.get("/latest/dynamic/").handler(ctx -> handleDirectory(ctx, "instance-identity/"));
-        router.get("/latest/dynamic/instance-identity").handler(ctx -> handleDirectory(ctx, "document"));
-        router.get("/latest/dynamic/instance-identity/").handler(ctx -> handleDirectory(ctx, "document"));
+        serverRouter.get("/latest/meta-data/tags").handler(ctx -> handleDirectory(ctx, "instance/"));
+        serverRouter.get("/latest/meta-data/tags/").handler(ctx -> handleDirectory(ctx, "instance/"));
+        serverRouter.get("/latest/dynamic").handler(ctx -> handleDirectory(ctx, "instance-identity/"));
+        serverRouter.get("/latest/dynamic/").handler(ctx -> handleDirectory(ctx, "instance-identity/"));
+        serverRouter.get("/latest/dynamic/instance-identity").handler(ctx -> handleDirectory(ctx, "document"));
+        serverRouter.get("/latest/dynamic/instance-identity/").handler(ctx -> handleDirectory(ctx, "document"));
 
         // IMDSv2 token endpoint
-        router.put("/latest/api/token").handler(this::handleToken);
+        serverRouter.put("/latest/api/token").handler(this::handleToken);
 
         // Metadata endpoints
-        router.get("/latest/meta-data/instance-id").handler(ctx -> handleText(ctx, inst -> inst.getInstanceId()));
-        router.get("/latest/meta-data/ami-id").handler(ctx -> handleText(ctx, inst -> inst.getImageId()));
-        router.get("/latest/meta-data/instance-type").handler(ctx -> handleText(ctx, inst -> inst.getInstanceType()));
-        router.get("/latest/meta-data/local-ipv4").handler(ctx -> handleText(ctx, inst -> inst.getPrivateIpAddress()));
-        router.get("/latest/meta-data/public-ipv4").handler(ctx -> handleText(ctx, inst -> inst.getPublicIpAddress()));
-        router.get("/latest/meta-data/public-hostname").handler(ctx -> handleText(ctx, inst -> inst.getPublicDnsName()));
-        router.get("/latest/meta-data/local-hostname").handler(ctx -> handleText(ctx, inst -> inst.getPrivateDnsName()));
-        router.get("/latest/meta-data/hostname").handler(ctx -> handleText(ctx, inst -> inst.getPrivateDnsName()));
-        router.get("/latest/meta-data/mac").handler(ctx -> handleMac(ctx));
-        router.get("/latest/meta-data/security-groups").handler(ctx -> handleSecurityGroups(ctx));
-        router.get("/latest/meta-data/placement/availability-zone").handler(ctx -> handleText(ctx, inst ->
+        serverRouter.get("/latest/meta-data/instance-id").handler(ctx -> handleText(ctx, inst -> inst.getInstanceId()));
+        serverRouter.get("/latest/meta-data/ami-id").handler(ctx -> handleText(ctx, inst -> inst.getImageId()));
+        serverRouter.get("/latest/meta-data/instance-type").handler(ctx -> handleText(ctx, inst -> inst.getInstanceType()));
+        serverRouter.get("/latest/meta-data/local-ipv4").handler(ctx -> handleText(ctx, inst -> inst.getPrivateIpAddress()));
+        serverRouter.get("/latest/meta-data/public-ipv4").handler(ctx -> handleText(ctx, inst -> inst.getPublicIpAddress()));
+        serverRouter.get("/latest/meta-data/public-hostname").handler(ctx -> handleText(ctx, inst -> inst.getPublicDnsName()));
+        serverRouter.get("/latest/meta-data/local-hostname").handler(ctx -> handleText(ctx, inst -> inst.getPrivateDnsName()));
+        serverRouter.get("/latest/meta-data/hostname").handler(ctx -> handleText(ctx, inst -> inst.getPrivateDnsName()));
+        serverRouter.get("/latest/meta-data/mac").handler(ctx -> handleMac(ctx));
+        serverRouter.get("/latest/meta-data/security-groups").handler(ctx -> handleSecurityGroups(ctx));
+        serverRouter.get("/latest/meta-data/placement/availability-zone").handler(ctx -> handleText(ctx, inst ->
                 inst.getPlacement() != null ? inst.getPlacement().getAvailabilityZone() : "us-east-1a"));
-        router.get("/latest/meta-data/placement/region").handler(ctx -> handleText(ctx, inst -> inst.getRegion()));
-        router.get("/latest/meta-data/iam/info").handler(ctx -> handleIamInfo(ctx));
-        router.get("/latest/meta-data/iam/security-credentials/").handler(ctx -> handleCredentialsList(ctx));
-        router.get("/latest/meta-data/iam/security-credentials/:role").handler(ctx -> handleCredentials(ctx));
-        router.get("/latest/meta-data/tags/instance").handler(ctx -> handleInstanceTagKeys(ctx));
-        router.get("/latest/meta-data/tags/instance/").handler(ctx -> handleInstanceTagKeys(ctx));
-        router.getWithRegex("/latest/meta-data/tags/instance/.+").handler(ctx -> handleInstanceTagValue(ctx));
-        router.get("/latest/user-data").handler(ctx -> handleUserData(ctx));
-        router.get("/latest/dynamic/instance-identity/document").handler(ctx -> handleIdentityDocument(ctx));
+        serverRouter.get("/latest/meta-data/placement/region").handler(ctx -> handleText(ctx, inst -> inst.getRegion()));
+        serverRouter.get("/latest/meta-data/iam/info").handler(ctx -> handleIamInfo(ctx));
+        serverRouter.get("/latest/meta-data/iam/security-credentials/").handler(ctx -> handleCredentialsList(ctx));
+        serverRouter.get("/latest/meta-data/iam/security-credentials/:role").handler(ctx -> handleCredentials(ctx));
+        serverRouter.get("/latest/meta-data/tags/instance").handler(ctx -> handleInstanceTagKeys(ctx));
+        serverRouter.get("/latest/meta-data/tags/instance/").handler(ctx -> handleInstanceTagKeys(ctx));
+        serverRouter.getWithRegex("/latest/meta-data/tags/instance/.+").handler(ctx -> handleInstanceTagValue(ctx));
+        serverRouter.get("/latest/user-data").handler(ctx -> handleUserData(ctx));
+        serverRouter.get("/latest/dynamic/instance-identity/document").handler(ctx -> handleIdentityDocument(ctx));
 
+        router = serverRouter;
         httpServer = vertx.createHttpServer();
-        httpServer.requestHandler(router).listen(port, result -> {
+        httpServer.requestHandler(serverRouter).listen(port, result -> {
             if (result.succeeded()) {
                 LOG.infof("EC2 IMDS server listening on port %d", port);
                 future.complete(null);
@@ -185,9 +242,13 @@ public class Ec2MetadataServer {
         if (httpServer != null) {
             httpServer.close();
         }
+        instanceEndpoints.values().forEach(endpoint -> endpoint.server().close());
+        instanceEndpoints.clear();
+        endpointPortToInstance.clear();
         tokenToInstance.clear();
         containerIpToInstance.clear();
         instanceCredentials.clear();
+        router = null;
     }
 
     // ── Token (IMDSv2) ────────────────────────────────────────────────────────
@@ -468,6 +529,10 @@ public class Ec2MetadataServer {
     // ── Instance resolution ───────────────────────────────────────────────────
 
     private Instance resolveInstanceByIp(RoutingContext ctx) {
+        Instance endpointInstance = endpointPortToInstance.get(ctx.request().localAddress().port());
+        if (endpointInstance != null) {
+            return endpointInstance;
+        }
         String remoteIp = ctx.request().remoteAddress().host();
         return containerIpToInstance.get(remoteIp);
     }
@@ -482,6 +547,11 @@ public class Ec2MetadataServer {
             }
         }
 
+        Instance endpointInstance = endpointPortToInstance.get(ctx.request().localAddress().port());
+        if (endpointInstance != null) {
+            return endpointInstance;
+        }
+
         // Fall back to source IP (IMDSv1)
         String remoteIp = ctx.request().remoteAddress().host();
         Instance inst = containerIpToInstance.get(remoteIp);
@@ -491,6 +561,8 @@ public class Ec2MetadataServer {
         }
         return inst;
     }
+
+    private record InstanceMetadataEndpoint(int port, HttpServer server) {}
 
     // ── Utilities ─────────────────────────────────────────────────────────────
 
