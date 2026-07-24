@@ -3,6 +3,8 @@ package com.floci.test;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import software.amazon.awssdk.services.ec2.Ec2Client;
+import software.amazon.awssdk.services.ec2.model.DescribeImagesRequest;
+import software.amazon.awssdk.services.ec2.model.Filter;
 import software.amazon.awssdk.services.ec2.model.InstanceType;
 import software.amazon.awssdk.services.ec2.model.RunInstancesRequest;
 
@@ -18,7 +20,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 @EnabledIfSystemProperty(named = "floci.native-cloud-init-it", matches = "true")
 class Ec2NativeCloudInitGuestTest {
 
-    private static final String CLOUD_IMAGE = "ami-ubuntu2404-cloud-arm64";
+    private static final String STOCK_UBUNTU_IMAGE_NAME =
+            "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*";
     private static final Duration GUEST_START_TIMEOUT = Duration.ofSeconds(60);
     private static final Duration CLOUD_INIT_TIMEOUT = Duration.ofSeconds(90);
     private static final int USER_DATA_TIMEOUT_SECONDS = Integer.getInteger(
@@ -130,7 +133,7 @@ class Ec2NativeCloudInitGuestTest {
 
     private static String launch(Ec2Client ec2, String userData) {
         return ec2.runInstances(RunInstancesRequest.builder()
-                        .imageId(CLOUD_IMAGE)
+                        .imageId(stockUbuntuImageId(ec2))
                         .instanceType(InstanceType.fromValue("t4g.small"))
                         .minCount(1)
                         .maxCount(1)
@@ -139,6 +142,19 @@ class Ec2NativeCloudInitGuestTest {
                 .instances()
                 .get(0)
                 .instanceId();
+    }
+
+    private static String stockUbuntuImageId(Ec2Client ec2) {
+        return ec2.describeImages(DescribeImagesRequest.builder()
+                        .owners("099720109477")
+                        .filters(
+                                Filter.builder().name("name").values(STOCK_UBUNTU_IMAGE_NAME).build(),
+                                Filter.builder().name("architecture").values("arm64").build(),
+                                Filter.builder().name("state").values("available").build())
+                        .build())
+                .images()
+                .getFirst()
+                .imageId();
     }
 
     private static void terminate(Ec2Client ec2, String instanceId, String container) throws Exception {

@@ -35,6 +35,9 @@ class AmiImageToolTest {
         assertEquals("15188696da114a3ffd3d3554f5858a0c3ac257933656e85feb4e0e83ad542b4a", image.canonical.rootfsSha256);
         assertEquals("04d1dec4a9066c7f91d25b736f602c30286de9e61969011615373b22ffc29ac4",
                 image.canonical.manifestSha256);
+        assertEquals("ami-ubuntu2404-arm64", image.catalogImageId);
+        assertEquals(List.of("ami-ubuntu2404", "ami-ubuntu2404-cloud-arm64", "ami-ubuntu2404-cloud"),
+                image.catalogAliases);
         assertEquals("floci/ami-ubuntu:24.04-arm64-sha256-15188696da114a3ffd3d3554f5858a0c3ac257933656e85feb4e0e83ad542b4a",
                 image.docker.image);
         assertEquals(List.of("systemd", "cloud-init", "netcat-openbsd"), image.guest.smokePackages);
