@@ -13,6 +13,10 @@ import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
 import software.amazon.awssdk.auth.credentials.InstanceProfileCredentialsProvider;
 
 import java.net.ServerSocket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -28,6 +32,32 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class Ec2ImdsCredentialsSdkIntegrationTest {
+
+    @Test
+    void isolatedMetadataEndpointsPreserveInstanceIdentityAcrossLoopbackNat() throws Exception {
+        int port = availablePort();
+        Vertx vertx = Vertx.vertx();
+        Ec2MetadataServer server = new Ec2MetadataServer(vertx, config(port), iamServiceWithRole());
+        server.start().get(5, TimeUnit.SECONDS);
+
+        Instance first = instanceWithProfile();
+        Instance second = instanceWithProfile();
+        second.setInstanceId("i-fedcba98765432100");
+        server.registerContainer("172.18.0.11", first.getInstanceId(), first);
+        server.registerContainer("172.18.0.12", second.getInstanceId(), second);
+
+        try (HttpClient client = HttpClient.newHttpClient()) {
+            int firstPort = server.registerInstanceEndpoint(first);
+            int secondPort = server.registerInstanceEndpoint(second);
+
+            assertEquals(first.getInstanceId(), metadataInstanceId(client, firstPort));
+            assertEquals(second.getInstanceId(), metadataInstanceId(client, secondPort));
+        }
+        finally {
+            server.stop();
+            vertx.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        }
+    }
 
     @Test
     void awsSdkCredentialChainResolvesFlociInstanceProfileCredentials() throws Exception {
@@ -110,5 +140,12 @@ class Ec2ImdsCredentialsSdkIntegrationTest {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();
         }
+    }
+
+    private static String metadataInstanceId(HttpClient client, int port) throws Exception {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("http://127.0.0.1:" + port + "/latest/meta-data/instance-id"))
+                .build();
+        return client.send(request, HttpResponse.BodyHandlers.ofString()).body();
     }
 }

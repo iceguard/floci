@@ -39,7 +39,7 @@ Any unrecognized AMI ID (including real AWS AMI IDs like `ami-0abc12345678`) fal
 
 ### Cloud-image-derived AMI guests
 
-The advertised Canonical Ubuntu 24.04 ARM64 AMI is built from Canonical cloud-image artifacts, not from the Docker-library `ubuntu:24.04` image. It boots with `systemd` and native `cloud-init` using the EC2 datasource. Floci registers the guest with IMDS, installs the link-local `169.254.169.254` endpoint, exposes versioned metadata traversal, and releases guest init only after metadata preflight succeeds. `DescribeImages` publishes one stock Canonical record, while `ami-ubuntu2404-cloud-arm64` and `ami-ubuntu2404-cloud` remain resolver aliases for callers that used the former separate cloud record.
+The advertised Canonical Ubuntu 24.04 ARM64 AMI is built from Canonical cloud-image artifacts, not from the Docker-library `ubuntu:24.04` image. It boots with `systemd` and native `cloud-init` using the EC2 datasource. Floci registers the guest with IMDS, installs the link-local `169.254.169.254` endpoint, exposes versioned metadata traversal, and releases guest init only after metadata preflight succeeds. Each native guest proxies that standard link-local endpoint to an isolated host listener, preserving instance identity even when Docker Desktop or OrbStack NATs container-to-host connections through loopback. `DescribeImages` publishes one stock Canonical record, while `ami-ubuntu2404-cloud-arm64` and `ami-ubuntu2404-cloud` remain resolver aliases for callers that used the former separate cloud record.
 
 This mode is selected by the cloud-image AMI contract rather than a global configuration switch. Minimal-image entries keep the direct shell user-data execution path and `tail -f /dev/null` container lifecycle.
 
