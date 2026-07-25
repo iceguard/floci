@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
+import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceBootstrapResult;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
@@ -58,6 +59,9 @@ public class Ec2ContainerManager {
     private static final String PRE_SYSTEMD_ENTRYPOINT = "/usr/local/sbin/floci-ec2-pre-systemd";
     private static final String SYSTEMD_RELEASE_PATH = "/run/floci-ec2/start-systemd";
     private static final int DEFAULT_USER_DATA_TIMEOUT_SECONDS = 900;
+    private static final Pattern PEM_CERTIFICATE = Pattern.compile(
+            "-----BEGIN CERTIFICATE-----\\s*.*?\\s*-----END CERTIFICATE-----",
+            Pattern.DOTALL);
     private static final Pattern MIME_BOUNDARY = Pattern.compile("(?im)^content-type:\\s*multipart/[^;]+;\\s*boundary=\"?([^\";\\n\\r]+)\"?.*$");
     static int containerBridgeIpAttempts = 30;
     static long containerBridgeIpPollMillis = 500;
@@ -70,6 +74,7 @@ public class Ec2ContainerManager {
     private final DockerClient dockerClient;
     private final PortAllocator portAllocator;
     private final EmulatorConfig config;
+    private final AcmService acmService;
     private final Ec2MetadataServer metadataServer;
     private final Ec2PortForwardManager portForwardManager;
     private volatile Consumer<Instance> instancePersister = ignored -> {};
@@ -88,6 +93,7 @@ public class Ec2ContainerManager {
                                DockerClient dockerClient,
                                PortAllocator portAllocator,
                                EmulatorConfig config,
+                               AcmService acmService,
                                Ec2MetadataServer metadataServer,
                                Ec2PortForwardManager portForwardManager) {
         this.containerBuilder = containerBuilder;
@@ -97,6 +103,7 @@ public class Ec2ContainerManager {
         this.dockerClient = dockerClient;
         this.portAllocator = portAllocator;
         this.config = config;
+        this.acmService = acmService;
         this.metadataServer = metadataServer;
         this.portForwardManager = portForwardManager;
     }
@@ -847,6 +854,10 @@ public class Ec2ContainerManager {
             copyFileToContainer(containerId, "/etc/cloud/cloud.cfg.d", "99-floci-ec2.cfg",
                     cloudInitDatasourceConfiguration().getBytes(StandardCharsets.UTF_8), 0644);
 
+            if (!installAcmTrustAnchors(containerId, instanceId, instance.getRegion())) {
+                return false;
+            }
+
             ContainerExecResult enable = execInContainerForResult(containerId,
                     new String[]{"systemctl", "enable", "floci-imds-address.service", "floci-imds-proxy.socket"}, 15);
             if (enable.exitCode() != 0) {
@@ -963,6 +974,56 @@ public class Ec2ContainerManager {
                     timeout: 5
                     strict_id: false
                 """;
+    }
+
+    private boolean installAcmTrustAnchors(String containerId, String instanceId, String region) throws Exception {
+        List<String> certificates = acmTrustAnchors(acmService.certificateChains(region));
+        if (certificates.isEmpty()) {
+            return true;
+        }
+
+        for (int index = 0; index < certificates.size(); index++) {
+            copyFileToContainer(
+                    containerId,
+                    "/usr/local/share/ca-certificates",
+                    "floci-acm-trust-" + (index + 1) + ".crt",
+                    (certificates.get(index) + "\n").getBytes(StandardCharsets.UTF_8),
+                    0644);
+        }
+        ContainerExecResult trustStore = execInContainerForResult(
+                containerId,
+                new String[]{"update-ca-certificates"},
+                30);
+        if (trustStore.exitCode() != 0) {
+            LOG.warnv("Could not install ACM trust anchors for EC2 instance {0}: {1}",
+                    instanceId, trustStore.summary());
+            return false;
+        }
+        LOG.infov("Installed {0} ACM trust anchor(s) for EC2 instance {1}",
+                certificates.size(), instanceId);
+        return true;
+    }
+
+    static List<String> acmTrustAnchors(List<String> chains) {
+        if (chains == null || chains.isEmpty()) {
+            return List.of();
+        }
+        return chains.stream()
+                .flatMap(chain -> pemCertificates(chain).stream())
+                .distinct()
+                .toList();
+    }
+
+    static List<String> pemCertificates(String chain) {
+        if (chain == null || chain.isBlank()) {
+            return List.of();
+        }
+        Matcher matcher = PEM_CERTIFICATE.matcher(chain);
+        List<String> certificates = new ArrayList<>();
+        while (matcher.find()) {
+            certificates.add(matcher.group().strip());
+        }
+        return List.copyOf(certificates);
     }
 
     private void copyFileToContainer(

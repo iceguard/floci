@@ -76,8 +76,10 @@ public class CertificateGenerator {
      * Generates a certificate for local emulation that mimics an ACM-issued certificate:
      * the subject is {@code CN=<domainName>} but the issuer is a cosmetic Amazon CA DN, matching
      * what real ACM returns. It is signed by its own key, so it is <em>not</em> verifiable as a
-     * trust anchor (the issuer DN does not match any certificate a client could hold). Use this
-     * for ACM responses; use {@link #generateSelfSignedCertificate} for a cert clients must trust.
+     * trust anchor (the issuer DN does not match any certificate a client could hold). This method
+     * is retained for callers that need the legacy cosmetic shape. ACM requests use
+     * {@link #generateCertificateSignedBy}; use {@link #generateSelfSignedCertificate} for a cert
+     * clients must trust directly.
      *
      * <p>Note: RSA key generation (especially 4096-bit) can take 100-500ms.
      * In production emulator usage, consider moving this to a worker thread
@@ -98,11 +100,53 @@ public class CertificateGenerator {
         return buildCertificate(domainName, sans, keyAlgorithm, "CN=" + domainName, true);
     }
 
+    /**
+     * Generates a leaf certificate signed by a local certificate authority.
+     */
+    public GeneratedCertificate generateCertificateSignedBy(
+            String domainName,
+            List<String> sans,
+            KeyAlgorithm keyAlgorithm,
+            String certificateAuthorityPem,
+            String certificateAuthorityPrivateKeyPem) {
+        try {
+            X509Certificate certificateAuthority = parseCertificate(certificateAuthorityPem);
+            PrivateKey certificateAuthorityPrivateKey = parsePrivateKey(certificateAuthorityPrivateKeyPem);
+            KeyPair keyPair = generateKeyPair(keyAlgorithm);
+            return buildCertificate(
+                    domainName,
+                    sans,
+                    keyAlgorithm,
+                    keyPair,
+                    certificateAuthority.getSubjectX500Principal().getName(),
+                    false,
+                    certificateAuthorityPrivateKey);
+        } catch (Exception e) {
+            LOG.error("Failed to generate CA-signed certificate", e);
+            throw new CertificateGenerationException("Certificate generation failed: " + e.getMessage(), e);
+        }
+    }
+
     private GeneratedCertificate buildCertificate(String domainName, List<String> sans, KeyAlgorithm keyAlgorithm,
                                                   String issuerDn, boolean asCa) {
         try {
             KeyPair keyPair = generateKeyPair(keyAlgorithm);
+            return buildCertificate(domainName, sans, keyAlgorithm, keyPair, issuerDn, asCa, keyPair.getPrivate());
+        } catch (Exception e) {
+            LOG.error("Failed to generate certificate", e);
+            throw new CertificateGenerationException("Certificate generation failed: " + e.getMessage(), e);
+        }
+    }
 
+    private GeneratedCertificate buildCertificate(
+            String domainName,
+            List<String> sans,
+            KeyAlgorithm keyAlgorithm,
+            KeyPair keyPair,
+            String issuerDn,
+            boolean asCa,
+            PrivateKey signingKey) {
+        try {
             Instant now = Instant.now();
             Instant notBefore = now;
             Instant notAfter = now.plus(365, ChronoUnit.DAYS);
@@ -113,7 +157,7 @@ public class CertificateGenerator {
             X500Name issuer = new X500Name(issuerDn);
             X500Name subject = new X500Name(subjectDn);
 
-            String signatureAlgorithm = keyAlgorithm.getAlgorithm().equals("EC")
+            String signatureAlgorithm = signingKey.getAlgorithm().equals("EC")
                 ? "SHA512withECDSA"
                 : "SHA512WithRSA";
 
@@ -152,10 +196,11 @@ public class CertificateGenerator {
 
             // Signed with the subject's own private key. For generateCertificate() the issuer DN is
             // a cosmetic Amazon DN (mimicking ACM); for generateSelfSignedCertificate() issuer ==
-            // subject, so the cert is a valid self-signed trust anchor.
+            // subject, so the cert is a valid self-signed trust anchor. CA-signed certificates use
+            // the supplied authority key and its subject as the issuer.
             ContentSigner signer = new JcaContentSignerBuilder(signatureAlgorithm)
                 .setProvider(BouncyCastleProvider.PROVIDER_NAME)
-                .build(keyPair.getPrivate());
+                .build(signingKey);
 
             X509CertificateHolder certHolder = certBuilder.build(signer);
             X509Certificate cert = new JcaX509CertificateConverter()
