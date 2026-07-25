@@ -1268,7 +1268,8 @@ public class Ec2Service implements ContainerTeardown {
 
     public VpcEndpoint createVpcEndpoint(String region, String vpcId, String serviceName, String endpointType,
                                          List<String> routeTableIds, List<String> subnetIds,
-                                         List<String> securityGroupIds, Boolean privateDnsEnabled, List<Tag> endpointTags) {
+                                         List<String> securityGroupIds, Boolean privateDnsEnabled,
+                                         String policyDocument, List<Tag> endpointTags) {
         ensureDefaultResources(region);
         getRequiredVpc(region, vpcId);
         for (String routeTableId : routeTableIds) {
@@ -1293,6 +1294,7 @@ public class Ec2Service implements ContainerTeardown {
         endpoint.setRouteTableIds(new ArrayList<>(routeTableIds));
         endpoint.setSubnetIds(new ArrayList<>(subnetIds));
         endpoint.setSecurityGroupIds(new ArrayList<>(securityGroupIds));
+        endpoint.setPolicyDocument(policyDocument);
         if (endpointTags != null && !endpointTags.isEmpty()) {
             endpoint.setTags(new ArrayList<>(endpointTags));
             tags.put(endpoint.getVpcEndpointId(), new ArrayList<>(endpointTags));
@@ -1314,6 +1316,48 @@ public class Ec2Service implements ContainerTeardown {
                 .filter(endpoint -> endpointIds.isEmpty() || endpointIds.contains(endpoint.getVpcEndpointId()))
                 .filter(endpoint -> matchesFilters(endpoint, filters, region))
                 .collect(Collectors.toList());
+    }
+
+    public VpcEndpoint modifyVpcEndpoint(
+            String region,
+            String endpointId,
+            List<String> addRouteTableIds,
+            List<String> removeRouteTableIds,
+            List<String> addSubnetIds,
+            List<String> removeSubnetIds,
+            List<String> addSecurityGroupIds,
+            List<String> removeSecurityGroupIds,
+            Boolean privateDnsEnabled,
+            String policyDocument) {
+        ensureDefaultResources(region);
+        VpcEndpoint endpoint = getRequiredVpcEndpoint(region, endpointId);
+
+        addRouteTableIds.forEach(routeTableId -> getRequiredRouteTable(region, routeTableId));
+        addSubnetIds.forEach(subnetId -> requireSubnet(region, subnetId));
+        addSecurityGroupIds.forEach(securityGroupId -> getRequiredSecurityGroup(region, securityGroupId));
+
+        endpoint.setRouteTableIds(reconcileIds(
+                endpoint.getRouteTableIds(), addRouteTableIds, removeRouteTableIds));
+        endpoint.setSubnetIds(reconcileIds(
+                endpoint.getSubnetIds(), addSubnetIds, removeSubnetIds));
+        endpoint.setSecurityGroupIds(reconcileIds(
+                endpoint.getSecurityGroupIds(), addSecurityGroupIds, removeSecurityGroupIds));
+        if (privateDnsEnabled != null) {
+            endpoint.setPrivateDnsEnabled(privateDnsEnabled);
+        }
+        if (policyDocument != null) {
+            endpoint.setPolicyDocument(policyDocument);
+        }
+        vpcEndpoints.put(key(region, endpointId), endpoint);
+        return endpoint;
+    }
+
+    private static List<String> reconcileIds(
+            List<String> existing, List<String> additions, List<String> removals) {
+        LinkedHashSet<String> reconciled = new LinkedHashSet<>(existing);
+        reconciled.removeAll(removals);
+        reconciled.addAll(additions);
+        return new ArrayList<>(reconciled);
     }
 
     public List<VpcEndpoint> deleteVpcEndpoints(String region, List<String> endpointIds) {

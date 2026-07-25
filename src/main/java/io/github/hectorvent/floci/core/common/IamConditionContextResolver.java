@@ -44,6 +44,14 @@ public class IamConditionContextResolver {
         }
         if ("ec2:CreateLaunchTemplate".equals(action)) {
             readLaunchTemplateRequestTags(ctx, conditions);
+        } else if ("ec2:CreateVpcEndpoint".equals(action)) {
+            readEc2RequestTags(ctx, "vpc-endpoint", conditions);
+        } else if ("ec2:ModifyVpcEndpoint".equals(action)
+                || "ec2:DeleteVpcEndpoints".equals(action)) {
+            addVpcEndpointResourceTags(ctx, region, conditions);
+        } else if ("ec2:CreateTags".equals(action) && isVpcEndpointResource(ctx)) {
+            readFormTags(ctx, "Tag", conditions);
+            addVpcEndpointResourceTags(ctx, region, conditions);
         } else if ("ec2:CreateLaunchTemplateVersion".equals(action)
                 || "ec2:ModifyLaunchTemplate".equals(action)
                 || "ec2:DeleteLaunchTemplate".equals(action)) {
@@ -52,6 +60,75 @@ public class IamConditionContextResolver {
             return null;
         }
         return conditions.isEmpty() ? null : conditions;
+    }
+
+    private boolean isVpcEndpointResource(ContainerRequestContext ctx) {
+        String resourceId = formRequestResolver.firstParameter(ctx, "ResourceId.1");
+        return resourceId != null && resourceId.startsWith("vpce-");
+    }
+
+    private void readEc2RequestTags(
+            ContainerRequestContext ctx,
+            String expectedResourceType,
+            Map<String, List<String>> conditions) {
+        for (int specification = 1; ; specification++) {
+            String prefix = "TagSpecification." + specification;
+            String resourceType = formRequestResolver.firstParameter(ctx, prefix + ".ResourceType");
+            if (resourceType == null) {
+                return;
+            }
+            if (!expectedResourceType.equals(resourceType)) {
+                continue;
+            }
+            readFormTags(ctx, prefix + ".Tag", conditions);
+        }
+    }
+
+    private void readFormTags(
+            ContainerRequestContext ctx,
+            String prefix,
+            Map<String, List<String>> conditions) {
+        for (int index = 1; ; index++) {
+            String key = formRequestResolver.firstParameter(ctx, prefix + "." + index + ".Key");
+            if (key == null) {
+                return;
+            }
+            String value = formRequestResolver.firstParameter(ctx, prefix + "." + index + ".Value");
+            if (value != null) {
+                conditions.put("aws:RequestTag/" + key, List.of(value));
+            }
+        }
+    }
+
+    private void addVpcEndpointResourceTags(
+            ContainerRequestContext ctx,
+            String region,
+            Map<String, List<String>> conditions) {
+        String endpointId = formRequestResolver.firstParameter(ctx, "VpcEndpointId");
+        if (endpointId == null) {
+            endpointId = formRequestResolver.firstParameter(ctx, "VpcEndpointId.1");
+        }
+        if (endpointId == null) {
+            endpointId = formRequestResolver.firstParameter(ctx, "ResourceId.1");
+        }
+        if (endpointId == null || !endpointId.startsWith("vpce-")) {
+            return;
+        }
+        try {
+            ec2Service.describeVpcEndpoints(region, List.of(endpointId), Map.of())
+                    .getFirst()
+                    .getTags()
+                    .forEach(tag -> {
+                        if (tag.getKey() != null && tag.getValue() != null) {
+                            conditions.put(
+                                    "aws:ResourceTag/" + tag.getKey(),
+                                    List.of(tag.getValue()));
+                        }
+                    });
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve EC2 VPC endpoint tags for {0}: {1}",
+                    endpointId, e.getMessage());
+        }
     }
 
     private void readLaunchTemplateRequestTags(

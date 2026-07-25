@@ -9,6 +9,7 @@ import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -59,7 +60,79 @@ public class ResourceArnBuilder {
     public List<AuthorizationRequest> resourceAuthorizations(
             String credentialScope, String action, ContainerRequestContext ctx,
             String region, String accountId) {
+        if ("ec2".equals(credentialScope)
+                && ("ec2:DeleteVpcEndpoints".equals(action)
+                        || "ec2:CreateTags".equals(action))) {
+            List<String> endpointIds = indexedFormParameters(
+                    ctx,
+                    "ec2:DeleteVpcEndpoints".equals(action)
+                            ? "VpcEndpointId"
+                            : "ResourceId");
+            if (!endpointIds.isEmpty()
+                    && endpointIds.stream().allMatch(id -> id.startsWith("vpce-"))) {
+                Map<String, List<String>> requestTags =
+                        "ec2:CreateTags".equals(action) ? ec2RequestTags(ctx) : Map.of();
+                return endpointIds.stream()
+                        .map(endpointId -> new AuthorizationRequest(
+                                action,
+                                vpcEndpointArn(endpointId, region, accountId),
+                                vpcEndpointConditionContext(endpointId, region, requestTags)))
+                        .toList();
+            }
+        }
         return List.of();
+    }
+
+    private List<String> indexedFormParameters(
+            ContainerRequestContext ctx, String prefix) {
+        List<String> values = new ArrayList<>();
+        for (int index = 1; ; index++) {
+            String value = formRequestResolver.firstParameter(ctx, prefix + "." + index);
+            if (value == null) {
+                return values;
+            }
+            values.add(value);
+        }
+    }
+
+    private Map<String, List<String>> ec2RequestTags(ContainerRequestContext ctx) {
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        for (int index = 1; ; index++) {
+            String key = formRequestResolver.firstParameter(ctx, "Tag." + index + ".Key");
+            if (key == null) {
+                return conditions;
+            }
+            String value = formRequestResolver.firstParameter(ctx, "Tag." + index + ".Value");
+            if (value != null) {
+                conditions.put("aws:RequestTag/" + key, List.of(value));
+            }
+        }
+    }
+
+    private Map<String, List<String>> vpcEndpointConditionContext(
+            String endpointId,
+            String region,
+            Map<String, List<String>> requestTags) {
+        Map<String, List<String>> conditions = new LinkedHashMap<>(requestTags);
+        if (region != null && !region.isBlank()) {
+            conditions.put("aws:RequestedRegion", List.of(region));
+        }
+        try {
+            ec2Service.describeVpcEndpoints(region, List.of(endpointId), Map.of())
+                    .getFirst()
+                    .getTags()
+                    .forEach(tag -> {
+                        if (tag.getKey() != null && tag.getValue() != null) {
+                            conditions.put(
+                                    "aws:ResourceTag/" + tag.getKey(),
+                                    List.of(tag.getValue()));
+                        }
+                    });
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve EC2 VPC endpoint tags for {0}: {1}",
+                    endpointId, e.getMessage());
+        }
+        return conditions.isEmpty() ? null : Map.copyOf(conditions);
     }
 
     public List<String> additionalResources(String credentialScope, ContainerRequestContext ctx,
@@ -69,9 +142,15 @@ public class ResourceArnBuilder {
 
     public List<AuthorizationRequest> additionalAuthorizations(
             String action, String primaryResource, Map<String, List<String>> conditionContext) {
-        if ("ec2:CreateLaunchTemplate".equals(action) && hasRequestTags(conditionContext)) {
+        if (("ec2:CreateLaunchTemplate".equals(action)
+                || "ec2:CreateVpcEndpoint".equals(action))
+                && hasRequestTags(conditionContext)) {
             Map<String, List<String>> createTagsContext = new LinkedHashMap<>(conditionContext);
-            createTagsContext.put("ec2:CreateAction", List.of("CreateLaunchTemplate"));
+            createTagsContext.put(
+                    "ec2:CreateAction",
+                    List.of("ec2:CreateVpcEndpoint".equals(action)
+                            ? "CreateVpcEndpoint"
+                            : "CreateLaunchTemplate"));
             return List.of(new AuthorizationRequest(
                     "ec2:CreateTags", primaryResource, Map.copyOf(createTagsContext)));
         }
@@ -206,6 +285,27 @@ public class ResourceArnBuilder {
             return AwsArnUtils.Arn.of("ec2", region, accountId,
                     "launch-template/lt-00000000000000000").toString();
         }
+        if ("CreateVpcEndpoint".equals(action)) {
+            return vpcEndpointArn("vpce-00000000000000000", region, accountId);
+        }
+        if ("ModifyVpcEndpoint".equals(action)) {
+            return vpcEndpointArn(
+                    formRequestResolver.firstParameter(ctx, "VpcEndpointId"),
+                    region,
+                    accountId);
+        }
+        if ("DeleteVpcEndpoints".equals(action)) {
+            return vpcEndpointArn(
+                    formRequestResolver.firstParameter(ctx, "VpcEndpointId.1"),
+                    region,
+                    accountId);
+        }
+        if ("CreateTags".equals(action)) {
+            String resourceId = formRequestResolver.firstParameter(ctx, "ResourceId.1");
+            if (resourceId != null && resourceId.startsWith("vpce-")) {
+                return vpcEndpointArn(resourceId, region, accountId);
+            }
+        }
         if (!"CreateLaunchTemplateVersion".equals(action)
                 && !"ModifyLaunchTemplate".equals(action)
                 && !"DeleteLaunchTemplate".equals(action)) {
@@ -225,6 +325,14 @@ public class ResourceArnBuilder {
                     : AwsArnUtils.Arn.of(
                             "ec2", region, accountId, "launch-template/" + id).toString();
         }
+    }
+
+    private static String vpcEndpointArn(
+            String endpointId, String region, String accountId) {
+        return endpointId == null || endpointId.isBlank()
+                ? "*"
+                : AwsArnUtils.Arn.of(
+                        "ec2", region, accountId, "vpc-endpoint/" + endpointId).toString();
     }
 
     private String extractSegmentAfter(String path, String segment) {
