@@ -13,6 +13,8 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.Ec2Exception;
 import software.amazon.awssdk.services.ec2.model.Filter;
+import software.amazon.awssdk.services.ec2.model.IpPermission;
+import software.amazon.awssdk.services.ec2.model.IpRange;
 import software.amazon.awssdk.services.ec2.model.ResourceType;
 import software.amazon.awssdk.services.ec2.model.SecurityGroup;
 import software.amazon.awssdk.services.ec2.model.Tag;
@@ -24,6 +26,7 @@ import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -41,20 +44,45 @@ class Ec2SecurityGroupAuthorizationIntegrationTest {
     void authorizesTaggedCreateAgainstSecurityGroupArn() {
         try (Ec2Client root = rootClient()) {
             String vpcId = createVpc(root);
-            SessionCredentials credentials = createSession("floci", true);
+            int baselineCount = securityGroupCount(root, vpcId);
+            SessionCredentials credentials = createSession("floci", true, true);
             try (Ec2Client scoped = ec2Client(credentials)) {
                 String groupId = createTaggedSecurityGroup(scoped, vpcId, "floci");
 
-                SecurityGroup group = root.describeSecurityGroups(
-                                request -> request.groupIds(groupId))
-                        .securityGroups()
-                        .getFirst();
+                SecurityGroup group = getSecurityGroup(root, groupId);
                 assertTrue(group.tags().stream().anyMatch(tag ->
                         DEFINITION_TAG.equals(tag.key()) && "example".equals(tag.value())));
                 assertTrue(group.tags().stream().anyMatch(tag ->
                         MANAGED_BY_TAG.equals(tag.key()) && "floci".equals(tag.value())));
 
-                root.deleteSecurityGroup(request -> request.groupId(groupId));
+                scoped.revokeSecurityGroupEgress(request -> request
+                        .groupId(groupId)
+                        .ipPermissions(defaultEgress()));
+                assertTrue(getSecurityGroup(root, groupId).ipPermissionsEgress().isEmpty());
+
+                IpPermission https = httpsPermission();
+                scoped.authorizeSecurityGroupIngress(request -> request
+                        .groupId(groupId)
+                        .ipPermissions(https));
+                assertEquals(1, getSecurityGroup(root, groupId).ipPermissions().size());
+
+                scoped.authorizeSecurityGroupEgress(request -> request
+                        .groupId(groupId)
+                        .ipPermissions(https));
+                assertEquals(1, getSecurityGroup(root, groupId).ipPermissionsEgress().size());
+
+                scoped.revokeSecurityGroupIngress(request -> request
+                        .groupId(groupId)
+                        .ipPermissions(https));
+                assertTrue(getSecurityGroup(root, groupId).ipPermissions().isEmpty());
+
+                scoped.revokeSecurityGroupEgress(request -> request
+                        .groupId(groupId)
+                        .ipPermissions(https));
+                assertTrue(getSecurityGroup(root, groupId).ipPermissionsEgress().isEmpty());
+
+                scoped.deleteSecurityGroup(request -> request.groupId(groupId));
+                assertEquals(baselineCount, securityGroupCount(root, vpcId));
             } finally {
                 root.deleteVpc(request -> request.vpcId(vpcId));
             }
@@ -66,7 +94,7 @@ class Ec2SecurityGroupAuthorizationIntegrationTest {
         try (Ec2Client root = rootClient()) {
             String vpcId = createVpc(root);
             int before = securityGroupCount(root, vpcId);
-            SessionCredentials credentials = createSession("floci", true);
+            SessionCredentials credentials = createSession("floci", true, true);
             try (Ec2Client scoped = ec2Client(credentials)) {
                 Ec2Exception denied = assertThrows(Ec2Exception.class,
                         () -> createTaggedSecurityGroup(scoped, vpcId, "other"));
@@ -84,7 +112,7 @@ class Ec2SecurityGroupAuthorizationIntegrationTest {
         try (Ec2Client root = rootClient()) {
             String vpcId = createVpc(root);
             int before = securityGroupCount(root, vpcId);
-            SessionCredentials credentials = createSession("floci", false);
+            SessionCredentials credentials = createSession("floci", false, true);
             try (Ec2Client scoped = ec2Client(credentials)) {
                 Ec2Exception denied = assertThrows(Ec2Exception.class,
                         () -> createTaggedSecurityGroup(scoped, vpcId, "floci"));
@@ -92,6 +120,48 @@ class Ec2SecurityGroupAuthorizationIntegrationTest {
                 assertAccessDenied(denied, "ec2:CreateTags");
                 assertEquals(before, securityGroupCount(root, vpcId));
             } finally {
+                root.deleteVpc(request -> request.vpcId(vpcId));
+            }
+        }
+    }
+
+    @Test
+    void rejectsLifecycleMutationForWrongResourceTagWithoutMutation() {
+        try (Ec2Client root = rootClient()) {
+            String vpcId = createVpc(root);
+            String groupId = createTaggedSecurityGroup(root, vpcId, "other");
+            SessionCredentials credentials = createSession("floci", true, true);
+            try (Ec2Client scoped = ec2Client(credentials)) {
+                Ec2Exception denied = assertThrows(Ec2Exception.class,
+                        () -> scoped.revokeSecurityGroupEgress(request -> request
+                                .groupId(groupId)
+                                .ipPermissions(defaultEgress())));
+
+                assertAccessDenied(denied, "ec2:RevokeSecurityGroupEgress");
+                assertFalse(getSecurityGroup(root, groupId).ipPermissionsEgress().isEmpty());
+            } finally {
+                root.deleteSecurityGroup(request -> request.groupId(groupId));
+                root.deleteVpc(request -> request.vpcId(vpcId));
+            }
+        }
+    }
+
+    @Test
+    void rejectsLifecycleMutationWithoutPermissionWithoutMutation() {
+        try (Ec2Client root = rootClient()) {
+            String vpcId = createVpc(root);
+            String groupId = createTaggedSecurityGroup(root, vpcId, "floci");
+            SessionCredentials credentials = createSession("floci", true, false);
+            try (Ec2Client scoped = ec2Client(credentials)) {
+                Ec2Exception denied = assertThrows(Ec2Exception.class,
+                        () -> scoped.revokeSecurityGroupEgress(request -> request
+                                .groupId(groupId)
+                                .ipPermissions(defaultEgress())));
+
+                assertAccessDenied(denied, "ec2:RevokeSecurityGroupEgress");
+                assertFalse(getSecurityGroup(root, groupId).ipPermissionsEgress().isEmpty());
+            } finally {
+                root.deleteSecurityGroup(request -> request.groupId(groupId));
                 root.deleteVpc(request -> request.vpcId(vpcId));
             }
         }
@@ -131,8 +201,30 @@ class Ec2SecurityGroupAuthorizationIntegrationTest {
                 .size();
     }
 
+    private static SecurityGroup getSecurityGroup(Ec2Client root, String groupId) {
+        return root.describeSecurityGroups(request -> request.groupIds(groupId))
+                .securityGroups()
+                .getFirst();
+    }
+
+    private static IpPermission defaultEgress() {
+        return IpPermission.builder()
+                .ipProtocol("-1")
+                .ipRanges(IpRange.builder().cidrIp("0.0.0.0/0").build())
+                .build();
+    }
+
+    private static IpPermission httpsPermission() {
+        return IpPermission.builder()
+                .ipProtocol("tcp")
+                .fromPort(443)
+                .toPort(443)
+                .ipRanges(IpRange.builder().cidrIp("10.92.0.0/16").build())
+                .build();
+    }
+
     private static SessionCredentials createSession(
-            String managedBy, boolean allowCreateTags) {
+            String managedBy, boolean allowCreateTags, boolean allowLifecycle) {
         String roleName = "SecurityGroupRole" + UUID.randomUUID().toString().substring(0, 8);
         createRole(roleName);
         String createTags = allowCreateTags ? """
@@ -148,6 +240,25 @@ class Ec2SecurityGroupAuthorizationIntegrationTest {
                 }
                 """.formatted(
                 REGION, ACCOUNT_ID, DEFINITION_TAG, MANAGED_BY_TAG, managedBy) : "";
+        String lifecycle = allowLifecycle ? """
+                , {
+                  "Effect": "Allow",
+                  "Action": [
+                    "ec2:AuthorizeSecurityGroupIngress",
+                    "ec2:AuthorizeSecurityGroupEgress",
+                    "ec2:RevokeSecurityGroupIngress",
+                    "ec2:RevokeSecurityGroupEgress",
+                    "ec2:DeleteSecurityGroup"
+                  ],
+                  "Resource": "arn:aws:ec2:%s:%s:security-group/*",
+                  "Condition": {"StringEquals": {
+                    "aws:RequestedRegion": "%s",
+                    "aws:ResourceTag/%s": "example",
+                    "aws:ResourceTag/%s": "%s"
+                  }}
+                }
+                """.formatted(
+                REGION, ACCOUNT_ID, REGION, DEFINITION_TAG, MANAGED_BY_TAG, managedBy) : "";
         putRolePolicy(roleName, """
                 {
                   "Version": "2012-10-17",
@@ -160,11 +271,11 @@ class Ec2SecurityGroupAuthorizationIntegrationTest {
                       "aws:RequestTag/%s": "example",
                       "aws:RequestTag/%s": "%s"
                     }}
-                  }%s]
+                  }%s%s]
                 }
                 """.formatted(
                 REGION, ACCOUNT_ID, REGION, DEFINITION_TAG, MANAGED_BY_TAG, managedBy,
-                createTags));
+                createTags, lifecycle));
         return assumeRole(roleName);
     }
 
