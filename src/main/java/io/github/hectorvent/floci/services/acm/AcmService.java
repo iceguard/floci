@@ -278,16 +278,52 @@ public class AcmService {
      * before the first leaf certificate request receive the same trust root used later.
      */
     public List<String> certificateChains(String region) {
+        return certificateChains(region, Optional.empty());
+    }
+
+    /**
+     * Returns the local trust roots plus imported chains that terminate certificates in Floci's
+     * configured local hostname namespace. The latter model publicly trusted production chains
+     * with fixture-local certificate material without making arbitrary imported private
+     * certificate authorities trusted by compute guests.
+     */
+    public List<String> certificateChains(String region, Optional<String> localHostname) {
         Certificate certificateAuthority = localCertificateAuthority();
         return Stream.concat(
                         Stream.of(certificateAuthority.getCertificateBody()),
                         store.scan(k -> true).stream()
                                 .filter(certificate -> certificate.getArn().contains(":acm:" + region + ":"))
-                                .filter(certificate -> certificate.getType() == CertificateType.AMAZON_ISSUED)
+                                .filter(certificate -> certificate.getType() == CertificateType.AMAZON_ISSUED
+                                        || isLocalHostnameImportedCertificate(certificate, localHostname))
                                 .map(Certificate::getCertificateChain))
                 .filter(chain -> chain != null && !chain.isBlank())
                 .distinct()
                 .toList();
+    }
+
+    private static boolean isLocalHostnameImportedCertificate(
+            Certificate certificate,
+            Optional<String> localHostname) {
+        if (certificate.getType() != CertificateType.IMPORTED
+                || certificate.getDomainName() == null
+                || localHostname.isEmpty()) {
+            return false;
+        }
+        String hostname = normalizeCertificateName(localHostname.orElseThrow());
+        String certificateName = normalizeCertificateName(certificate.getDomainName());
+        return !hostname.isEmpty()
+                && (certificateName.equals(hostname) || certificateName.endsWith("." + hostname));
+    }
+
+    private static String normalizeCertificateName(String value) {
+        String normalized = value.strip().toLowerCase(Locale.ROOT);
+        while (normalized.startsWith("*.")) {
+            normalized = normalized.substring(2);
+        }
+        while (normalized.endsWith(".")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        return normalized;
     }
 
     /**
