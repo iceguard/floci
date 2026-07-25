@@ -1503,7 +1503,7 @@ public class Ec2Service implements ContainerTeardown {
         List<VpcEndpoint> deleted = new ArrayList<>();
         for (String endpointId : endpointIds) {
             VpcEndpoint endpoint = getRequiredVpcEndpoint(region, endpointId);
-            endpoint.setState("deleted");
+            endpoint.setState("Deleted");
             vpcEndpoints.delete(key(region, endpointId));
             tags.delete(endpointId);
             deleted.add(endpoint);

@@ -15,7 +15,7 @@ public class VpcEndpoint {
     private String vpcId;
     private String serviceName;
     private String vpcEndpointType = "Gateway";
-    private String state = "available";
+    private String state = "Available";
     private Instant creationTimestamp;
     private String region;
     private List<String> routeTableIds = new ArrayList<>();
