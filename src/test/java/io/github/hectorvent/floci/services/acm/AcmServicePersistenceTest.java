@@ -39,6 +39,7 @@ class AcmServicePersistenceTest {
     void certificateSurvivesRestart(@TempDir Path dir) throws Exception {
         // Step 1: Create a service with a persistent backend and create a certificate
         AcmService first = newService(dir);
+        String trustAnchorBeforeCertificateRequest = first.certificateChains(REGION).getFirst();
         Certificate cert = first.requestCertificate(
                 "example.com",
                 List.of("www.example.com"),
@@ -51,6 +52,8 @@ class AcmServicePersistenceTest {
                 REGION
         );
         assertNotNull(cert);
+        assertEquals(trustAnchorBeforeCertificateRequest, cert.getCertificateChain(),
+                "compute guests must receive the local ACM authority before a leaf certificate is requested");
         String arn = cert.getArn();
 
         // Step 2: Create a second service instance sharing the same storage directory (simulating restart)
