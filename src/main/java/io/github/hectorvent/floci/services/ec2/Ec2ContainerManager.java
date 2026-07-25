@@ -977,7 +977,7 @@ public class Ec2ContainerManager {
     }
 
     private boolean installAcmTrustAnchors(String containerId, String instanceId, String region) throws Exception {
-        List<String> certificates = acmTrustAnchors(acmService.certificateChains(region));
+        List<String> certificates = acmTrustAnchors(acmService.certificateChains(region, config.hostname()));
         if (certificates.isEmpty()) {
             return true;
         }
