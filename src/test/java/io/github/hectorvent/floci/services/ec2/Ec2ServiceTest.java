@@ -435,10 +435,10 @@ class Ec2ServiceTest {
                 Map.of("vpc-id", List.of("vpc-default"))).getFirst().getSubnetId();
         VpcEndpoint endpoint = service.createVpcEndpoint("us-east-1", "vpc-default",
                 "com.amazonaws.us-east-1.s3", "Interface",
-                List.of(), List.of(subnetId), List.of(), null, List.of());
+                List.of(), List.of(subnetId), List.of(), null, null, List.of());
         service.createVpcEndpoint("us-east-1", "vpc-default",
                 "com.amazonaws.us-east-1.dynamodb", "Gateway",
-                List.of(), List.of(), List.of(), null, List.of());
+                List.of(), List.of(), List.of(), null, null, List.of());
 
         List<NetworkInterface> enis = service.endpointNetworkInterfaces("us-east-1");
 
@@ -455,6 +455,61 @@ class Ec2ServiceTest {
 
         assertTrue(service.endpointNetworkInterfaces("eu-west-1").isEmpty(),
                 "endpoints are regional");
+    }
+
+    @Test
+    void modifiesGatewayAndInterfaceVpcEndpointConfiguration() {
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory());
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "10.80.0.0/16", false).getVpcId();
+        String firstRouteTable = service.describeRouteTables(region, List.of(), Map.of()).stream()
+                .filter(table -> vpcId.equals(table.getVpcId()))
+                .findFirst()
+                .orElseThrow()
+                .getRouteTableId();
+        String secondRouteTable = service.createRouteTable(region, vpcId).getRouteTableId();
+        String firstSubnet = service.createSubnet(
+                region, vpcId, "10.80.1.0/24", "us-east-1a").getSubnetId();
+        String secondSubnet = service.createSubnet(
+                region, vpcId, "10.80.2.0/24", "us-east-1b").getSubnetId();
+        String firstGroup = service.createSecurityGroup(
+                region, "endpoint-a", "endpoint a", vpcId).getGroupId();
+        String secondGroup = service.createSecurityGroup(
+                region, "endpoint-b", "endpoint b", vpcId).getGroupId();
+
+        VpcEndpoint gateway = service.createVpcEndpoint(
+                region, vpcId, "com.amazonaws.us-east-1.s3", "Gateway",
+                List.of(firstRouteTable), List.of(), List.of(), false,
+                "{\"Version\":\"2012-10-17\"}", List.of());
+        VpcEndpoint iface = service.createVpcEndpoint(
+                region, vpcId, "com.amazonaws.us-east-1.secretsmanager", "Interface",
+                List.of(), List.of(firstSubnet), List.of(firstGroup), true,
+                null, List.of());
+
+        service.modifyVpcEndpoint(
+                region, gateway.getVpcEndpointId(),
+                List.of(secondRouteTable), List.of(firstRouteTable),
+                List.of(), List.of(), List.of(), List.of(),
+                null, "{\"Statement\":[]}");
+        service.modifyVpcEndpoint(
+                region, iface.getVpcEndpointId(),
+                List.of(), List.of(),
+                List.of(secondSubnet), List.of(firstSubnet),
+                List.of(secondGroup), List.of(firstGroup),
+                false, null);
+
+        VpcEndpoint modifiedGateway = service.describeVpcEndpoints(
+                region, List.of(gateway.getVpcEndpointId()), Map.of()).getFirst();
+        assertEquals(List.of(secondRouteTable), modifiedGateway.getRouteTableIds());
+        assertEquals("{\"Statement\":[]}", modifiedGateway.getPolicyDocument());
+        VpcEndpoint modifiedInterface = service.describeVpcEndpoints(
+                region, List.of(iface.getVpcEndpointId()), Map.of()).getFirst();
+        assertEquals(List.of(secondSubnet), modifiedInterface.getSubnetIds());
+        assertEquals(List.of(secondGroup), modifiedInterface.getSecurityGroupIds());
+        assertFalse(modifiedInterface.isPrivateDnsEnabled());
     }
 
     @Test

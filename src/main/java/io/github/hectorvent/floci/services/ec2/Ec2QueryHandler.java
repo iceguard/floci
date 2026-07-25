@@ -61,6 +61,7 @@ public class Ec2QueryHandler {
                 case "DescribeVpcEndpointServices" -> handleDescribeVpcEndpointServices(params, region);
                 case "CreateVpcEndpoint" -> handleCreateVpcEndpoint(params, region);
                 case "DescribeVpcEndpoints" -> handleDescribeVpcEndpoints(params, region);
+                case "ModifyVpcEndpoint" -> handleModifyVpcEndpoint(params, region);
                 case "DeleteVpcEndpoints" -> handleDeleteVpcEndpoints(params, region);
                 // Flow Logs
                 case "CreateFlowLogs" -> handleCreateFlowLogs(params, region);
@@ -1045,6 +1046,7 @@ public class Ec2QueryHandler {
                 getList(p, "SubnetId"),
                 getList(p, "SecurityGroupId"),
                 p.getFirst("PrivateDnsEnabled") != null ? Boolean.valueOf(p.getFirst("PrivateDnsEnabled")) : null,
+                p.getFirst("PolicyDocument"),
                 parseTagsForResource(p, "vpc-endpoint"));
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateVpcEndpointResponse", AwsNamespaces.EC2)
@@ -1067,6 +1069,21 @@ public class Ec2QueryHandler {
         }
         xml.end("vpcEndpointSet").end("DescribeVpcEndpointsResponse");
         return xmlResponse(xml.build());
+    }
+
+    private Response handleModifyVpcEndpoint(MultivaluedMap<String, String> p, String region) {
+        service.modifyVpcEndpoint(
+                region,
+                p.getFirst("VpcEndpointId"),
+                getList(p, "AddRouteTableId"),
+                getList(p, "RemoveRouteTableId"),
+                getList(p, "AddSubnetId"),
+                getList(p, "RemoveSubnetId"),
+                getList(p, "AddSecurityGroupId"),
+                getList(p, "RemoveSecurityGroupId"),
+                p.getFirst("PrivateDnsEnabled") != null ? Boolean.valueOf(p.getFirst("PrivateDnsEnabled")) : null,
+                p.getFirst("PolicyDocument"));
+        return booleanResponse("ModifyVpcEndpoint");
     }
 
     private Response handleDescribePrefixLists(MultivaluedMap<String, String> p, String region) {
@@ -2575,7 +2592,8 @@ public class Ec2QueryHandler {
                 .elem("vpcId", endpoint.getVpcId())
                 .elem("serviceName", endpoint.getServiceName())
                 .elem("state", endpoint.getState())
-                .elem("privateDnsEnabled", String.valueOf(endpoint.isPrivateDnsEnabled()));
+                .elem("privateDnsEnabled", String.valueOf(endpoint.isPrivateDnsEnabled()))
+                .elem("policyDocument", endpoint.getPolicyDocument());
         if (endpoint.getCreationTimestamp() != null) {
             xml.elem("creationTimestamp", ISO_FMT.format(endpoint.getCreationTimestamp()));
         }
