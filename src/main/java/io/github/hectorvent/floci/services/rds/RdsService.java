@@ -285,12 +285,37 @@ public class RdsService implements Resettable {
                                        List<String> vpcSecurityGroupIds,
                                        String region,
                                        boolean autoMinorVersionUpgrade) {
+        return createDbInstance(id, engineParam, engineVersion, masterUsername, masterPassword,
+                dbName, dbInstanceClass, allocatedStorage, iamEnabled, paramGroupName,
+                dbSubnetGroupName, dbClusterIdentifier, availabilityZone, multiAz,
+                manageMasterUserPassword, masterUserSecretKmsKeyId, tags, vpcSecurityGroupIds,
+                region, autoMinorVersionUpgrade, null, "gp2");
+    }
+
+    public DbInstance createDbInstance(String id, String engineParam, String engineVersion,
+                                       String masterUsername, String masterPassword,
+                                       String dbName, String dbInstanceClass,
+                                       int allocatedStorage, boolean iamEnabled,
+                                       String paramGroupName, String dbSubnetGroupName,
+                                       String dbClusterIdentifier, String availabilityZone,
+                                       boolean multiAz, boolean manageMasterUserPassword,
+                                       String masterUserSecretKmsKeyId,
+                                       Map<String, String> tags,
+                                       List<String> vpcSecurityGroupIds,
+                                       String region,
+                                       boolean autoMinorVersionUpgrade,
+                                       Integer maxAllocatedStorage,
+                                       String storageType) {
         String effectiveRegion = effectiveRegion(region);
         if (instances.get(id).isPresent()) {
             throw new AwsException("DBInstanceAlreadyExists",
                     "DB instance " + id + " already exists.", 400);
         }
 
+        Integer effectiveMaxAllocatedStorage =
+                validateStorageConfiguration(allocatedStorage, maxAllocatedStorage);
+        String effectiveStorageType =
+                storageType == null || storageType.isBlank() ? "gp2" : storageType;
         DatabaseEngine engine = resolveEngine(engineParam);
         if (dbSubnetGroupName != null && !dbSubnetGroupName.isBlank() && !"default".equalsIgnoreCase(dbSubnetGroupName)) {
             getDbSubnetGroup(dbSubnetGroupName, effectiveRegion);
@@ -354,6 +379,8 @@ public class RdsService implements Resettable {
         DbInstance instance = new DbInstance(id, engine, engineVersion, masterUsername, masterPassword,
                 dbName, dbInstanceClass, allocatedStorage, DbInstanceStatus.AVAILABLE,
                 endpoint, iamEnabled, paramGroupName, dbClusterIdentifier, Instant.now(), proxyPort);
+        instance.setMaxAllocatedStorage(effectiveMaxAllocatedStorage);
+        instance.setStorageType(effectiveStorageType);
         instance.setDbSubnetGroupName(dbSubnetGroupName);
         instance.setContainerId(containerId);
         instance.setContainerHost(containerHost);
@@ -593,7 +620,30 @@ public class RdsService implements Resettable {
     public DbInstance modifyDbInstance(String id, String newPassword, Boolean iamEnabled,
                                        String dbSubnetGroupName, List<String> vpcSecurityGroupIds,
                                        String region, Boolean autoMinorVersionUpgrade) {
+        return modifyDbInstance(id, newPassword, iamEnabled, dbSubnetGroupName,
+                vpcSecurityGroupIds, region, autoMinorVersionUpgrade, null, null);
+    }
+
+    public DbInstance modifyDbInstance(String id, String newPassword, Boolean iamEnabled,
+                                       String dbSubnetGroupName, List<String> vpcSecurityGroupIds,
+                                       String region, Boolean autoMinorVersionUpgrade,
+                                       Integer allocatedStorage, Integer maxAllocatedStorage) {
         DbInstance instance = getDbInstance(id);
+        int effectiveAllocatedStorage = allocatedStorage == null
+                ? instance.getAllocatedStorage()
+                : allocatedStorage;
+        if (effectiveAllocatedStorage < instance.getAllocatedStorage()) {
+            throw invalidStorageChange("AllocatedStorage cannot be reduced.");
+        }
+        Integer effectiveMaxAllocatedStorage = maxAllocatedStorage == null
+                ? instance.getMaxAllocatedStorage()
+                : validateStorageConfiguration(effectiveAllocatedStorage, maxAllocatedStorage);
+        if (effectiveMaxAllocatedStorage != null
+                && effectiveMaxAllocatedStorage <= effectiveAllocatedStorage) {
+            throw invalidStorageChange(
+                    "MaxAllocatedStorage must be greater than AllocatedStorage.");
+        }
+
         instance.setStatus(DbInstanceStatus.AVAILABLE);
         if (newPassword != null && !newPassword.isBlank()) {
             instance.setMasterPassword(newPassword);
@@ -611,9 +661,31 @@ public class RdsService implements Resettable {
         if (autoMinorVersionUpgrade != null) {
             instance.setAutoMinorVersionUpgrade(autoMinorVersionUpgrade);
         }
+        if (allocatedStorage != null) {
+            instance.setAllocatedStorage(effectiveAllocatedStorage);
+        }
+        if (maxAllocatedStorage != null) {
+            instance.setMaxAllocatedStorage(effectiveMaxAllocatedStorage);
+        }
         instances.put(id, instance);
         LOG.infov("DB instance {0} modified", id);
         return instance;
+    }
+
+    private static Integer validateStorageConfiguration(
+            int allocatedStorage, Integer maxAllocatedStorage) {
+        if (maxAllocatedStorage == null || maxAllocatedStorage == 0) {
+            return null;
+        }
+        if (maxAllocatedStorage < 0 || maxAllocatedStorage <= allocatedStorage) {
+            throw invalidStorageChange(
+                    "MaxAllocatedStorage must be greater than AllocatedStorage.");
+        }
+        return maxAllocatedStorage;
+    }
+
+    private static AwsException invalidStorageChange(String message) {
+        return new AwsException("InvalidParameterCombination", message, 400);
     }
 
     public List<Map<String, String>> describeOrderableDbInstanceOptions(String engine,
