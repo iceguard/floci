@@ -770,14 +770,14 @@ public class Ec2ContainerManager {
     static String[] nativeMetadataProxyInstallCommand() {
         return new String[]{"sh", "-c", String.join("\n",
                 "set -eu",
-                "if command -v ip >/dev/null 2>&1 && command -v nc >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then exit 0; fi",
+                "if command -v ip >/dev/null 2>&1 && command -v socat >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then exit 0; fi",
                 "if command -v apt-get >/dev/null 2>&1; then",
                 "  apt-get update -qq >/dev/null",
-                "  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2 netcat-openbsd curl ca-certificates >/dev/null",
+                "  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2 socat curl ca-certificates >/dev/null",
                 "elif command -v dnf >/dev/null 2>&1; then",
-                "  dnf install -y iproute nmap-ncat curl ca-certificates >/dev/null",
+                "  dnf install -y iproute socat curl ca-certificates >/dev/null",
                 "elif command -v apk >/dev/null 2>&1; then",
-                "  apk add --no-cache iproute2 netcat-openbsd curl ca-certificates >/dev/null",
+                "  apk add --no-cache iproute2 socat curl ca-certificates >/dev/null",
                 "else",
                 "  echo 'No supported package manager found for native IMDS proxy dependencies' >&2",
                 "  exit 1",
@@ -940,7 +940,7 @@ public class Ec2ContainerManager {
                 After=floci-imds-address.service
 
                 [Service]
-                ExecStart=/usr/bin/nc %s %d
+                ExecStart=/usr/bin/socat STDIO TCP:%s:%d,connect-timeout=5
                 StandardInput=socket
                 StandardOutput=socket
                 """.formatted(flociHost, imdsPort);

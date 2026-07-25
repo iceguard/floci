@@ -60,6 +60,7 @@ class Ec2NativeCloudInitGuestTest {
                     "docker", "exec", container, "curl", "-fsS",
                     "http://169.254.169.254/2021-03-23/meta-data/instance-id").output().trim())
                     .isEqualTo(instanceId);
+            assertMetadataRemainsAvailableAfterRepeatedRequests(container, instanceId);
             assertThat(command(Duration.ofSeconds(10), "docker", "exec", container, "env").output())
                     .doesNotContain("AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=", "AWS_SESSION_TOKEN=");
             assertThat(command(Duration.ofSeconds(10),
@@ -85,6 +86,17 @@ class Ec2NativeCloudInitGuestTest {
         }
         finally {
             terminate(ec2, instanceId, container);
+        }
+    }
+
+    private static void assertMetadataRemainsAvailableAfterRepeatedRequests(String container, String instanceId)
+            throws Exception {
+        for (int request = 0; request < 80; request++) {
+            assertThat(command(Duration.ofSeconds(10),
+                    "docker", "exec", container, "curl", "-fsS",
+                    "http://169.254.169.254/latest/meta-data/instance-id").output().trim())
+                    .as("IMDS request %s", request + 1)
+                    .isEqualTo(instanceId);
         }
     }
 
