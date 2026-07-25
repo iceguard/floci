@@ -448,6 +448,17 @@ class Ec2ServiceTest {
         assertEquals("vpc-default", eni.getVpcId());
         assertEquals("VPC Endpoint Interface " + endpoint.getVpcEndpointId(), eni.getDescription());
         assertTrue(eni.getNetworkInterfaceId().startsWith("eni-"));
+        assertEquals(List.of(eni.getNetworkInterfaceId()), endpoint.getNetworkInterfaceIds());
+
+        NetworkInterface described = service.describeNetworkInterfaces(
+                "us-east-1",
+                endpoint.getNetworkInterfaceIds(),
+                Map.of(),
+                0,
+                null).networkInterfaces().getFirst();
+        assertEquals(eni.getNetworkInterfaceId(), described.getNetworkInterfaceId());
+        assertEquals(subnetId, described.getSubnetId());
+        assertEquals("vpc-default", described.getVpcId());
 
         NetworkInterface again = service.endpointNetworkInterfaces("us-east-1").getFirst();
         assertEquals(eni.getNetworkInterfaceId(), again.getNetworkInterfaceId());

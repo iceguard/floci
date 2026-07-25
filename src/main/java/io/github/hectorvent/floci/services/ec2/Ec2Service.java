@@ -1434,6 +1434,9 @@ public class Ec2Service implements ContainerTeardown {
         endpoint.setRouteTableIds(new ArrayList<>(routeTableIds));
         endpoint.setSubnetIds(new ArrayList<>(subnetIds));
         endpoint.setSecurityGroupIds(new ArrayList<>(securityGroupIds));
+        if (isInterface) {
+            endpoint.setNetworkInterfaceIds(endpointEniIds(endpoint));
+        }
         endpoint.setPolicyDocument(policyDocument);
         if (endpointTags != null && !endpointTags.isEmpty()) {
             endpoint.setTags(new ArrayList<>(endpointTags));
@@ -1451,11 +1454,13 @@ public class Ec2Service implements ContainerTeardown {
                 getRequiredVpcEndpoint(region, endpointId);
             }
         }
-        return vpcEndpoints.scan(k -> true).stream()
+        List<VpcEndpoint> endpoints = vpcEndpoints.scan(k -> true).stream()
                 .filter(endpoint -> endpoint.getRegion().equals(region))
                 .filter(endpoint -> endpointIds.isEmpty() || endpointIds.contains(endpoint.getVpcEndpointId()))
                 .filter(endpoint -> matchesFilters(endpoint, filters, region))
                 .collect(Collectors.toList());
+        endpoints.forEach(endpoint -> reconcileEndpointNetworkInterfaces(region, endpoint));
+        return endpoints;
     }
 
     public VpcEndpoint modifyVpcEndpoint(
@@ -1482,6 +1487,9 @@ public class Ec2Service implements ContainerTeardown {
                 endpoint.getSubnetIds(), addSubnetIds, removeSubnetIds));
         endpoint.setSecurityGroupIds(reconcileIds(
                 endpoint.getSecurityGroupIds(), addSecurityGroupIds, removeSecurityGroupIds));
+        if ("Interface".equalsIgnoreCase(endpoint.getVpcEndpointType())) {
+            reconcileEndpointNetworkInterfaces(region, endpoint);
+        }
         if (privateDnsEnabled != null) {
             endpoint.setPrivateDnsEnabled(privateDnsEnabled);
         }
@@ -1513,12 +1521,6 @@ public class Ec2Service implements ContainerTeardown {
         return deleted;
     }
 
-    /**
-     * Network interfaces owned by interface VPC endpoints (PrivateLink ENIs).
-     * Floci does not persist per-endpoint ENIs; they are synthesized
-     * deterministically from the endpoint's subnets so flow-log generation can
-     * attribute AWS-service traffic to a stable endpoint address.
-     */
     public List<NetworkInterface> endpointNetworkInterfaces(String region) {
         List<NetworkInterface> result = new ArrayList<>();
         for (VpcEndpoint endpoint : vpcEndpoints.scan(k -> true)) {
@@ -1526,23 +1528,57 @@ public class Ec2Service implements ContainerTeardown {
                     || !"Interface".equalsIgnoreCase(endpoint.getVpcEndpointType())) {
                 continue;
             }
-            for (String subnetId : endpoint.getSubnetIds()) {
+            List<String> networkInterfaceIds = endpointEniIds(endpoint);
+            for (int index = 0; index < endpoint.getSubnetIds().size(); index++) {
+                String subnetId = endpoint.getSubnetIds().get(index);
                 Subnet subnet = subnets.get(key(region, subnetId)).orElse(null);
                 if (subnet == null) {
                     continue;
                 }
                 NetworkInterface ni = new NetworkInterface();
-                ni.setNetworkInterfaceId(endpointEniId(endpoint.getVpcEndpointId(), subnetId));
+                ni.setNetworkInterfaceId(networkInterfaceIds.get(index));
                 ni.setSubnetId(subnetId);
                 ni.setVpcId(endpoint.getVpcId());
                 ni.setAvailabilityZone(subnet.getAvailabilityZone());
                 ni.setDescription("VPC Endpoint Interface " + endpoint.getVpcEndpointId());
+                ni.setOwnerId(accountId);
                 ni.setInterfaceType("vpc_endpoint");
                 ni.setPrivateIpAddress(endpointPrivateIp(subnet, endpoint.getVpcEndpointId()));
+                ni.setPrivateDnsName("ip-" + ni.getPrivateIpAddress().replace('.', '-')
+                        + "." + region + ".compute.internal");
+                for (String securityGroupId : endpoint.getSecurityGroupIds()) {
+                    SecurityGroup securityGroup =
+                            securityGroups.get(key(region, securityGroupId)).orElse(null);
+                    ni.getGroups().add(new GroupIdentifier(
+                            securityGroupId,
+                            securityGroup != null ? securityGroup.getGroupName() : null));
+                }
+                NetworkInterfacePrivateIpAddress primaryIp =
+                        new NetworkInterfacePrivateIpAddress();
+                primaryIp.setPrivateIpAddress(ni.getPrivateIpAddress());
+                primaryIp.setPrivateDnsName(ni.getPrivateDnsName());
+                primaryIp.setPrimary(true);
+                ni.getPrivateIpAddresses().add(primaryIp);
                 result.add(ni);
             }
         }
         return result;
+    }
+
+    private static List<String> endpointEniIds(VpcEndpoint endpoint) {
+        return endpoint.getSubnetIds().stream()
+                .map(subnetId -> endpointEniId(endpoint.getVpcEndpointId(), subnetId))
+                .toList();
+    }
+
+    private void reconcileEndpointNetworkInterfaces(String region, VpcEndpoint endpoint) {
+        List<String> expectedIds = "Interface".equalsIgnoreCase(endpoint.getVpcEndpointType())
+                ? endpointEniIds(endpoint)
+                : List.of();
+        if (!expectedIds.equals(endpoint.getNetworkInterfaceIds())) {
+            endpoint.setNetworkInterfaceIds(new ArrayList<>(expectedIds));
+            vpcEndpoints.put(key(region, endpoint.getVpcEndpointId()), endpoint);
+        }
     }
 
     private static String endpointEniId(String endpointId, String subnetId) {
@@ -1582,8 +1618,10 @@ public class Ec2Service implements ContainerTeardown {
         subnet.setVpcId(vpcId);
         subnet.setCidrBlock(cidrBlock);
         subnet.setState("available");
-        subnet.setAvailabilityZone(availabilityZone != null ? availabilityZone : region + "a");
-        subnet.setAvailabilityZoneId(region + "-az1");
+        String resolvedAvailabilityZone =
+                availabilityZone != null ? availabilityZone : region + "a";
+        subnet.setAvailabilityZone(resolvedAvailabilityZone);
+        subnet.setAvailabilityZoneId(availabilityZoneId(region, resolvedAvailabilityZone));
         subnet.setAvailableIpAddressCount(251);
         subnet.setOwnerId(accountId);
         subnet.setRegion(region);
@@ -1602,6 +1640,18 @@ public class Ec2Service implements ContainerTeardown {
             networkAcls.put(key(region, defaultAcl.getNetworkAclId()), defaultAcl);
         }
         return subnet;
+    }
+
+    private static String availabilityZoneId(String region, String availabilityZone) {
+        if (availabilityZone != null
+                && availabilityZone.startsWith(region)
+                && availabilityZone.length() == region.length() + 1) {
+            char suffix = availabilityZone.charAt(availabilityZone.length() - 1);
+            if (suffix >= 'a' && suffix <= 'z') {
+                return region + "-az" + (suffix - 'a' + 1);
+            }
+        }
+        return region + "-az1";
     }
 
     public List<Subnet> describeSubnets(String region, List<String> subnetIds, Map<String, List<String>> filters) {
@@ -3288,6 +3338,16 @@ public class Ec2Service implements ContainerTeardown {
                     continue;
                 }
 
+                result.add(ni);
+            }
+        }
+        for (NetworkInterface ni : endpointNetworkInterfaces(region)) {
+            if (!networkInterfaceIds.isEmpty()
+                    && !networkInterfaceIds.contains(ni.getNetworkInterfaceId())) {
+                continue;
+            }
+            foundIds.add(ni.getNetworkInterfaceId());
+            if (matchesFilters(ni, filters, region)) {
                 result.add(ni);
             }
         }

@@ -275,14 +275,16 @@ public class ResourceArnBuilder {
                     .toList();
         }
         if (("ec2:CreateLaunchTemplate".equals(action)
+                || "ec2:CreateSecurityGroup".equals(action)
                 || "ec2:CreateVpcEndpoint".equals(action))
                 && hasRequestTags(conditionContext)) {
             Map<String, List<String>> createTagsContext = new LinkedHashMap<>(conditionContext);
-            createTagsContext.put(
-                    "ec2:CreateAction",
-                    List.of("ec2:CreateVpcEndpoint".equals(action)
-                            ? "CreateVpcEndpoint"
-                            : "CreateLaunchTemplate"));
+            String createAction = switch (action) {
+                case "ec2:CreateSecurityGroup" -> "CreateSecurityGroup";
+                case "ec2:CreateVpcEndpoint" -> "CreateVpcEndpoint";
+                default -> "CreateLaunchTemplate";
+            };
+            createTagsContext.put("ec2:CreateAction", List.of(createAction));
             return List.of(new AuthorizationRequest(
                     "ec2:CreateTags", primaryResource, Map.copyOf(createTagsContext)));
         }
@@ -598,6 +600,10 @@ public class ResourceArnBuilder {
         if ("CreateLaunchTemplate".equals(action)) {
             return AwsArnUtils.Arn.of("ec2", region, accountId,
                     "launch-template/lt-00000000000000000").toString();
+        }
+        if ("CreateSecurityGroup".equals(action)) {
+            return AwsArnUtils.Arn.of("ec2", region, accountId,
+                    "security-group/sg-00000000000000000").toString();
         }
         if ("CreateVpcEndpoint".equals(action)) {
             return vpcEndpointArn("vpce-00000000000000000", region, accountId);

@@ -222,6 +222,8 @@ public class IamConditionContextResolver {
         }
         if ("ec2:CreateLaunchTemplate".equals(action)) {
             readLaunchTemplateRequestTags(ctx, conditions);
+        } else if ("ec2:CreateSecurityGroup".equals(action)) {
+            readEc2RequestTags(ctx, "security-group", conditions);
         } else if ("ec2:CreateVpcEndpoint".equals(action)) {
             readEc2RequestTags(ctx, "vpc-endpoint", conditions);
         } else if ("ec2:ModifyVpcEndpoint".equals(action)
