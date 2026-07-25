@@ -224,6 +224,8 @@ public class IamConditionContextResolver {
             readLaunchTemplateRequestTags(ctx, conditions);
         } else if ("ec2:CreateSecurityGroup".equals(action)) {
             readEc2RequestTags(ctx, "security-group", conditions);
+        } else if (isSecurityGroupLifecycleAction(action)) {
+            addSecurityGroupResourceTags(ctx, region, conditions);
         } else if ("ec2:CreateVpcEndpoint".equals(action)) {
             readEc2RequestTags(ctx, "vpc-endpoint", conditions);
         } else if ("ec2:ModifyVpcEndpoint".equals(action)
@@ -241,6 +243,36 @@ public class IamConditionContextResolver {
             return null;
         }
         return conditions.isEmpty() ? null : conditions;
+    }
+
+    private static boolean isSecurityGroupLifecycleAction(String action) {
+        return "ec2:AuthorizeSecurityGroupIngress".equals(action)
+                || "ec2:AuthorizeSecurityGroupEgress".equals(action)
+                || "ec2:RevokeSecurityGroupIngress".equals(action)
+                || "ec2:RevokeSecurityGroupEgress".equals(action)
+                || "ec2:DeleteSecurityGroup".equals(action);
+    }
+
+    private void addSecurityGroupResourceTags(
+            ContainerRequestContext ctx,
+            String region,
+            Map<String, List<String>> conditions) {
+        String groupId = formRequestResolver.firstParameter(ctx, "GroupId");
+        String groupName = formRequestResolver.firstParameter(ctx, "GroupName");
+        try {
+            ec2Service.resolveSecurityGroup(region, groupId, groupName)
+                    .getTags()
+                    .forEach(tag -> {
+                        if (tag.getKey() != null && tag.getValue() != null) {
+                            conditions.put(
+                                    "aws:ResourceTag/" + tag.getKey(),
+                                    List.of(tag.getValue()));
+                        }
+                    });
+        } catch (AwsException e) {
+            LOG.debugv("Unable to resolve EC2 security group tags for {0}: {1}",
+                    groupId != null ? groupId : groupName, e.getMessage());
+        }
     }
 
     private boolean isVpcEndpointResource(ContainerRequestContext ctx) {

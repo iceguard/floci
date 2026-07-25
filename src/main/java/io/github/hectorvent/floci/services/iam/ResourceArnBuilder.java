@@ -605,6 +605,23 @@ public class ResourceArnBuilder {
             return AwsArnUtils.Arn.of("ec2", region, accountId,
                     "security-group/sg-00000000000000000").toString();
         }
+        if (isSecurityGroupLifecycleAction(action)) {
+            String groupId = formRequestResolver.firstParameter(ctx, "GroupId");
+            String groupName = formRequestResolver.firstParameter(ctx, "GroupName");
+            try {
+                String resolvedId = ec2Service.resolveSecurityGroup(
+                                region, groupId, groupName)
+                        .getGroupId();
+                return securityGroupArn(resolvedId, region, accountId);
+            }
+            catch (AwsException e) {
+                LOG.debugv("Unable to resolve EC2 security group resource {0}: {1}",
+                        groupId != null ? groupId : groupName, e.getMessage());
+                return groupId == null || groupId.isBlank()
+                        ? "*"
+                        : securityGroupArn(groupId, region, accountId);
+            }
+        }
         if ("CreateVpcEndpoint".equals(action)) {
             return vpcEndpointArn("vpce-00000000000000000", region, accountId);
         }
@@ -645,6 +662,19 @@ public class ResourceArnBuilder {
                     : AwsArnUtils.Arn.of(
                             "ec2", region, accountId, "launch-template/" + id).toString();
         }
+    }
+
+    private static boolean isSecurityGroupLifecycleAction(String action) {
+        return "AuthorizeSecurityGroupIngress".equals(action)
+                || "AuthorizeSecurityGroupEgress".equals(action)
+                || "RevokeSecurityGroupIngress".equals(action)
+                || "RevokeSecurityGroupEgress".equals(action)
+                || "DeleteSecurityGroup".equals(action);
+    }
+
+    private static String securityGroupArn(String groupId, String region, String accountId) {
+        return AwsArnUtils.Arn.of(
+                "ec2", region, accountId, "security-group/" + groupId).toString();
     }
 
     private static String vpcEndpointArn(String endpointId, String region, String accountId) {

@@ -1731,6 +1731,27 @@ public class Ec2Service implements ContainerTeardown {
                 .collect(Collectors.toList());
     }
 
+    public SecurityGroup resolveSecurityGroup(String region, String groupId, String groupName) {
+        ensureDefaultResources(region);
+        if (groupId != null && !groupId.isBlank()) {
+            return getRequiredSecurityGroup(region, groupId);
+        }
+        if (groupName != null && !groupName.isBlank()) {
+            return securityGroups.scan(k -> true).stream()
+                    .filter(group -> region.equals(group.getRegion()))
+                    .filter(group -> groupName.equals(group.getGroupName()))
+                    .findFirst()
+                    .orElseThrow(() -> new AwsException(
+                            "InvalidGroup.NotFound",
+                            "The security group '" + groupName + "' does not exist",
+                            400));
+        }
+        throw new AwsException(
+                "InvalidParameterValue",
+                "Either GroupId or GroupName must be specified",
+                400);
+    }
+
     public void deleteSecurityGroup(String region, String groupId) {
         ensureDefaultResources(region);
         if (securityGroups.get(key(region, groupId)).isEmpty()) {
