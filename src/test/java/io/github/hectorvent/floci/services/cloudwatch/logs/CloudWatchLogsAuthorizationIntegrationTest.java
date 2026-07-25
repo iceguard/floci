@@ -14,6 +14,7 @@ import software.amazon.awssdk.services.cloudwatchlogs.CloudWatchLogsClient;
 import software.amazon.awssdk.services.cloudwatchlogs.model.CloudWatchLogsException;
 
 import java.net.URI;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -52,9 +53,9 @@ class CloudWatchLogsAuthorizationIntegrationTest {
                     .stream()
                     .anyMatch(group -> allowedName.equals(group.logGroupName())));
 
-            assertAccessDenied(assertThrows(CloudWatchLogsException.class,
+            assertAccessDenied("logs:CreateLogGroup", assertThrows(CloudWatchLogsException.class,
                     () -> scoped.createLogGroup(request -> request.logGroupName(deniedName))));
-            assertAccessDenied(assertThrows(CloudWatchLogsException.class,
+            assertAccessDenied("logs:CreateLogGroup", assertThrows(CloudWatchLogsException.class,
                     () -> missingAction.createLogGroup(request -> request.logGroupName(allowedName + "-other"))));
 
             assertTrue(root.describeLogGroups(request -> request.logGroupNamePrefix(deniedName))
@@ -64,6 +65,61 @@ class CloudWatchLogsAuthorizationIntegrationTest {
                     .logGroups()
                     .isEmpty());
             root.deleteLogGroup(request -> request.logGroupName(allowedName));
+        }
+    }
+
+    @Test
+    void tagOperationsAuthorizeTheSuppliedLogGroupArn() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String allowedName = "/iceguard/" + suffix + "/otel";
+        String deniedName = "/other/" + suffix + "/otel";
+        String allowedArn = logGroupArn(allowedName);
+        String deniedArn = logGroupArn(deniedName);
+        RoleCredentials scopedCredentials = roleCredentials(
+                "ScopedLogGroupTagger" + suffix,
+                List.of(
+                        "logs:ListTagsForResource",
+                        "logs:TagResource",
+                        "logs:UntagResource"),
+                allowedArn);
+        RoleCredentials missingActionCredentials = roleCredentials(
+                "LogGroupDescriber" + suffix,
+                "logs:DescribeLogGroups",
+                logGroupArn("*"));
+
+        try (CloudWatchLogsClient scoped = logsClient(scopedCredentials);
+             CloudWatchLogsClient missingAction = logsClient(missingActionCredentials);
+             CloudWatchLogsClient root = logsClient(ACCOUNT_ID)) {
+            root.createLogGroup(request -> request.logGroupName(allowedName));
+            root.createLogGroup(request -> request.logGroupName(deniedName));
+
+            scoped.tagResource(request -> request
+                    .resourceArn(allowedArn)
+                    .tags(Map.of("owner", "iceguard")));
+            assertEquals(
+                    Map.of("owner", "iceguard"),
+                    scoped.listTagsForResource(request -> request.resourceArn(allowedArn)).tags());
+            scoped.untagResource(request -> request
+                    .resourceArn(allowedArn)
+                    .tagKeys("owner"));
+            assertEquals(
+                    Map.of(),
+                    scoped.listTagsForResource(request -> request.resourceArn(allowedArn)).tags());
+
+            assertAccessDenied("logs:ListTagsForResource", assertThrows(CloudWatchLogsException.class,
+                    () -> scoped.listTagsForResource(request -> request.resourceArn(deniedArn))));
+            assertAccessDenied("logs:TagResource", assertThrows(CloudWatchLogsException.class,
+                    () -> scoped.tagResource(request -> request
+                            .resourceArn(deniedArn)
+                            .tags(Map.of("owner", "other")))));
+            assertAccessDenied("logs:ListTagsForResource", assertThrows(CloudWatchLogsException.class,
+                    () -> missingAction.listTagsForResource(request -> request.resourceArn(allowedArn))));
+
+            assertEquals(
+                    Map.of(),
+                    root.listTagsForResource(request -> request.resourceArn(deniedArn)).tags());
+            root.deleteLogGroup(request -> request.logGroupName(allowedName));
+            root.deleteLogGroup(request -> request.logGroupName(deniedName));
         }
     }
 
@@ -91,8 +147,12 @@ class CloudWatchLogsAuthorizationIntegrationTest {
     }
 
     private static RoleCredentials roleCredentials(String roleName, String action, String resource) {
+        return roleCredentials(roleName, List.of(action), resource);
+    }
+
+    private static RoleCredentials roleCredentials(String roleName, List<String> actions, String resource) {
         createRole(roleName);
-        putRolePolicy(roleName, action, resource);
+        putRolePolicy(roleName, actions, resource);
         return assumeRole(roleName);
     }
 
@@ -118,7 +178,12 @@ class CloudWatchLogsAuthorizationIntegrationTest {
                 .statusCode(200);
     }
 
-    private static void putRolePolicy(String roleName, String action, String resource) {
+    private static void putRolePolicy(String roleName, List<String> actions, String resource) {
+        String actionJson = actions.size() == 1
+                ? "\"%s\"".formatted(actions.getFirst())
+                : actions.stream()
+                        .map(action -> "\"%s\"".formatted(action))
+                        .collect(java.util.stream.Collectors.joining(",", "[", "]"));
         given()
                 .formParam("Action", "PutRolePolicy")
                 .formParam("RoleName", roleName)
@@ -128,11 +193,11 @@ class CloudWatchLogsAuthorizationIntegrationTest {
                           "Version": "2012-10-17",
                           "Statement": [{
                             "Effect": "Allow",
-                            "Action": "%s",
+                            "Action": %s,
                             "Resource": "%s"
                           }]
                         }
-                        """.formatted(action, resource))
+                        """.formatted(actionJson, resource))
                 .header("Authorization", auth(ACCOUNT_ID, "iam"))
         .when()
                 .post("/")
@@ -167,10 +232,10 @@ class CloudWatchLogsAuthorizationIntegrationTest {
                 + "/aws4_request, SignedHeaders=host, Signature=abc";
     }
 
-    private static void assertAccessDenied(CloudWatchLogsException exception) {
+    private static void assertAccessDenied(String action, CloudWatchLogsException exception) {
         assertEquals(403, exception.statusCode());
         assertEquals("AccessDeniedException", exception.awsErrorDetails().errorCode());
-        assertTrue(exception.getMessage().contains("logs:CreateLogGroup"));
+        assertTrue(exception.getMessage().contains(action));
     }
 
     private record RoleCredentials(String accessKeyId, String secretAccessKey, String sessionToken) {
