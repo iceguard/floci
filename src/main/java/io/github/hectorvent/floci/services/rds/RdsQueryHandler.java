@@ -56,6 +56,7 @@ public class RdsQueryHandler {
                 case "ModifyDBInstance" -> handleModifyDbInstance(params, region);
                 case "RebootDBInstance" -> handleRebootDbInstance(params);
                 case "DescribeOrderableDBInstanceOptions" -> handleDescribeOrderableDbInstanceOptions(params);
+                case "DescribeValidDBInstanceModifications" -> handleDescribeValidDbInstanceModifications(params);
                 case "CreateDBSubnetGroup" -> handleCreateDbSubnetGroup(params, region);
                 case "DescribeDBSubnetGroups" -> handleDescribeDbSubnetGroups(params, region);
                 case "ModifyDBSubnetGroup" -> handleModifyDbSubnetGroup(params, region);
@@ -108,6 +109,9 @@ public class RdsQueryHandler {
         String dbInstanceClass = params.getFirst("DBInstanceClass");
         String allocatedStorageStr = params.getFirst("AllocatedStorage");
         int allocatedStorage = allocatedStorageStr != null ? parseIntSafe(allocatedStorageStr, 20) : 20;
+        Integer maxAllocatedStorage = parseOptionalInteger(
+                params.getFirst("MaxAllocatedStorage"), "MaxAllocatedStorage");
+        String storageType = params.getFirst("StorageType");
         boolean iamEnabled = "true".equalsIgnoreCase(params.getFirst("EnableIAMDatabaseAuthentication"));
         String paramGroupName = params.getFirst("DBParameterGroupName");
         String dbSubnetGroupName = params.getFirst("DBSubnetGroupName");
@@ -131,11 +135,20 @@ public class RdsQueryHandler {
 
         try {
             List<String> vpcSecurityGroupIds = vpcSecurityGroupIds(params);
-            DbInstance instance = service.createDbInstance(id, engine, engineVersion, masterUsername,
-                    masterPassword, dbName, dbInstanceClass, allocatedStorage, iamEnabled,
-                    paramGroupName, dbSubnetGroupName, dbClusterIdentifier, availabilityZone, multiAz,
-                    manageMasterUserPassword, masterUserSecretKmsKeyId, tags, vpcSecurityGroupIds, region,
-                    autoMinorVersionUpgrade);
+            DbInstance instance;
+            if (maxAllocatedStorage == null && (storageType == null || storageType.isBlank())) {
+                instance = service.createDbInstance(id, engine, engineVersion, masterUsername,
+                        masterPassword, dbName, dbInstanceClass, allocatedStorage, iamEnabled,
+                        paramGroupName, dbSubnetGroupName, dbClusterIdentifier, availabilityZone, multiAz,
+                        manageMasterUserPassword, masterUserSecretKmsKeyId, tags, vpcSecurityGroupIds,
+                        region, autoMinorVersionUpgrade);
+            } else {
+                instance = service.createDbInstance(id, engine, engineVersion, masterUsername,
+                        masterPassword, dbName, dbInstanceClass, allocatedStorage, iamEnabled,
+                        paramGroupName, dbSubnetGroupName, dbClusterIdentifier, availabilityZone, multiAz,
+                        manageMasterUserPassword, masterUserSecretKmsKeyId, tags, vpcSecurityGroupIds,
+                        region, autoMinorVersionUpgrade, maxAllocatedStorage, storageType);
+            }
             String result = dbInstanceXml(instance);
             return Response.ok(AwsQueryResponse.envelope("CreateDBInstance", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -187,11 +200,22 @@ public class RdsQueryHandler {
         String dbSubnetGroupName = params.getFirst("DBSubnetGroupName");
         Boolean autoMinorVersionUpgrade = parseOptionalBoolean(
                 params.getFirst("AutoMinorVersionUpgrade"), "AutoMinorVersionUpgrade");
+        Integer allocatedStorage = parseOptionalInteger(
+                params.getFirst("AllocatedStorage"), "AllocatedStorage");
+        Integer maxAllocatedStorage = parseOptionalInteger(
+                params.getFirst("MaxAllocatedStorage"), "MaxAllocatedStorage");
         try {
             List<String> vpcSecurityGroupIds = vpcSecurityGroupIds(params);
-            DbInstance instance = service.modifyDbInstance(
-                    id, newPassword, iamEnabled, dbSubnetGroupName, vpcSecurityGroupIds, region,
-                    autoMinorVersionUpgrade);
+            DbInstance instance;
+            if (allocatedStorage == null && maxAllocatedStorage == null) {
+                instance = service.modifyDbInstance(
+                        id, newPassword, iamEnabled, dbSubnetGroupName, vpcSecurityGroupIds, region,
+                        autoMinorVersionUpgrade);
+            } else {
+                instance = service.modifyDbInstance(
+                        id, newPassword, iamEnabled, dbSubnetGroupName, vpcSecurityGroupIds, region,
+                        autoMinorVersionUpgrade, allocatedStorage, maxAllocatedStorage);
+            }
             String result = dbInstanceXml(instance);
             return Response.ok(AwsQueryResponse.envelope("ModifyDBInstance", AwsNamespaces.RDS, result)).build();
         } catch (AwsException e) {
@@ -210,6 +234,10 @@ public class RdsQueryHandler {
                .elem("Engine", option.get("engine"))
                .elem("EngineVersion", option.get("engineVersion"))
                .elem("DBInstanceClass", option.get("dbInstanceClass"))
+               .elem("StorageType", "gp3")
+               .elem("SupportsStorageAutoscaling", true)
+               .elem("MinStorageSize", 20)
+               .elem("MaxStorageSize", 65536)
                .elem("LicenseModel", "postgresql-license")
                .start("AvailabilityZones")
                  .start("AvailabilityZone")
@@ -221,6 +249,40 @@ public class RdsQueryHandler {
         xml.end("OrderableDBInstanceOptions").start("Marker").end("Marker");
         return Response.ok(AwsQueryResponse.envelope("DescribeOrderableDBInstanceOptions",
                 AwsNamespaces.RDS, xml.build())).build();
+    }
+
+    private Response handleDescribeValidDbInstanceModifications(
+            MultivaluedMap<String, String> params) {
+        String id = params.getFirst("DBInstanceIdentifier");
+        if (id == null || id.isBlank()) {
+            return AwsQueryResponse.error("InvalidParameterValue",
+                    "DBInstanceIdentifier is required.", AwsNamespaces.RDS, 400);
+        }
+        try {
+            DbInstance instance = service.getDbInstance(id);
+            int minimumStorage = Math.max(20, instance.getAllocatedStorage() + 1);
+            XmlBuilder xml = new XmlBuilder()
+                    .start("ValidDBInstanceModificationsMessage")
+                    .start("Storage")
+                    .start("ValidStorageOptions")
+                    .elem("StorageType", instance.getStorageType())
+                    .elem("SupportsStorageAutoscaling", true)
+                    .start("StorageSize")
+                    .start("Range")
+                    .elem("From", minimumStorage)
+                    .elem("To", 65536)
+                    .elem("Step", 1)
+                    .end("Range")
+                    .end("StorageSize")
+                    .end("ValidStorageOptions")
+                    .end("Storage")
+                    .end("ValidDBInstanceModificationsMessage");
+            return Response.ok(AwsQueryResponse.envelope(
+                    "DescribeValidDBInstanceModifications", AwsNamespaces.RDS, xml.build())).build();
+        } catch (AwsException e) {
+            return AwsQueryResponse.error(
+                    e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
+        }
     }
 
     private Response handleAddTagsToResource(MultivaluedMap<String, String> params) {
@@ -654,6 +716,9 @@ public class RdsQueryHandler {
         }
         xml.elem("DBInstanceClass", i.getDbInstanceClass())
            .elem("AllocatedStorage", i.getAllocatedStorage());
+        if (i.getMaxAllocatedStorage() != null) {
+            xml.elem("MaxAllocatedStorage", i.getMaxAllocatedStorage());
+        }
         if (ep != null) {
             xml.start("Endpoint")
                .elem("Address", ep.address())
@@ -663,7 +728,7 @@ public class RdsQueryHandler {
         xml.elem("IAMDatabaseAuthenticationEnabled", i.isIamDatabaseAuthenticationEnabled())
            .elem("AutoMinorVersionUpgrade", i.isAutoMinorVersionUpgrade())
            .elem("MultiAZ", i.isMultiAz())
-           .elem("StorageType", "gp2")
+           .elem("StorageType", i.getStorageType())
            .elem("PubliclyAccessible", false)
            .elem("AvailabilityZone", i.getAvailabilityZone() != null ? i.getAvailabilityZone() : config.defaultAvailabilityZone())
            .elem("PreferredMaintenanceWindow", "mon:00:00-mon:03:00")
@@ -777,6 +842,19 @@ public class RdsQueryHandler {
         throw new AwsException("InvalidParameterValue",
                 "Invalid value for " + parameterName + ": " + value
                         + ". Valid values are true or false.", 400);
+    }
+
+    private static Integer parseOptionalInteger(String value, String parameterName) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value);
+        } catch (NumberFormatException e) {
+            throw new AwsException("InvalidParameterValue",
+                    "Invalid value for " + parameterName + ": " + value
+                            + ". The value must be an integer.", 400);
+        }
     }
 
     private String dbClusterXml(DbCluster c) {
