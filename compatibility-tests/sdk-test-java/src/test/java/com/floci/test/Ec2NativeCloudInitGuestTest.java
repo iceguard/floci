@@ -31,30 +31,15 @@ class Ec2NativeCloudInitGuestTest {
 
     @Test
     void nativeCloudInitLifecycleMatchesEc2GuestSemantics() throws Exception {
-        String certificateArn = null;
         try (AcmClient acm = TestFixtures.acmClient();
                 Ec2Client ec2 = TestFixtures.ec2Client()) {
-            String createdCertificateArn = acm.requestCertificate(request -> request.domainName("native-cloud-init.test"))
-                    .certificateArn();
-            certificateArn = createdCertificateArn;
-            String certificateChain = acm.getCertificate(request -> request.certificateArn(createdCertificateArn))
-                    .certificateChain();
-
-            proveSuccessAndReboot(ec2, certificateChain);
+            proveSuccessAndReboot(acm, ec2);
             proveFailure(ec2);
             proveTimeout(ec2);
         }
-        finally {
-            if (certificateArn != null) {
-                try (AcmClient acm = TestFixtures.acmClient()) {
-                    String arn = certificateArn;
-                    acm.deleteCertificate(request -> request.certificateArn(arn));
-                }
-            }
-        }
     }
 
-    private static void proveSuccessAndReboot(Ec2Client ec2, String certificateChain) throws Exception {
+    private static void proveSuccessAndReboot(AcmClient acm, Ec2Client ec2) throws Exception {
         String userData = """
                 #!/bin/sh
                 set -eu
@@ -64,8 +49,14 @@ class Ec2NativeCloudInitGuestTest {
                 """;
         String instanceId = launch(ec2, userData);
         String container = containerName(instanceId);
+        String certificateArn = null;
         try {
             waitForContainer(container, true, GUEST_START_TIMEOUT);
+            certificateArn = acm.requestCertificate(request -> request.domainName("native-cloud-init.test"))
+                    .certificateArn();
+            String requestedCertificateArn = certificateArn;
+            String certificateChain = acm.getCertificate(request -> request.certificateArn(requestedCertificateArn))
+                    .certificateChain();
             CommandResult cloudInit = command(CLOUD_INIT_TIMEOUT,
                     "docker", "exec", container, "cloud-init", "status", "--wait", "--long");
             assertThat(cloudInit.exitCode()).isZero();
@@ -114,7 +105,15 @@ class Ec2NativeCloudInitGuestTest {
                     .isEqualTo("1");
         }
         finally {
-            terminate(ec2, instanceId, container);
+            try {
+                terminate(ec2, instanceId, container);
+            }
+            finally {
+                if (certificateArn != null) {
+                    String requestedCertificateArn = certificateArn;
+                    acm.deleteCertificate(request -> request.certificateArn(requestedCertificateArn));
+                }
+            }
         }
     }
 
