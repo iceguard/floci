@@ -22,6 +22,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
+import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
 import org.junit.jupiter.api.Test;
@@ -62,6 +63,14 @@ class Ec2ContainerManagerTest {
 
     private static final String TEST_USER_DATA_OUTPUT = "test-output";
     private static final String TEST_CONTAINER_ID = "container-1";
+    private static final String TEST_CERTIFICATE_A = """
+            -----BEGIN CERTIFICATE-----
+            QUFB
+            -----END CERTIFICATE-----""";
+    private static final String TEST_CERTIFICATE_B = """
+            -----BEGIN CERTIFICATE-----
+            QkJC
+            -----END CERTIFICATE-----""";
 
     @org.junit.jupiter.api.AfterEach
     void resetBridgeIpPolling() {
@@ -122,6 +131,7 @@ class Ec2ContainerManagerTest {
                 dockerClient,
                 mock(PortAllocator.class),
                 mock(EmulatorConfig.class),
+                mock(AcmService.class),
                 metadataServer,
                 mock(Ec2PortForwardManager.class));
 
@@ -495,6 +505,23 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void nativeCloudInitTrustAnchorsSplitPemChainsAndRemoveDuplicates() {
+        assertEquals(
+                List.of(TEST_CERTIFICATE_A, TEST_CERTIFICATE_B),
+                Ec2ContainerManager.acmTrustAnchors(List.of(
+                        TEST_CERTIFICATE_A + "\n" + TEST_CERTIFICATE_B,
+                        TEST_CERTIFICATE_A,
+                        "not a certificate")));
+    }
+
+    @Test
+    void nativeCloudInitTrustAnchorsIgnoreMissingChains() {
+        assertEquals(List.of(), Ec2ContainerManager.acmTrustAnchors(null));
+        assertEquals(List.of(), Ec2ContainerManager.acmTrustAnchors(List.of()));
+        assertEquals(List.of(), Ec2ContainerManager.pemCertificates("not a certificate"));
+    }
+
+    @Test
     void nativeCloudInitTimeoutKillsTheWholeFinalUnitBeforeStoppingIt() {
         String command = Ec2ContainerManager.stopNativeCloudInitCommand()[2];
 
@@ -684,6 +711,7 @@ class Ec2ContainerManagerTest {
                 dockerClient,
                 portAllocator,
                 config,
+                mock(AcmService.class),
                 metadataServer,
                 portForwardManager);
         return new LaunchHarness(manager, dockerClient, metadataServer, builder,

@@ -65,4 +65,23 @@ class CertificateGeneratorSelfSignedTest {
                 "ACM-style issuer should still be the Amazon CA DN");
         assertEquals(-1, cert.getBasicConstraints(), "ACM-style leaf cert must not be a CA");
     }
+
+    @Test
+    void certificateSignedByLocalAuthorityVerifiesAgainstItsChain() throws Exception {
+        var certificateAuthority = generator.generateSelfSignedCertificate(
+                "Amazon Root CA 1", List.of(), KeyAlgorithm.RSA_2048);
+        var generated = generator.generateCertificateSignedBy(
+                "service.example.com",
+                List.of("service.example.com"),
+                KeyAlgorithm.RSA_2048,
+                certificateAuthority.certificatePem(),
+                certificateAuthority.privateKeyPem());
+
+        X509Certificate root = generator.parseCertificate(certificateAuthority.certificatePem());
+        X509Certificate leaf = generator.parseCertificate(generated.certificatePem());
+
+        assertEquals(root.getSubjectX500Principal(), leaf.getIssuerX500Principal());
+        assertEquals(-1, leaf.getBasicConstraints(), "ACM leaf certificate must not be a CA");
+        leaf.verify(root.getPublicKey());
+    }
 }
