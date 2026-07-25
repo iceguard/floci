@@ -23,6 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * ACM (AWS Certificate Manager) service implementation for the local emulator.
@@ -273,16 +274,20 @@ public class AcmService {
     /**
      * Returns the certificate chains that local compute guests need in order to model the public
      * trust roots present in real provider images. Private keys and leaf certificate bodies are
-     * deliberately excluded.
+     * deliberately excluded. The local authority is created on demand here so guests launched
+     * before the first leaf certificate request receive the same trust root used later.
      */
     public List<String> certificateChains(String region) {
-        return store.scan(k -> true).stream()
-            .filter(certificate -> certificate.getArn().contains(":acm:" + region + ":"))
-            .filter(certificate -> certificate.getType() == CertificateType.AMAZON_ISSUED)
-            .map(Certificate::getCertificateChain)
-            .filter(chain -> chain != null && !chain.isBlank())
-            .distinct()
-            .toList();
+        Certificate certificateAuthority = localCertificateAuthority();
+        return Stream.concat(
+                        Stream.of(certificateAuthority.getCertificateBody()),
+                        store.scan(k -> true).stream()
+                                .filter(certificate -> certificate.getArn().contains(":acm:" + region + ":"))
+                                .filter(certificate -> certificate.getType() == CertificateType.AMAZON_ISSUED)
+                                .map(Certificate::getCertificateChain))
+                .filter(chain -> chain != null && !chain.isBlank())
+                .distinct()
+                .toList();
     }
 
     /**

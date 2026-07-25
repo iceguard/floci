@@ -16,6 +16,12 @@ class AcmServiceTest {
     @Test
     void certificateChainsAreRegionScopedAndDeduplicated() {
         InMemoryStorage<String, Certificate> store = new InMemoryStorage<>();
+        Certificate certificateAuthority = certificate(
+                "arn:aws:acm:floci-local:000000000000:certificate-authority/root",
+                null,
+                null);
+        certificateAuthority.setCertificateBody("local-root");
+        store.put("__floci_local_acm_ca__", certificateAuthority);
         store.put("east-one", certificate(
                 "arn:aws:acm:us-east-1:000000000000:certificate/east-one",
                 "east-chain",
@@ -43,8 +49,8 @@ class AcmServiceTest {
                 mock(RegionResolver.class),
                 0);
 
-        assertEquals(List.of("east-chain"), service.certificateChains("us-east-1"));
-        assertEquals(List.of("west-chain"), service.certificateChains("us-west-2"));
+        assertEquals(List.of("local-root", "east-chain"), service.certificateChains("us-east-1"));
+        assertEquals(List.of("local-root", "west-chain"), service.certificateChains("us-west-2"));
     }
 
     private static Certificate certificate(String arn, String chain, CertificateType type) {
