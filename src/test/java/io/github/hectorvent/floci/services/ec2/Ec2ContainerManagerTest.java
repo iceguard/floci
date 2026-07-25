@@ -370,9 +370,9 @@ class Ec2ContainerManagerTest {
 
         assertEquals("sh", command[0]);
         assertTrue(command[2].contains("iproute2"));
-        assertTrue(command[2].contains("netcat-openbsd"));
+        assertTrue(command[2].contains("socat"));
         assertTrue(command[2].contains("curl"));
-        assertFalse(command[2].contains("command -v socat"));
+        assertTrue(command[2].contains("command -v socat"));
     }
 
     @Test
@@ -486,7 +486,7 @@ class Ec2ContainerManagerTest {
         assertTrue(Ec2ContainerManager.metadataProxySocketUnit().contains("Before=cloud-init-local.service"));
         assertTrue(Ec2ContainerManager.metadataProxySocketUnit().contains("Accept=yes"));
         assertTrue(Ec2ContainerManager.metadataProxyServiceUnit("floci", 9169)
-                .contains("ExecStart=/usr/bin/nc floci 9169"));
+                .contains("ExecStart=/usr/bin/socat STDIO TCP:floci:9169,connect-timeout=5"));
         assertTrue(Ec2ContainerManager.metadataProxyServiceUnit("floci", 9169)
                 .contains("DefaultDependencies=no"));
         assertTrue(Ec2ContainerManager.cloudInitDatasourceIdentification().contains("datasource: Ec2"));
