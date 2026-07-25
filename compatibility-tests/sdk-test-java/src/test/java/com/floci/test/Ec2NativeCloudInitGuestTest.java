@@ -52,15 +52,20 @@ class Ec2NativeCloudInitGuestTest {
         String certificateArn = null;
         try {
             waitForContainer(container, true, GUEST_START_TIMEOUT);
+            CommandResult cloudInit = command(CLOUD_INIT_TIMEOUT,
+                    "docker", "exec", container, "cloud-init", "status", "--wait", "--long");
+            assertThat(cloudInit.exitCode()).isZero();
+            assertThat(cloudInit.output()).contains("extended_status: done", "DataSourceEc2");
+            String trustAnchor = "/usr/local/share/ca-certificates/floci-acm-trust-1.crt";
+            assertThat(command(Duration.ofSeconds(10),
+                    "docker", "exec", container, "test", "-f", trustAnchor).exitCode())
+                    .as("the guest must receive the local ACM authority before any leaf certificate exists")
+                    .isZero();
             certificateArn = acm.requestCertificate(request -> request.domainName("native-cloud-init.test"))
                     .certificateArn();
             String requestedCertificateArn = certificateArn;
             String certificateChain = acm.getCertificate(request -> request.certificateArn(requestedCertificateArn))
                     .certificateChain();
-            CommandResult cloudInit = command(CLOUD_INIT_TIMEOUT,
-                    "docker", "exec", container, "cloud-init", "status", "--wait", "--long");
-            assertThat(cloudInit.exitCode()).isZero();
-            assertThat(cloudInit.output()).contains("extended_status: done", "DataSourceEc2");
             assertThat(command(Duration.ofSeconds(10),
                     "docker", "exec", container, "sha256sum", "/var/lib/cloud/instance/user-data.txt").output())
                     .startsWith(sha256(userData));
@@ -74,7 +79,6 @@ class Ec2NativeCloudInitGuestTest {
             assertThat(command(Duration.ofSeconds(10),
                     "docker", "exec", container, "cat", "/var/lib/floci-cloud-init-count").output().trim())
                     .isEqualTo("1");
-            String trustAnchor = "/usr/local/share/ca-certificates/floci-acm-trust-1.crt";
             assertThat(command(Duration.ofSeconds(10),
                     "docker", "exec", container, "sha256sum", trustAnchor).output())
                     .startsWith(sha256(certificateChain.strip() + "\n"));
