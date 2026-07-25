@@ -77,6 +77,7 @@ public class ResourceArnBuilder {
             case "kinesis"        -> buildKinesisArn(ctx, region, accountId);
             case "secretsmanager" -> buildSecretsManagerArn(ctx, region, accountId);
             case "ssm"            -> buildSsmArn(ctx, region, accountId);
+            case "logs"           -> buildCloudWatchLogsArn(ctx, region, accountId);
             case "kms"            -> buildKmsArn(ctx, path, region, accountId);
             case "iam"            -> buildIamArn(ctx, accountId);
             case "rds"            -> buildRdsArn(ctx, region, accountId);
@@ -396,6 +397,20 @@ public class ResourceArnBuilder {
     // ── SSM ──────────────────────────────────────────────────────────────────────
     private String buildSsmArn(ContainerRequestContext ctx, String region, String accountId) {
         return AwsArnUtils.Arn.of("ssm", region, accountId, "parameter/*").toString();
+    }
+
+    // ── CloudWatch Logs ─────────────────────────────────────────────────────────
+    private String buildCloudWatchLogsArn(
+            ContainerRequestContext ctx, String region, String accountId) {
+        String target = ctx.getHeaderString("X-Amz-Target");
+        if (target == null || !target.endsWith(".CreateLogGroup")) {
+            return "*";
+        }
+        String logGroupName = jsonRequestResolver.firstTextField(ctx, "logGroupName");
+        return logGroupName == null || logGroupName.isBlank()
+                ? "*"
+                : AwsArnUtils.Arn.of(
+                        "logs", region, accountId, "log-group:" + logGroupName).toString();
     }
 
     // ── KMS ──────────────────────────────────────────────────────────────────────
