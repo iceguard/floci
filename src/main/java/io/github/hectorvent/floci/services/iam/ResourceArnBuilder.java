@@ -403,14 +403,23 @@ public class ResourceArnBuilder {
     private String buildCloudWatchLogsArn(
             ContainerRequestContext ctx, String region, String accountId) {
         String target = ctx.getHeaderString("X-Amz-Target");
-        if (target == null || !target.endsWith(".CreateLogGroup")) {
+        if (target == null) {
             return "*";
         }
-        String logGroupName = jsonRequestResolver.firstTextField(ctx, "logGroupName");
-        return logGroupName == null || logGroupName.isBlank()
-                ? "*"
-                : AwsArnUtils.Arn.of(
-                        "logs", region, accountId, "log-group:" + logGroupName).toString();
+        if (target.endsWith(".CreateLogGroup")) {
+            String logGroupName = jsonRequestResolver.firstTextField(ctx, "logGroupName");
+            return logGroupName == null || logGroupName.isBlank()
+                    ? "*"
+                    : AwsArnUtils.Arn.of(
+                            "logs", region, accountId, "log-group:" + logGroupName).toString();
+        }
+        if (target.endsWith(".ListTagsForResource")
+                || target.endsWith(".TagResource")
+                || target.endsWith(".UntagResource")) {
+            String resourceArn = jsonRequestResolver.firstTextField(ctx, "resourceArn");
+            return resourceArn == null || resourceArn.isBlank() ? "*" : resourceArn;
+        }
+        return "*";
     }
 
     // ── KMS ──────────────────────────────────────────────────────────────────────
