@@ -12,8 +12,6 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.io.IOException;
-import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
@@ -43,6 +41,9 @@ public class AcmService {
     private static final int MAX_TAG_VALUE_LENGTH = 256;
     private static final int MAX_SANS = 100;
     private static final int MAX_DOMAIN_LENGTH = 253;
+    private static final String LOCAL_CERTIFICATE_AUTHORITY_STORAGE_KEY = "__floci_local_acm_ca__";
+    private static final String LOCAL_CERTIFICATE_AUTHORITY_ARN =
+            "arn:aws:acm:floci-local:000000000000:certificate-authority/root";
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
     private final StorageBackend<String, Certificate> store;
@@ -51,6 +52,7 @@ public class AcmService {
     private final int validationWaitSeconds;
     private final AtomicInteger accountDaysBeforeExpiry = new AtomicInteger(45);
     private final AtomicBoolean securityWarningLogged = new AtomicBoolean(false);
+    private volatile Certificate localCertificateAuthority;
 
     /**
      * Idempotency token cache using lazy expiration (1-hour TTL).
@@ -80,9 +82,6 @@ public class AcmService {
         this.certificateGenerator = certificateGenerator;
         this.regionResolver = regionResolver;
         this.validationWaitSeconds = validationWaitSeconds;
-
-        // Validate Root CA resource availability
-        validateRootCaResource();
     }
 
     /**
@@ -93,19 +92,6 @@ public class AcmService {
         if (securityWarningLogged.compareAndSet(false, true)) {
             LOG.warn("SECURITY WARNING: ACM emulator stores private keys in plaintext. " +
                      "This is acceptable for local development but NOT for production use.");
-        }
-    }
-
-    private void validateRootCaResource() {
-        try (InputStream is = getClass().getResourceAsStream("/certs/amazon-root-ca.pem")) {
-            if (is == null) {
-                LOG.warn("Amazon Root CA certificate not found at /certs/amazon-root-ca.pem - " +
-                         "certificate chains will be empty");
-            } else {
-                LOG.info("Amazon Root CA certificate loaded successfully");
-            }
-        } catch (IOException e) {
-            LOG.warnv("Failed to validate Root CA resource: {0}", e.getMessage());
         }
     }
 
@@ -148,9 +134,13 @@ public class AcmService {
         }
 
         // Generate real X.509 certificate
-        CertificateGenerator.GeneratedCertificate generated = certificateGenerator.generateCertificate(
-            domainName, sans, alg
-        );
+        Certificate certificateAuthority = localCertificateAuthority();
+        CertificateGenerator.GeneratedCertificate generated = certificateGenerator.generateCertificateSignedBy(
+                domainName,
+                sans,
+                alg,
+                certificateAuthority.getCertificateBody(),
+                certificateAuthority.getPrivateKey());
 
         Instant now = Instant.now();
 
@@ -180,7 +170,7 @@ public class AcmService {
         cert.setSignatureAlgorithm(generated.signatureAlgorithm());
         cert.setCertificateBody(generated.certificatePem());
         cert.setPrivateKey(generated.privateKeyPem());
-        cert.setCertificateChain(getAwsRootCa());
+        cert.setCertificateChain(certificateAuthority.getCertificateBody());
         cert.setCertOptions(options != null ? options : CertificateOptions.defaultOptions());
         cert.setCertAuthorityArn(certAuthorityArn);
         cert.setIdempotencyToken(idempotencyToken);
@@ -278,6 +268,21 @@ public class AcmService {
         }
 
         return new ListResult(page, newNextToken);
+    }
+
+    /**
+     * Returns the certificate chains that local compute guests need in order to model the public
+     * trust roots present in real provider images. Private keys and leaf certificate bodies are
+     * deliberately excluded.
+     */
+    public List<String> certificateChains(String region) {
+        return store.scan(k -> true).stream()
+            .filter(certificate -> certificate.getArn().contains(":acm:" + region + ":"))
+            .filter(certificate -> certificate.getType() == CertificateType.AMAZON_ISSUED)
+            .map(Certificate::getCertificateChain)
+            .filter(chain -> chain != null && !chain.isBlank())
+            .distinct()
+            .toList();
     }
 
     /**
@@ -643,16 +648,32 @@ public class AcmService {
             .orElse(dn);
     }
 
-    private String getAwsRootCa() {
-        try (InputStream is = getClass().getResourceAsStream("/certs/amazon-root-ca.pem")) {
-            if (is == null) {
-                LOG.warn("Could not load Amazon Root CA from resources, using empty chain");
-                return "";
-            }
-            return new String(is.readAllBytes(), StandardCharsets.UTF_8);
-        } catch (IOException e) {
-            LOG.warn("Failed to load Amazon Root CA: " + e.getMessage());
-            return "";
+    private synchronized Certificate localCertificateAuthority() {
+        if (localCertificateAuthority != null) {
+            return localCertificateAuthority;
         }
+        localCertificateAuthority = store.get(LOCAL_CERTIFICATE_AUTHORITY_STORAGE_KEY)
+                .orElseGet(this::createLocalCertificateAuthority);
+        return localCertificateAuthority;
+    }
+
+    private Certificate createLocalCertificateAuthority() {
+        CertificateGenerator.GeneratedCertificate generated = certificateGenerator.generateSelfSignedCertificate(
+                "Amazon Root CA 1",
+                List.of(),
+                KeyAlgorithm.RSA_2048);
+        Certificate certificateAuthority = new Certificate();
+        certificateAuthority.setArn(LOCAL_CERTIFICATE_AUTHORITY_ARN);
+        certificateAuthority.setDomainName("Amazon Root CA 1");
+        certificateAuthority.setCertificateBody(generated.certificatePem());
+        certificateAuthority.setPrivateKey(generated.privateKeyPem());
+        certificateAuthority.setSubject(generated.subject());
+        certificateAuthority.setIssuer(generated.issuer());
+        certificateAuthority.setKeyAlgorithm(KeyAlgorithm.RSA_2048);
+        certificateAuthority.setSignatureAlgorithm(generated.signatureAlgorithm());
+        certificateAuthority.setCreatedAt(Instant.now());
+        store.put(LOCAL_CERTIFICATE_AUTHORITY_STORAGE_KEY, certificateAuthority);
+        LOG.info("Generated persistent local ACM certificate authority");
+        return certificateAuthority;
     }
 }

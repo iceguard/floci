@@ -36,7 +36,7 @@ class AcmServicePersistenceTest {
     }
 
     @Test
-    void certificateSurvivesRestart(@TempDir Path dir) {
+    void certificateSurvivesRestart(@TempDir Path dir) throws Exception {
         // Step 1: Create a service with a persistent backend and create a certificate
         AcmService first = newService(dir);
         Certificate cert = first.requestCertificate(
@@ -63,6 +63,25 @@ class AcmServicePersistenceTest {
         assertEquals("example.com", loaded.getDomainName());
         assertEquals(List.of("example.com", "www.example.com"), loaded.getSubjectAlternativeNames());
         assertEquals("test", loaded.getTags().get("Env"));
+
+        Certificate second = restarted.requestCertificate(
+                "second.example.com",
+                List.of(),
+                ValidationMethod.DNS,
+                null,
+                KeyAlgorithm.RSA_2048,
+                null,
+                null,
+                Map.of(),
+                REGION);
+        assertEquals(cert.getCertificateChain(), second.getCertificateChain(),
+                "the persisted local ACM authority must sign certificates after restart");
+
+        var root = generator.parseCertificate(cert.getCertificateChain());
+        var leaf = generator.parseCertificate(cert.getCertificateBody());
+        var secondLeaf = generator.parseCertificate(second.getCertificateBody());
+        leaf.verify(root.getPublicKey());
+        secondLeaf.verify(root.getPublicKey());
     }
 
     private AcmService newService(Path dir) {

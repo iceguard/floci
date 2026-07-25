@@ -2,6 +2,7 @@ package com.floci.test;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import software.amazon.awssdk.services.acm.AcmClient;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.DescribeImagesRequest;
 import software.amazon.awssdk.services.ec2.model.Filter;
@@ -30,14 +31,30 @@ class Ec2NativeCloudInitGuestTest {
 
     @Test
     void nativeCloudInitLifecycleMatchesEc2GuestSemantics() throws Exception {
-        try (Ec2Client ec2 = TestFixtures.ec2Client()) {
-            proveSuccessAndReboot(ec2);
+        String certificateArn = null;
+        try (AcmClient acm = TestFixtures.acmClient();
+                Ec2Client ec2 = TestFixtures.ec2Client()) {
+            String createdCertificateArn = acm.requestCertificate(request -> request.domainName("native-cloud-init.test"))
+                    .certificateArn();
+            certificateArn = createdCertificateArn;
+            String certificateChain = acm.getCertificate(request -> request.certificateArn(createdCertificateArn))
+                    .certificateChain();
+
+            proveSuccessAndReboot(ec2, certificateChain);
             proveFailure(ec2);
             proveTimeout(ec2);
         }
+        finally {
+            if (certificateArn != null) {
+                try (AcmClient acm = TestFixtures.acmClient()) {
+                    String arn = certificateArn;
+                    acm.deleteCertificate(request -> request.certificateArn(arn));
+                }
+            }
+        }
     }
 
-    private static void proveSuccessAndReboot(Ec2Client ec2) throws Exception {
+    private static void proveSuccessAndReboot(Ec2Client ec2, String certificateChain) throws Exception {
         String userData = """
                 #!/bin/sh
                 set -eu
@@ -66,6 +83,18 @@ class Ec2NativeCloudInitGuestTest {
             assertThat(command(Duration.ofSeconds(10),
                     "docker", "exec", container, "cat", "/var/lib/floci-cloud-init-count").output().trim())
                     .isEqualTo("1");
+            String trustAnchor = "/usr/local/share/ca-certificates/floci-acm-trust-1.crt";
+            assertThat(command(Duration.ofSeconds(10),
+                    "docker", "exec", container, "sha256sum", trustAnchor).output())
+                    .startsWith(sha256(certificateChain.strip() + "\n"));
+            assertThat(command(Duration.ofSeconds(10),
+                    "docker", "exec", container, "test", "-L",
+                    "/etc/ssl/certs/floci-acm-trust-1.pem").exitCode())
+                    .isZero();
+            assertThat(command(Duration.ofSeconds(10),
+                    "docker", "exec", container, "openssl", "verify",
+                    "-CApath", "/etc/ssl/certs", trustAnchor).output())
+                    .contains(trustAnchor + ": OK");
 
             ec2.rebootInstances(request -> request.instanceIds(instanceId));
             waitUntil(() -> command(Duration.ofSeconds(10),
