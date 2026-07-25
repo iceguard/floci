@@ -13,6 +13,7 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.CreateVpcEndpointResponse;
 import software.amazon.awssdk.services.ec2.model.Ec2Exception;
+import software.amazon.awssdk.services.ec2.model.IpAddressType;
 import software.amazon.awssdk.services.ec2.model.ResourceType;
 import software.amazon.awssdk.services.ec2.model.State;
 import software.amazon.awssdk.services.ec2.model.Tag;
@@ -51,6 +52,7 @@ class Ec2VpcEndpointAuthorizationIntegrationTest {
                         scoped, fixture, "floci");
                 assertEquals(State.AVAILABLE, created.vpcEndpoint().state());
                 assertEquals("Available", created.vpcEndpoint().stateAsString());
+                assertEquals(IpAddressType.IPV4, created.vpcEndpoint().ipAddressType());
                 String endpointId = created.vpcEndpoint().vpcEndpointId();
 
                 scoped.modifyVpcEndpoint(request -> request
@@ -65,6 +67,7 @@ class Ec2VpcEndpointAuthorizationIntegrationTest {
                 VpcEndpoint modified = endpoint(root, endpointId);
                 assertEquals(State.AVAILABLE, modified.state());
                 assertEquals("Available", modified.stateAsString());
+                assertEquals(IpAddressType.IPV4, modified.ipAddressType());
                 assertEquals(List.of(fixture.secondRouteTableId()), modified.routeTableIds());
                 assertEquals("{\"Statement\":[]}", modified.policyDocument());
                 assertTrue(modified.tags().stream().anyMatch(tag ->
@@ -162,6 +165,7 @@ class Ec2VpcEndpointAuthorizationIntegrationTest {
                 .vpcId(fixture.vpcId())
                 .serviceName(fixture.serviceName())
                 .vpcEndpointType(VpcEndpointType.GATEWAY)
+                .ipAddressType(IpAddressType.IPV4)
                 .routeTableIds(fixture.firstRouteTableId())
                 .tagSpecifications(TagSpecification.builder()
                         .resourceType(ResourceType.VPC_ENDPOINT)

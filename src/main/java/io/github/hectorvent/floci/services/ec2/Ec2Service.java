@@ -1405,6 +1405,7 @@ public class Ec2Service implements ContainerTeardown {
     // ─── VPC Endpoints ────────────────────────────────────────────────────────
 
     public VpcEndpoint createVpcEndpoint(String region, String vpcId, String serviceName, String endpointType,
+                                         String ipAddressType,
                                          List<String> routeTableIds, List<String> subnetIds,
                                          List<String> securityGroupIds, Boolean privateDnsEnabled,
                                          String policyDocument, List<Tag> endpointTags) {
@@ -1425,6 +1426,7 @@ public class Ec2Service implements ContainerTeardown {
         endpoint.setVpcId(vpcId);
         endpoint.setServiceName(serviceName);
         endpoint.setVpcEndpointType(endpointType != null && !endpointType.isBlank() ? endpointType : "Gateway");
+        endpoint.setIpAddressType(ipAddressType != null && !ipAddressType.isBlank() ? ipAddressType : "ipv4");
         boolean isInterface = "Interface".equalsIgnoreCase(endpoint.getVpcEndpointType());
         endpoint.setPrivateDnsEnabled(privateDnsEnabled != null ? privateDnsEnabled : isInterface);
         endpoint.setCreationTimestamp(Instant.now());

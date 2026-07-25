@@ -6,6 +6,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.Ec2Exception;
+import software.amazon.awssdk.services.ec2.model.IpAddressType;
 import software.amazon.awssdk.services.ec2.model.ResourceType;
 import software.amazon.awssdk.services.ec2.model.SecurityGroupIdentifier;
 import software.amazon.awssdk.services.ec2.model.State;
@@ -64,6 +65,7 @@ class Ec2VpcEndpointTests {
                         .vpcId(vpcId)
                         .serviceName("com.amazonaws.us-east-1.s3")
                         .vpcEndpointType(VpcEndpointType.GATEWAY)
+                        .ipAddressType(IpAddressType.IPV4)
                         .routeTableIds(firstRouteTableId)
                         .policyDocument("{\"Version\":\"2012-10-17\"}")
                         .tagSpecifications(TagSpecification.builder()
@@ -73,17 +75,20 @@ class Ec2VpcEndpointTests {
                 .vpcEndpoint();
         assertThat(createdGateway.state()).isEqualTo(State.AVAILABLE);
         assertThat(createdGateway.stateAsString()).isEqualTo("Available");
+        assertThat(createdGateway.ipAddressType()).isEqualTo(IpAddressType.IPV4);
         String gatewayId = createdGateway.vpcEndpointId();
         VpcEndpoint createdInterface = ec2.createVpcEndpoint(request -> request
                         .vpcId(vpcId)
                         .serviceName("com.amazonaws.us-east-1.secretsmanager")
                         .vpcEndpointType(VpcEndpointType.INTERFACE)
+                        .ipAddressType(IpAddressType.IPV4)
                         .subnetIds(firstSubnetId)
                         .securityGroupIds(firstGroupId)
                         .privateDnsEnabled(true))
                 .vpcEndpoint();
         assertThat(createdInterface.state()).isEqualTo(State.AVAILABLE);
         assertThat(createdInterface.stateAsString()).isEqualTo("Available");
+        assertThat(createdInterface.ipAddressType()).isEqualTo(IpAddressType.IPV4);
         String interfaceId = createdInterface.vpcEndpointId();
 
         ec2.modifyVpcEndpoint(request -> request
@@ -105,6 +110,7 @@ class Ec2VpcEndpointTests {
         VpcEndpoint gateway = endpoint(endpoints, gatewayId);
         assertThat(gateway.state()).isEqualTo(State.AVAILABLE);
         assertThat(gateway.stateAsString()).isEqualTo("Available");
+        assertThat(gateway.ipAddressType()).isEqualTo(IpAddressType.IPV4);
         assertThat(gateway.routeTableIds()).containsExactly(secondRouteTableId);
         assertThat(gateway.policyDocument()).isEqualTo("{\"Statement\":[]}");
         assertThat(gateway.tags()).extracting(Tag::key, Tag::value)
@@ -113,6 +119,7 @@ class Ec2VpcEndpointTests {
         VpcEndpoint iface = endpoint(endpoints, interfaceId);
         assertThat(iface.state()).isEqualTo(State.AVAILABLE);
         assertThat(iface.stateAsString()).isEqualTo("Available");
+        assertThat(iface.ipAddressType()).isEqualTo(IpAddressType.IPV4);
         assertThat(iface.subnetIds()).containsExactly(secondSubnetId);
         assertThat(iface.groups()).extracting(SecurityGroupIdentifier::groupId)
                 .containsExactly(secondGroupId);
