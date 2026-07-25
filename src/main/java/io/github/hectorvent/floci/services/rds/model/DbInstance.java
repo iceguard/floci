@@ -19,6 +19,8 @@ public class DbInstance {
     private String dbName;
     private String dbInstanceClass;
     private int allocatedStorage;
+    private Integer maxAllocatedStorage;
+    private String storageType = "gp2";
     private DbInstanceStatus status;
     private DbEndpoint endpoint;
     private boolean iamDatabaseAuthenticationEnabled;
@@ -95,6 +97,14 @@ public class DbInstance {
 
     public int getAllocatedStorage() { return allocatedStorage; }
     public void setAllocatedStorage(int allocatedStorage) { this.allocatedStorage = allocatedStorage; }
+
+    public Integer getMaxAllocatedStorage() { return maxAllocatedStorage; }
+    public void setMaxAllocatedStorage(Integer maxAllocatedStorage) { this.maxAllocatedStorage = maxAllocatedStorage; }
+
+    public String getStorageType() { return storageType; }
+    public void setStorageType(String storageType) {
+        this.storageType = storageType == null || storageType.isBlank() ? "gp2" : storageType;
+    }
 
     public DbInstanceStatus getStatus() { return status; }
     public void setStatus(DbInstanceStatus status) { this.status = status; }

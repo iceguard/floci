@@ -132,6 +132,25 @@ class RdsServicePersistenceTest {
     }
 
     @Test
+    void storageAutoscalingValuesSurviveRestart(@TempDir Path dir) {
+        RdsService first = newService(dir);
+        first.createDbInstance(
+                "autoscaling", "postgres", "16.3", "admin", "password", "app",
+                "db.t4g.small", 20, false, null, null, null, null, false,
+                false, null, Map.of(), List.of(), "us-east-1", true, 100, "gp3");
+        first.modifyDbInstance(
+                "autoscaling", null, null, null, List.of(), "us-east-1", null,
+                30, 120);
+
+        RdsService restarted = newService(dir);
+        DbInstance restored = restarted.getDbInstance("autoscaling");
+
+        assertEquals(30, restored.getAllocatedStorage());
+        assertEquals(120, restored.getMaxAllocatedStorage());
+        assertEquals("gp3", restored.getStorageType());
+    }
+
+    @Test
     void legacyInstanceWithoutAutoMinorVersionFieldDefaultsToEnabled(@TempDir Path dir) throws Exception {
         Files.writeString(dir.resolve("rds-instances.json"), """
                 {
