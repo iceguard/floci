@@ -18,6 +18,7 @@
         <quarkus.platform.version>3.36.3</quarkus.platform.version>
         <jackson.version>2.21.4</jackson.version>
         <apicurio.version>2.6.13.Final</apicurio.version>
+        <aws.sdk.version>2.44.14</aws.sdk.version>
         <wire.version>6.3.0</wire.version>
     </properties>
 
@@ -262,6 +263,18 @@
         <dependency>
             <groupId>io.rest-assured</groupId>
             <artifactId>rest-assured</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>cloudwatchlogs</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>url-connection-client</artifactId>
+            <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
         <dependency>

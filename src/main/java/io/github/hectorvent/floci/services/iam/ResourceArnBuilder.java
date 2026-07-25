@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.iam;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsFormRequestResolver;
+import io.github.hectorvent.floci.core.common.AwsJsonRequestResolver;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
@@ -25,11 +26,16 @@ public class ResourceArnBuilder {
 
     private final IamService iamService;
     private final AwsFormRequestResolver formRequestResolver;
+    private final AwsJsonRequestResolver jsonRequestResolver;
 
     @Inject
-    public ResourceArnBuilder(IamService iamService, AwsFormRequestResolver formRequestResolver) {
+    public ResourceArnBuilder(
+            IamService iamService,
+            AwsFormRequestResolver formRequestResolver,
+            AwsJsonRequestResolver jsonRequestResolver) {
         this.iamService = iamService;
         this.formRequestResolver = formRequestResolver;
+        this.jsonRequestResolver = jsonRequestResolver;
     }
 
     public String build(String credentialScope, ContainerRequestContext ctx,
@@ -44,6 +50,7 @@ public class ResourceArnBuilder {
             case "kinesis"        -> buildKinesisArn(ctx, region, accountId);
             case "secretsmanager" -> buildSecretsManagerArn(ctx, region, accountId);
             case "ssm"            -> buildSsmArn(ctx, region, accountId);
+            case "logs"           -> buildCloudWatchLogsArn(ctx, region, accountId);
             case "kms"            -> buildKmsArn(path, region, accountId);
             case "iam"            -> buildIamArn(ctx, accountId);
             default               -> "*";
@@ -133,6 +140,20 @@ public class ResourceArnBuilder {
     // ── SSM ──────────────────────────────────────────────────────────────────────
     private String buildSsmArn(ContainerRequestContext ctx, String region, String accountId) {
         return AwsArnUtils.Arn.of("ssm", region, accountId, "parameter/*").toString();
+    }
+
+    // ── CloudWatch Logs ─────────────────────────────────────────────────────────
+    private String buildCloudWatchLogsArn(
+            ContainerRequestContext ctx, String region, String accountId) {
+        String target = ctx.getHeaderString("X-Amz-Target");
+        if (target == null || !target.endsWith(".CreateLogGroup")) {
+            return "*";
+        }
+        String logGroupName = jsonRequestResolver.firstTextField(ctx, "logGroupName");
+        return logGroupName == null || logGroupName.isBlank()
+                ? "*"
+                : AwsArnUtils.Arn.of(
+                        "logs", region, accountId, "log-group:" + logGroupName).toString();
     }
 
     // ── KMS ──────────────────────────────────────────────────────────────────────
