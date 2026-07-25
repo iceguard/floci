@@ -14,6 +14,7 @@ import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.CreateVpcEndpointResponse;
 import software.amazon.awssdk.services.ec2.model.Ec2Exception;
 import software.amazon.awssdk.services.ec2.model.ResourceType;
+import software.amazon.awssdk.services.ec2.model.State;
 import software.amazon.awssdk.services.ec2.model.Tag;
 import software.amazon.awssdk.services.ec2.model.TagSpecification;
 import software.amazon.awssdk.services.ec2.model.VpcEndpoint;
@@ -46,8 +47,11 @@ class Ec2VpcEndpointAuthorizationIntegrationTest {
             EndpointFixture fixture = createGatewayFixture(root, "floci");
             SessionCredentials credentials = createSession("floci", true, true, true);
             try (Ec2Client scoped = ec2Client(credentials)) {
-                String endpointId = createTaggedGatewayEndpoint(
-                        scoped, fixture, "floci").vpcEndpoint().vpcEndpointId();
+                CreateVpcEndpointResponse created = createTaggedGatewayEndpoint(
+                        scoped, fixture, "floci");
+                assertEquals(State.AVAILABLE, created.vpcEndpoint().state());
+                assertEquals("Available", created.vpcEndpoint().stateAsString());
+                String endpointId = created.vpcEndpoint().vpcEndpointId();
 
                 scoped.modifyVpcEndpoint(request -> request
                         .vpcEndpointId(endpointId)
@@ -59,6 +63,8 @@ class Ec2VpcEndpointAuthorizationIntegrationTest {
                         .tags(Tag.builder().key("example.io:updated").value("true").build()));
 
                 VpcEndpoint modified = endpoint(root, endpointId);
+                assertEquals(State.AVAILABLE, modified.state());
+                assertEquals("Available", modified.stateAsString());
                 assertEquals(List.of(fixture.secondRouteTableId()), modified.routeTableIds());
                 assertEquals("{\"Statement\":[]}", modified.policyDocument());
                 assertTrue(modified.tags().stream().anyMatch(tag ->

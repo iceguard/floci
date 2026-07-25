@@ -8,6 +8,7 @@ import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.ec2.model.Ec2Exception;
 import software.amazon.awssdk.services.ec2.model.ResourceType;
 import software.amazon.awssdk.services.ec2.model.SecurityGroupIdentifier;
+import software.amazon.awssdk.services.ec2.model.State;
 import software.amazon.awssdk.services.ec2.model.Tag;
 import software.amazon.awssdk.services.ec2.model.TagSpecification;
 import software.amazon.awssdk.services.ec2.model.VpcEndpoint;
@@ -59,7 +60,7 @@ class Ec2VpcEndpointTests {
         String firstGroupId = createSecurityGroup(vpcId, "first");
         String secondGroupId = createSecurityGroup(vpcId, "second");
 
-        String gatewayId = ec2.createVpcEndpoint(request -> request
+        VpcEndpoint createdGateway = ec2.createVpcEndpoint(request -> request
                         .vpcId(vpcId)
                         .serviceName("com.amazonaws.us-east-1.s3")
                         .vpcEndpointType(VpcEndpointType.GATEWAY)
@@ -69,17 +70,21 @@ class Ec2VpcEndpointTests {
                                 .resourceType(ResourceType.VPC_ENDPOINT)
                                 .tags(Tag.builder().key("Name").value("sdk-gateway").build())
                                 .build()))
-                .vpcEndpoint()
-                .vpcEndpointId();
-        String interfaceId = ec2.createVpcEndpoint(request -> request
+                .vpcEndpoint();
+        assertThat(createdGateway.state()).isEqualTo(State.AVAILABLE);
+        assertThat(createdGateway.stateAsString()).isEqualTo("Available");
+        String gatewayId = createdGateway.vpcEndpointId();
+        VpcEndpoint createdInterface = ec2.createVpcEndpoint(request -> request
                         .vpcId(vpcId)
                         .serviceName("com.amazonaws.us-east-1.secretsmanager")
                         .vpcEndpointType(VpcEndpointType.INTERFACE)
                         .subnetIds(firstSubnetId)
                         .securityGroupIds(firstGroupId)
                         .privateDnsEnabled(true))
-                .vpcEndpoint()
-                .vpcEndpointId();
+                .vpcEndpoint();
+        assertThat(createdInterface.state()).isEqualTo(State.AVAILABLE);
+        assertThat(createdInterface.stateAsString()).isEqualTo("Available");
+        String interfaceId = createdInterface.vpcEndpointId();
 
         ec2.modifyVpcEndpoint(request -> request
                 .vpcEndpointId(gatewayId)
@@ -98,12 +103,16 @@ class Ec2VpcEndpointTests {
                         .vpcEndpointIds(gatewayId, interfaceId))
                 .vpcEndpoints();
         VpcEndpoint gateway = endpoint(endpoints, gatewayId);
+        assertThat(gateway.state()).isEqualTo(State.AVAILABLE);
+        assertThat(gateway.stateAsString()).isEqualTo("Available");
         assertThat(gateway.routeTableIds()).containsExactly(secondRouteTableId);
         assertThat(gateway.policyDocument()).isEqualTo("{\"Statement\":[]}");
         assertThat(gateway.tags()).extracting(Tag::key, Tag::value)
                 .containsExactly(org.assertj.core.groups.Tuple.tuple("Name", "sdk-gateway"));
 
         VpcEndpoint iface = endpoint(endpoints, interfaceId);
+        assertThat(iface.state()).isEqualTo(State.AVAILABLE);
+        assertThat(iface.stateAsString()).isEqualTo("Available");
         assertThat(iface.subnetIds()).containsExactly(secondSubnetId);
         assertThat(iface.groups()).extracting(SecurityGroupIdentifier::groupId)
                 .containsExactly(secondGroupId);
