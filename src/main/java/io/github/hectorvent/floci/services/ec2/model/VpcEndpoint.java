@@ -22,6 +22,7 @@ public class VpcEndpoint {
     private List<String> routeTableIds = new ArrayList<>();
     private List<String> subnetIds = new ArrayList<>();
     private List<String> securityGroupIds = new ArrayList<>();
+    private List<String> networkInterfaceIds = new ArrayList<>();
     private boolean privateDnsEnabled;
     private String policyDocument;
     private List<Tag> tags = new ArrayList<>();
@@ -60,6 +61,9 @@ public class VpcEndpoint {
 
     public List<String> getSecurityGroupIds() { return securityGroupIds; }
     public void setSecurityGroupIds(List<String> securityGroupIds) { this.securityGroupIds = securityGroupIds; }
+
+    public List<String> getNetworkInterfaceIds() { return networkInterfaceIds; }
+    public void setNetworkInterfaceIds(List<String> networkInterfaceIds) { this.networkInterfaceIds = networkInterfaceIds; }
 
     public boolean isPrivateDnsEnabled() { return privateDnsEnabled; }
     public void setPrivateDnsEnabled(boolean privateDnsEnabled) { this.privateDnsEnabled = privateDnsEnabled; }

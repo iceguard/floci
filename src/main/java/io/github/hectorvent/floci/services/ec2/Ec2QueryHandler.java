@@ -2643,7 +2643,21 @@ public class Ec2QueryHandler {
             xml.start("item").elem("groupId", securityGroupId).end("item");
         }
         xml.end("groupSet")
-                .raw(tagSetXml(endpoint.getTags()));
+                .start("networkInterfaceIdSet");
+        for (String networkInterfaceId : endpoint.getNetworkInterfaceIds()) {
+            xml.elem("item", networkInterfaceId);
+        }
+        xml.end("networkInterfaceIdSet");
+        if ("Interface".equalsIgnoreCase(endpoint.getVpcEndpointType())) {
+            xml.start("dnsEntrySet")
+                    .start("item")
+                    .elem("dnsName", endpoint.getVpcEndpointId() + "." + endpoint.getServiceName())
+                    .elem("hostedZoneId", "Z" + Integer.toHexString(
+                            endpoint.getVpcEndpointId().hashCode()).toUpperCase())
+                    .end("item")
+                    .end("dnsEntrySet");
+        }
+        xml.raw(tagSetXml(endpoint.getTags()));
         return xml.build();
     }
 
