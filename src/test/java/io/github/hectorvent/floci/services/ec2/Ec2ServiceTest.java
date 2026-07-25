@@ -390,10 +390,10 @@ class Ec2ServiceTest {
         String subnetId = service.describeSubnets("us-east-1", List.of(),
                 Map.of("vpc-id", List.of("vpc-default"))).getFirst().getSubnetId();
         VpcEndpoint endpoint = service.createVpcEndpoint("us-east-1", "vpc-default",
-                "com.amazonaws.us-east-1.s3", "Interface",
+                "com.amazonaws.us-east-1.s3", "Interface", "ipv4",
                 List.of(), List.of(subnetId), List.of(), null, null, List.of());
         service.createVpcEndpoint("us-east-1", "vpc-default",
-                "com.amazonaws.us-east-1.dynamodb", "Gateway",
+                "com.amazonaws.us-east-1.dynamodb", "Gateway", null,
                 List.of(), List.of(), List.of(), null, null, List.of());
 
         List<NetworkInterface> enis = service.endpointNetworkInterfaces("us-east-1");
@@ -437,11 +437,11 @@ class Ec2ServiceTest {
                 region, "endpoint-b", "endpoint b", vpcId).getGroupId();
 
         VpcEndpoint gateway = service.createVpcEndpoint(
-                region, vpcId, "com.amazonaws.us-east-1.s3", "Gateway",
+                region, vpcId, "com.amazonaws.us-east-1.s3", "Gateway", null,
                 List.of(firstRouteTable), List.of(), List.of(), false,
                 "{\"Version\":\"2012-10-17\"}", List.of());
         VpcEndpoint iface = service.createVpcEndpoint(
-                region, vpcId, "com.amazonaws.us-east-1.secretsmanager", "Interface",
+                region, vpcId, "com.amazonaws.us-east-1.secretsmanager", "Interface", "ipv4",
                 List.of(), List.of(firstSubnet), List.of(firstGroup), true,
                 null, List.of());
 
@@ -459,10 +459,12 @@ class Ec2ServiceTest {
 
         VpcEndpoint modifiedGateway = service.describeVpcEndpoints(
                 region, List.of(gateway.getVpcEndpointId()), Map.of()).getFirst();
+        assertEquals("ipv4", modifiedGateway.getIpAddressType());
         assertEquals(List.of(secondRouteTable), modifiedGateway.getRouteTableIds());
         assertEquals("{\"Statement\":[]}", modifiedGateway.getPolicyDocument());
         VpcEndpoint modifiedInterface = service.describeVpcEndpoints(
                 region, List.of(iface.getVpcEndpointId()), Map.of()).getFirst();
+        assertEquals("ipv4", modifiedInterface.getIpAddressType());
         assertEquals(List.of(secondSubnet), modifiedInterface.getSubnetIds());
         assertEquals(List.of(secondGroup), modifiedInterface.getSecurityGroupIds());
         assertFalse(modifiedInterface.isPrivateDnsEnabled());

@@ -1046,6 +1046,7 @@ public class Ec2QueryHandler {
                 p.getFirst("VpcId"),
                 p.getFirst("ServiceName"),
                 p.getFirst("VpcEndpointType"),
+                p.getFirst("IpAddressType"),
                 getList(p, "RouteTableId"),
                 getList(p, "SubnetId"),
                 getList(p, "SecurityGroupId"),
@@ -2621,6 +2622,7 @@ public class Ec2QueryHandler {
                 .elem("vpcId", endpoint.getVpcId())
                 .elem("serviceName", endpoint.getServiceName())
                 .elem("state", endpoint.getState())
+                .elem("ipAddressType", endpoint.getIpAddressType())
                 .elem("privateDnsEnabled", String.valueOf(endpoint.isPrivateDnsEnabled()))
                 .elem("policyDocument", endpoint.getPolicyDocument());
         if (endpoint.getCreationTimestamp() != null) {
