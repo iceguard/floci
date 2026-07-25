@@ -149,12 +149,28 @@ public class ResourceArnBuilder {
         if (target == null) {
             return "*";
         }
-        if (target.endsWith(".CreateLogGroup")) {
+        if (target.endsWith(".CreateLogGroup")
+                || target.endsWith(".PutRetentionPolicy")
+                || target.endsWith(".DeleteLogGroup")) {
             String logGroupName = jsonRequestResolver.firstTextField(ctx, "logGroupName");
             return logGroupName == null || logGroupName.isBlank()
                     ? "*"
                     : AwsArnUtils.Arn.of(
                             "logs", region, accountId, "log-group:" + logGroupName).toString();
+        }
+        if (target.endsWith(".CreateLogStream")
+                || target.endsWith(".DeleteLogStream")) {
+            String logGroupName = jsonRequestResolver.firstTextField(ctx, "logGroupName");
+            String logStreamName = jsonRequestResolver.firstTextField(ctx, "logStreamName");
+            return logGroupName == null || logGroupName.isBlank()
+                    || logStreamName == null || logStreamName.isBlank()
+                    ? "*"
+                    : AwsArnUtils.Arn.of(
+                            "logs",
+                            region,
+                            accountId,
+                            "log-group:" + logGroupName + ":log-stream:" + logStreamName)
+                            .toString();
         }
         if (target.endsWith(".ListTagsForResource")
                 || target.endsWith(".TagResource")
