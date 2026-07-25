@@ -20,6 +20,7 @@ import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -118,6 +119,126 @@ class CloudWatchLogsAuthorizationIntegrationTest {
             assertEquals(
                     Map.of(),
                     root.listTagsForResource(request -> request.resourceArn(deniedArn)).tags());
+            root.deleteLogGroup(request -> request.logGroupName(allowedName));
+            root.deleteLogGroup(request -> request.logGroupName(deniedName));
+        }
+    }
+
+    @Test
+    void groupLifecycleOperationsAuthorizeTheRequestedLogGroupArn() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String allowedName = "/iceguard/" + suffix + "/otel";
+        String deniedName = "/other/" + suffix + "/otel";
+        RoleCredentials scopedCredentials = roleCredentials(
+                "ScopedLogGroupLifecycle" + suffix,
+                List.of("logs:PutRetentionPolicy", "logs:DeleteLogGroup"),
+                logGroupArn(allowedName));
+        RoleCredentials missingActionCredentials = roleCredentials(
+                "LogGroupLifecycleReader" + suffix,
+                "logs:DescribeLogGroups",
+                logGroupArn("*"));
+
+        try (CloudWatchLogsClient scoped = logsClient(scopedCredentials);
+             CloudWatchLogsClient missingAction = logsClient(missingActionCredentials);
+             CloudWatchLogsClient root = logsClient(ACCOUNT_ID)) {
+            root.createLogGroup(request -> request.logGroupName(allowedName));
+            root.createLogGroup(request -> request.logGroupName(deniedName));
+
+            scoped.putRetentionPolicy(request -> request
+                    .logGroupName(allowedName)
+                    .retentionInDays(14));
+            assertEquals(
+                    14,
+                    root.describeLogGroups(request -> request.logGroupNamePrefix(allowedName))
+                            .logGroups()
+                            .getFirst()
+                            .retentionInDays());
+
+            assertAccessDenied("logs:PutRetentionPolicy", assertThrows(CloudWatchLogsException.class,
+                    () -> scoped.putRetentionPolicy(request -> request
+                            .logGroupName(deniedName)
+                            .retentionInDays(30))));
+            assertAccessDenied("logs:PutRetentionPolicy", assertThrows(CloudWatchLogsException.class,
+                    () -> missingAction.putRetentionPolicy(request -> request
+                            .logGroupName(allowedName)
+                            .retentionInDays(30))));
+            assertNull(root.describeLogGroups(request -> request.logGroupNamePrefix(deniedName))
+                    .logGroups()
+                    .getFirst()
+                    .retentionInDays());
+
+            scoped.deleteLogGroup(request -> request.logGroupName(allowedName));
+            assertTrue(root.describeLogGroups(request -> request.logGroupNamePrefix(allowedName))
+                    .logGroups()
+                    .isEmpty());
+            assertAccessDenied("logs:DeleteLogGroup", assertThrows(CloudWatchLogsException.class,
+                    () -> scoped.deleteLogGroup(request -> request.logGroupName(deniedName))));
+            root.deleteLogGroup(request -> request.logGroupName(deniedName));
+        }
+    }
+
+    @Test
+    void streamLifecycleOperationsAuthorizeTheRequestedLogStreamArn() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String allowedName = "/iceguard/" + suffix + "/otel";
+        String deniedName = "/other/" + suffix + "/otel";
+        String streamName = "application";
+        RoleCredentials scopedCredentials = roleCredentials(
+                "ScopedLogStreamLifecycle" + suffix,
+                List.of("logs:CreateLogStream", "logs:DeleteLogStream"),
+                logGroupArn(allowedName) + ":log-stream:*");
+        RoleCredentials missingActionCredentials = roleCredentials(
+                "LogStreamLifecycleReader" + suffix,
+                "logs:DescribeLogStreams",
+                logGroupArn("*") + ":log-stream:*");
+
+        try (CloudWatchLogsClient scoped = logsClient(scopedCredentials);
+             CloudWatchLogsClient missingAction = logsClient(missingActionCredentials);
+             CloudWatchLogsClient root = logsClient(ACCOUNT_ID)) {
+            root.createLogGroup(request -> request.logGroupName(allowedName));
+            root.createLogGroup(request -> request.logGroupName(deniedName));
+            root.createLogStream(request -> request
+                    .logGroupName(deniedName)
+                    .logStreamName(streamName));
+
+            scoped.createLogStream(request -> request
+                    .logGroupName(allowedName)
+                    .logStreamName(streamName));
+            assertEquals(
+                    List.of(streamName),
+                    root.describeLogStreams(request -> request.logGroupName(allowedName))
+                            .logStreams()
+                            .stream()
+                            .map(stream -> stream.logStreamName())
+                            .toList());
+
+            assertAccessDenied("logs:CreateLogStream", assertThrows(CloudWatchLogsException.class,
+                    () -> scoped.createLogStream(request -> request
+                            .logGroupName(deniedName)
+                            .logStreamName("denied"))));
+            assertAccessDenied("logs:CreateLogStream", assertThrows(CloudWatchLogsException.class,
+                    () -> missingAction.createLogStream(request -> request
+                            .logGroupName(allowedName)
+                            .logStreamName("missing-action"))));
+
+            scoped.deleteLogStream(request -> request
+                    .logGroupName(allowedName)
+                    .logStreamName(streamName));
+            assertTrue(root.describeLogStreams(request -> request.logGroupName(allowedName))
+                    .logStreams()
+                    .isEmpty());
+            assertAccessDenied("logs:DeleteLogStream", assertThrows(CloudWatchLogsException.class,
+                    () -> scoped.deleteLogStream(request -> request
+                            .logGroupName(deniedName)
+                            .logStreamName(streamName))));
+            assertEquals(
+                    List.of(streamName),
+                    root.describeLogStreams(request -> request.logGroupName(deniedName))
+                            .logStreams()
+                            .stream()
+                            .map(stream -> stream.logStreamName())
+                            .toList());
+
             root.deleteLogGroup(request -> request.logGroupName(allowedName));
             root.deleteLogGroup(request -> request.logGroupName(deniedName));
         }
