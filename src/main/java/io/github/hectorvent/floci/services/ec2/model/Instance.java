@@ -64,6 +64,7 @@ public class Instance {
     private String encodedUserData;
     private boolean nativeCloudInit;
     private InstanceBootstrapResult bootstrapResult;
+    private GuestCommandReadiness guestCommandReadiness;
     private int sshHostPort;
     private long terminatedAt;
 
@@ -191,6 +192,11 @@ public class Instance {
 
     public InstanceBootstrapResult getBootstrapResult() { return bootstrapResult; }
     public void setBootstrapResult(InstanceBootstrapResult bootstrapResult) { this.bootstrapResult = bootstrapResult; }
+
+    public GuestCommandReadiness getGuestCommandReadiness() { return guestCommandReadiness; }
+    public void setGuestCommandReadiness(GuestCommandReadiness guestCommandReadiness) {
+        this.guestCommandReadiness = guestCommandReadiness;
+    }
 
     public int getSshHostPort() { return sshHostPort; }
     public void setSshHostPort(int sshHostPort) { this.sshHostPort = sshHostPort; }

@@ -5,6 +5,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.GuestCommandReadiness;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -57,10 +58,11 @@ public class SsmDirectCommandExecutor {
         }
 
         Instance instance = ec2Service.findInstanceById(instanceId);
-        String script = String.join("\n", parameters.getOrDefault("commands", List.of()));
-        if (script.isBlank()) {
-            return Optional.of(ExecutionResult.success("", "", 0));
+        if (instance == null) {
+            return Optional.of(ExecutionResult.failed(
+                    "", "EC2 guest command execution became unavailable", 1));
         }
+        String script = String.join("\n", parameters.getOrDefault("commands", List.of()));
 
         String workingDirectory = parameters.getOrDefault("workingDirectory", List.of(""))
                 .stream()
@@ -69,6 +71,18 @@ public class SsmDirectCommandExecutor {
                 .orElse(null);
 
         try {
+            GuestCommandReadiness readiness = awaitGuestCommandReadiness(instance, executionTimeoutSeconds);
+            if (readiness == GuestCommandReadiness.UNAVAILABLE) {
+                return Optional.of(ExecutionResult.failed(
+                        "", "EC2 guest command execution became unavailable", 1));
+            }
+            if (readiness != GuestCommandReadiness.READY) {
+                return Optional.of(ExecutionResult.timedOut(
+                        "", "EC2 guest command execution was not ready before the command timeout", Instant.now()));
+            }
+            if (script.isBlank()) {
+                return Optional.of(ExecutionResult.success("", "", 0));
+            }
             return Optional.of(executeInContainer(
                     instance.getDockerContainerId(), script, workingDirectory, executionTimeoutSeconds, identityConsumer));
         }
@@ -88,6 +102,23 @@ public class SsmDirectCommandExecutor {
             return false;
         }
         return ec2Service.isInstanceContainerRunning(instanceId);
+    }
+
+    private static GuestCommandReadiness awaitGuestCommandReadiness(
+            Instance instance,
+            int timeoutSeconds)
+            throws InterruptedException {
+        long remainingNanos = TimeUnit.SECONDS.toNanos(Math.max(0, timeoutSeconds));
+        long deadline = System.nanoTime() + remainingNanos;
+        synchronized (instance) {
+            while (instance.getGuestCommandReadiness() == GuestCommandReadiness.PENDING
+                    && remainingNanos > 0) {
+                TimeUnit.NANOSECONDS.timedWait(instance, remainingNanos);
+                remainingNanos = deadline - System.nanoTime();
+            }
+            GuestCommandReadiness readiness = instance.getGuestCommandReadiness();
+            return readiness != null ? readiness : GuestCommandReadiness.READY;
+        }
     }
 
     private ExecutionResult executeInContainer(

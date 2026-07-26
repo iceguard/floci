@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
 import io.github.hectorvent.floci.services.acm.AcmService;
+import io.github.hectorvent.floci.services.ec2.model.GuestCommandReadiness;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceBootstrapResult;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
@@ -138,7 +139,7 @@ public class Ec2ContainerManager {
      *                 via socat sidecars once the container is running (empty for none)
      */
     public void launch(Instance instance, ResolvedAmiImage image, String publicKey, String region, Set<Integer> appPorts) {
-        instance.setState(InstanceState.pending());
+        transition(instance, InstanceState.pending(), GuestCommandReadiness.PENDING);
 
         executor.submit(() -> {
             String containerId = null;
@@ -262,8 +263,7 @@ public class Ec2ContainerManager {
                     return;
                 }
 
-                instance.setState(InstanceState.running());
-                persist(instance);
+                transition(instance, InstanceState.running(), GuestCommandReadiness.READY);
                 LOG.infov("EC2 instance {0} running in container {1} (SSH host port {2})",
                         instanceId, containerId, String.valueOf(sshHostPort));
 
@@ -313,6 +313,7 @@ public class Ec2ContainerManager {
      * would be abandoned mid-flight during shutdown) and leaves state handling to the caller.
      */
     public void stopForShutdown(Instance instance) {
+        updateGuestCommandReadiness(instance, GuestCommandReadiness.UNAVAILABLE);
         String containerId = instance.getDockerContainerId();
         if (containerId == null) {
             return;
@@ -334,10 +335,10 @@ public class Ec2ContainerManager {
     public void stop(Instance instance) {
         String containerId = instance.getDockerContainerId();
         if (containerId == null) {
-            instance.setState(InstanceState.stopped());
+            transition(instance, InstanceState.stopped(), GuestCommandReadiness.UNAVAILABLE);
             return;
         }
-        instance.setState(InstanceState.stopping());
+        transition(instance, InstanceState.stopping(), GuestCommandReadiness.UNAVAILABLE);
         executor.submit(() -> {
             // Sidecars forward to the container's current IP, which Docker reassigns on the
             // next start; tear them down so no forward is left pointing at a stale address.
@@ -353,8 +354,7 @@ public class Ec2ContainerManager {
             } catch (Exception e) {
                 LOG.warnv("Error stopping EC2 container {0}: {1}", containerId, e.getMessage());
             }
-            instance.setState(InstanceState.stopped());
-            persist(instance);
+            transition(instance, InstanceState.stopped(), GuestCommandReadiness.UNAVAILABLE);
         });
     }
 
@@ -365,10 +365,10 @@ public class Ec2ContainerManager {
     public void start(Instance instance) {
         String containerId = instance.getDockerContainerId();
         if (containerId == null) {
-            instance.setState(InstanceState.running());
+            transition(instance, InstanceState.running(), GuestCommandReadiness.READY);
             return;
         }
-        instance.setState(InstanceState.pending());
+        transition(instance, InstanceState.pending(), GuestCommandReadiness.PENDING);
         executor.submit(() -> {
             try {
                 dockerClient.startContainerCmd(containerId).exec();
@@ -409,8 +409,7 @@ public class Ec2ContainerManager {
                 cleanupFailedLaunch(instance, containerId, instance.getContainerBridgeIp(), instance.getSshHostPort());
                 return;
             }
-            instance.setState(InstanceState.running());
-            persist(instance);
+            transition(instance, InstanceState.running(), GuestCommandReadiness.READY);
         });
     }
 
@@ -446,6 +445,9 @@ public class Ec2ContainerManager {
         instance.setContainerBridgeIp(containerIp);
         exposeReachableNetworkAddress(instance, containerAddress);
         metadataServer.registerContainer(containerIp, instance.getInstanceId(), instance);
+        if (instance.getGuestCommandReadiness() == GuestCommandReadiness.PENDING) {
+            updateGuestCommandReadiness(instance, GuestCommandReadiness.UNAVAILABLE);
+        }
         return true;
     }
 
@@ -482,7 +484,7 @@ public class Ec2ContainerManager {
         String containerId = instance.getDockerContainerId();
         String containerIp = instance.getContainerBridgeIp();
         int sshHostPort = instance.getSshHostPort();
-        instance.setState(InstanceState.shuttingDown());
+        transition(instance, InstanceState.shuttingDown(), GuestCommandReadiness.UNAVAILABLE);
         executor.submit(() -> {
             portForwardManager.unpublishAll(instance);
             if (containerId != null) {
@@ -505,7 +507,7 @@ public class Ec2ContainerManager {
             }
             metadataServer.unregisterContainer(containerIp, instance);
             metadataServer.unregisterInstance(instance);
-            instance.setState(InstanceState.terminated());
+            transition(instance, InstanceState.terminated(), GuestCommandReadiness.UNAVAILABLE);
             instance.setTerminatedAt(System.currentTimeMillis());
             persist(instance);
         });
@@ -519,6 +521,7 @@ public class Ec2ContainerManager {
         if (containerId == null) {
             return;
         }
+        updateGuestCommandReadiness(instance, GuestCommandReadiness.PENDING);
         executor.submit(() -> {
             try {
                 if (instance.isNativeCloudInit()) {
@@ -545,16 +548,39 @@ public class Ec2ContainerManager {
                     cleanupFailedLaunch(instance, containerId, containerIp, instance.getSshHostPort());
                     return;
                 }
+                updateGuestCommandReadiness(instance, GuestCommandReadiness.READY);
                 LOG.infov("Rebooted EC2 container {0}", containerId);
-                persist(instance);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 cleanupFailedLaunch(instance, containerId, instance.getContainerBridgeIp(), instance.getSshHostPort());
             } catch (Exception e) {
+                updateGuestCommandReadiness(instance, GuestCommandReadiness.UNAVAILABLE);
                 LOG.warnv("Error rebooting EC2 container {0}: {1}", containerId, e.getMessage());
                 cleanupFailedLaunch(instance, containerId, instance.getContainerBridgeIp(), instance.getSshHostPort());
             }
         });
+    }
+
+    private void updateGuestCommandReadiness(
+            Instance instance,
+            GuestCommandReadiness readiness) {
+        synchronized (instance) {
+            instance.setGuestCommandReadiness(readiness);
+            persist(instance);
+            instance.notifyAll();
+        }
+    }
+
+    private void transition(
+            Instance instance,
+            InstanceState state,
+            GuestCommandReadiness readiness) {
+        synchronized (instance) {
+            instance.setState(state);
+            instance.setGuestCommandReadiness(readiness);
+            persist(instance);
+            instance.notifyAll();
+        }
     }
 
     public boolean isContainerRunning(Instance instance) {
@@ -1183,7 +1209,7 @@ public class Ec2ContainerManager {
         instance.setDockerContainerId(null);
         instance.setContainerBridgeIp(null);
         instance.setSshHostPort(0);
-        instance.setState(InstanceState.terminated());
+        transition(instance, InstanceState.terminated(), GuestCommandReadiness.UNAVAILABLE);
         instance.setTerminatedAt(System.currentTimeMillis());
         if (instance.getBootstrapResult() != null
                 && "RUNNING".equals(instance.getBootstrapResult().getStatus())) {
