@@ -1,6 +1,6 @@
 name: Publish IceGuard Images
 
-run-name: Publish IceGuard Floci images from ${{ inputs.source-ref }}
+run-name: Publish IceGuard Floci images from ${{ inputs.source-ref || github.sha }}
 
 on:
   workflow_dispatch:
@@ -10,6 +10,9 @@ on:
         required: true
         type: string
         default: user/ig/aggregate
+  push:
+    tags:
+      - iceguard/build-images/**
 
 permissions:
   contents: read
@@ -20,5 +23,5 @@ jobs:
     name: Build and publish images
     uses: ./.github/workflows/build-images.yml
     with:
-      source-ref: ${{ inputs.source-ref }}
+      source-ref: ${{ inputs.source-ref || github.sha }}
       image: ghcr.io/iceguard/floci
