@@ -13,14 +13,19 @@ import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import com.github.dockerjava.api.model.Bind;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -68,6 +73,31 @@ class RdsContainerManagerTest {
                 RdsContainerManager.engineDefaultDataPath(DatabaseEngine.POSTGRES, "postgres:latest"));
         assertEquals("/var/lib/postgresql/data",
                 RdsContainerManager.engineDefaultDataPath(DatabaseEngine.POSTGRES, "localhost:5000/postgres"));
+    }
+
+    @Test
+    void postgresReadinessWaitsThroughTransientConnectionBeforeValidHandshake() throws Exception {
+        try (var executor = Executors.newSingleThreadExecutor();
+             ServerSocket server = new ServerSocket(0)) {
+            var serverTask = executor.submit(() -> {
+                try (Socket transientConnection = server.accept()) {
+                    // A listener can disappear while PostgreSQL transitions to its final server.
+                }
+                try (Socket finalConnection = server.accept()) {
+                    assertArrayEquals(
+                            new byte[] {0, 0, 0, 8, 4, (byte) 0xD2, 0x16, 0x2F},
+                            finalConnection.getInputStream().readNBytes(8));
+                    finalConnection.getOutputStream().write('N');
+                    finalConnection.getOutputStream().flush();
+                }
+                return null;
+            });
+
+            RdsContainerManager.waitForPostgresBackendReady(
+                    "db1", "127.0.0.1", server.getLocalPort());
+
+            serverTask.get(5, TimeUnit.SECONDS);
+        }
     }
 
     @Test
