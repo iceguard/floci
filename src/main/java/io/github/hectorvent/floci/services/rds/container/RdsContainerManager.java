@@ -21,8 +21,10 @@ import org.jboss.logging.Logger;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
-import java.nio.file.Path;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -38,6 +40,10 @@ import java.util.concurrent.TimeUnit;
 public class RdsContainerManager {
 
     private static final Logger LOG = Logger.getLogger(RdsContainerManager.class);
+    private static final byte[] POSTGRES_SSL_REQUEST = {0, 0, 0, 8, 4, (byte) 0xD2, 0x16, 0x2F};
+    private static final long POSTGRES_READY_DEADLINE_MS = 60_000;
+    private static final int POSTGRES_PROBE_TIMEOUT_MS = 1_000;
+    private static final int POSTGRES_READY_RETRY_MS = 250;
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -111,6 +117,9 @@ public class RdsContainerManager {
 
         LOG.infov("RDS backend for instance {0}: {1}", instanceId, endpoint);
         initializeEngine(containerName, info.containerId(), engine, masterUsername);
+        if (engine == DatabaseEngine.POSTGRES) {
+            waitForPostgresBackendReady(instanceId, endpoint.host(), endpoint.port());
+        }
 
         RdsContainerHandle handle = new RdsContainerHandle(
                 info.containerId(), instanceId, endpoint.host(), endpoint.port());
@@ -252,6 +261,41 @@ public class RdsContainerManager {
             }
         }
         throw new IllegalStateException("Timed out initializing PostgreSQL IAM role in " + containerName + ": " + lastOutput);
+    }
+
+    static void waitForPostgresBackendReady(String instanceId, String host, int port) {
+        long deadline = System.currentTimeMillis() + POSTGRES_READY_DEADLINE_MS;
+        int attempt = 0;
+        while (System.currentTimeMillis() < deadline) {
+            attempt++;
+            try (Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(host, port), POSTGRES_PROBE_TIMEOUT_MS);
+                socket.setSoTimeout(POSTGRES_PROBE_TIMEOUT_MS);
+                socket.getOutputStream().write(POSTGRES_SSL_REQUEST);
+                socket.getOutputStream().flush();
+                int response = socket.getInputStream().read();
+                if (response == 'N' || response == 'S') {
+                    LOG.infov("PostgreSQL backend ready for RDS instance {0} after {1} probe attempt(s)",
+                            instanceId, attempt);
+                    return;
+                }
+            } catch (IOException e) {
+                if (LOG.isDebugEnabled()) {
+                    LOG.debugv("PostgreSQL backend probe for RDS instance {0} attempt {1}: {2}",
+                            instanceId, attempt, e.getMessage());
+                }
+            }
+            try {
+                Thread.sleep(POSTGRES_READY_RETRY_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(
+                        "Interrupted while waiting for PostgreSQL backend for RDS instance " + instanceId, e);
+            }
+        }
+        throw new IllegalStateException(
+                "PostgreSQL backend for RDS instance " + instanceId + " did not become ready on "
+                        + host + ":" + port + " within " + POSTGRES_READY_DEADLINE_MS + "ms");
     }
 
     private ContainerExecResult execInContainer(String containerId, String[] cmd, int timeoutSeconds) throws Exception {
