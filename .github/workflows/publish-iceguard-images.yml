@@ -9,7 +9,7 @@ on:
         description: Floci branch, tag, or commit to publish
         required: true
         type: string
-        default: 5d8dfb972b5462ced625691e29eadf2fa755f9e9
+        default: user/ig/aggregate
 
 permissions:
   contents: read
