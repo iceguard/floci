@@ -10,6 +10,7 @@ import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
 import com.github.dockerjava.api.command.InspectExecResponse;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.GuestCommandReadiness;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceState;
 import org.junit.jupiter.api.Test;
@@ -17,6 +18,9 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -28,6 +32,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -167,10 +172,11 @@ class SsmDirectCommandExecutorTest {
     }
 
     @Test
-    void blankRunShellScriptCompletesWithoutDockerExec() {
+    void blankRunShellScriptRequiresReadyGuestAndCompletesWithoutDockerExec() {
         DockerClient dockerClient = mock(DockerClient.class);
         Ec2Service ec2Service = mock(Ec2Service.class);
         Instance instance = instance("i-container", "container-1");
+        instance.setGuestCommandReadiness(GuestCommandReadiness.READY);
         when(ec2Service.findInstanceById("i-container")).thenReturn(instance);
         when(ec2Service.isInstanceContainerRunning("i-container")).thenReturn(true);
 
@@ -185,6 +191,87 @@ class SsmDirectCommandExecutorTest {
         assertEquals("Success", result.get().status());
         assertEquals("", result.get().standardOutput());
         assertEquals(0, result.get().responseCode());
+        verifyNoInteractions(dockerClient);
+    }
+
+    @Test
+    void waitsForGuestCommandReadinessBeforeDockerExec() throws Exception {
+        DockerClient dockerClient = mock(DockerClient.class);
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        Instance instance = instance("i-container", "container-1");
+        instance.setGuestCommandReadiness(GuestCommandReadiness.PENDING);
+        when(ec2Service.findInstanceById("i-container")).thenReturn(instance);
+        when(ec2Service.isInstanceContainerRunning("i-container")).thenReturn(true);
+        stubSuccessfulExecution(dockerClient, "container-1");
+
+        SsmDirectCommandExecutor executor = new SsmDirectCommandExecutor(dockerClient, ec2Service);
+        CountDownLatch commandStarted = new CountDownLatch(1);
+        CompletableFuture<Optional<SsmDirectCommandExecutor.ExecutionResult>> result =
+                CompletableFuture.supplyAsync(() -> {
+                    commandStarted.countDown();
+                    return executor.executeIfSupported(
+                            "i-container",
+                            "AWS-RunShellScript",
+                            Map.of("commands", List.of("echo ready")),
+                            30);
+                });
+        assertTrue(commandStarted.await(5, TimeUnit.SECONDS));
+        Thread.sleep(100);
+        verify(dockerClient, never()).execCreateCmd("container-1");
+        assertFalse(result.isDone());
+
+        synchronized (instance) {
+            instance.setGuestCommandReadiness(GuestCommandReadiness.READY);
+            instance.notifyAll();
+        }
+
+        Optional<SsmDirectCommandExecutor.ExecutionResult> completed = result.get(5, TimeUnit.SECONDS);
+        assertTrue(completed.isPresent());
+        assertEquals("Success", completed.orElseThrow().status());
+        verify(dockerClient).execCreateCmd("container-1");
+    }
+
+    @Test
+    void pendingGuestReadinessTimesOutWithoutDockerExecOrAgentFallback() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        Instance instance = instance("i-container", "container-1");
+        instance.setGuestCommandReadiness(GuestCommandReadiness.PENDING);
+        when(ec2Service.findInstanceById("i-container")).thenReturn(instance);
+        when(ec2Service.isInstanceContainerRunning("i-container")).thenReturn(true);
+
+        SsmDirectCommandExecutor executor = new SsmDirectCommandExecutor(dockerClient, ec2Service);
+        Optional<SsmDirectCommandExecutor.ExecutionResult> result = executor.executeIfSupported(
+                "i-container",
+                "AWS-RunShellScript",
+                Map.of("commands", List.of("echo never")),
+                0);
+
+        assertTrue(result.isPresent());
+        assertEquals("TimedOut", result.orElseThrow().status());
+        assertTrue(result.orElseThrow().standardError().contains("not ready"));
+        verifyNoInteractions(dockerClient);
+    }
+
+    @Test
+    void unavailableGuestReadinessFailsWithoutDockerExecOrAgentFallback() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        Instance instance = instance("i-container", "container-1");
+        instance.setGuestCommandReadiness(GuestCommandReadiness.UNAVAILABLE);
+        when(ec2Service.findInstanceById("i-container")).thenReturn(instance);
+        when(ec2Service.isInstanceContainerRunning("i-container")).thenReturn(true);
+
+        SsmDirectCommandExecutor executor = new SsmDirectCommandExecutor(dockerClient, ec2Service);
+        Optional<SsmDirectCommandExecutor.ExecutionResult> result = executor.executeIfSupported(
+                "i-container",
+                "AWS-RunShellScript",
+                Map.of("commands", List.of("echo never")),
+                30);
+
+        assertTrue(result.isPresent());
+        assertEquals("Failed", result.orElseThrow().status());
+        assertTrue(result.orElseThrow().standardError().contains("unavailable"));
         verifyNoInteractions(dockerClient);
     }
 
@@ -330,5 +417,29 @@ class SsmDirectCommandExecutorTest {
         instance.setDockerContainerId(containerId);
         instance.setState(InstanceState.running());
         return instance;
+    }
+
+    private static void stubSuccessfulExecution(DockerClient dockerClient, String containerId) {
+        ExecCreateCmd execCreate = mock(ExecCreateCmd.class, withSettings().defaultAnswer(RETURNS_SELF));
+        ExecCreateCmdResponse execCreateResponse = mock(ExecCreateCmdResponse.class);
+        when(execCreateResponse.getId()).thenReturn("exec-ready");
+        when(execCreate.exec()).thenReturn(execCreateResponse);
+        when(dockerClient.execCreateCmd(containerId)).thenReturn(execCreate);
+
+        ExecStartCmd execStart = mock(ExecStartCmd.class);
+        when(execStart.exec(any())).thenAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            ResultCallback<Frame> resultCallback = invocation.getArgument(0);
+            resultCallback.onNext(new Frame(StreamType.STDOUT, "ready\n".getBytes()));
+            resultCallback.onComplete();
+            return resultCallback;
+        });
+        when(dockerClient.execStartCmd("exec-ready")).thenReturn(execStart);
+
+        InspectExecCmd inspectExec = mock(InspectExecCmd.class);
+        InspectExecResponse inspectExecResponse = mock(InspectExecResponse.class);
+        when(inspectExecResponse.getExitCodeLong()).thenReturn(0L);
+        when(inspectExec.exec()).thenReturn(inspectExecResponse);
+        when(dockerClient.inspectExecCmd("exec-ready")).thenReturn(inspectExec);
     }
 }

@@ -58,6 +58,7 @@ public class Instance {
     private String dockerContainerId;
     private String containerBridgeIp;
     private String userData;
+    private GuestCommandReadiness guestCommandReadiness;
     private int sshHostPort;
     private long terminatedAt;
 
@@ -168,6 +169,11 @@ public class Instance {
 
     public String getUserData() { return userData; }
     public void setUserData(String userData) { this.userData = userData; }
+
+    public GuestCommandReadiness getGuestCommandReadiness() { return guestCommandReadiness; }
+    public void setGuestCommandReadiness(GuestCommandReadiness guestCommandReadiness) {
+        this.guestCommandReadiness = guestCommandReadiness;
+    }
 
     public int getSshHostPort() { return sshHostPort; }
     public void setSshHostPort(int sshHostPort) { this.sshHostPort = sshHostPort; }

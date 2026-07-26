@@ -24,6 +24,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
+import io.github.hectorvent.floci.services.ec2.model.GuestCommandReadiness;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
 import org.junit.jupiter.api.Test;
@@ -115,8 +116,10 @@ class Ec2ContainerManagerTest {
         instance.setInstanceId("i-restored");
         instance.setDockerContainerId(TEST_CONTAINER_ID);
         instance.setContainerBridgeIp("192.168.215.7");
+        instance.setGuestCommandReadiness(GuestCommandReadiness.PENDING);
 
         assertTrue(manager.restoreMetadataRegistration(instance));
+        assertEquals(GuestCommandReadiness.UNAVAILABLE, instance.getGuestCommandReadiness());
 
         assertEquals("192.168.215.42", instance.getContainerBridgeIp());
         assertEquals("192.168.215.42", instance.getPrivateIpAddress());
@@ -343,6 +346,7 @@ class Ec2ContainerManagerTest {
 
         awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
         assertEquals(TEST_CONTAINER_ID, instance.getDockerContainerId());
+        assertEquals(GuestCommandReadiness.UNAVAILABLE, instance.getGuestCommandReadiness());
         verify(harness.metadataServer, never()).registerContainer(anyString(), anyString(), any());
     }
 
@@ -365,6 +369,7 @@ class Ec2ContainerManagerTest {
 
         assertTrue(userDataStarted.await(2, TimeUnit.SECONDS), "user data should start");
         assertEquals("running", instance.getState().getName());
+        assertEquals(GuestCommandReadiness.READY, instance.getGuestCommandReadiness());
         assertFalse(finishUserData.await(10, TimeUnit.MILLISECONDS), "user data should still be blocked");
         finishUserData.countDown();
         awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
