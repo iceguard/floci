@@ -1,7 +1,38 @@
 """STS integration tests."""
 
+import json
+
+import boto3
 import pytest
 from botocore.exceptions import ClientError, ParamValidationError
+
+ROLE_NAMES = ("pytest-assumed-role", "my-role", "web-identity-role")
+TRUST_POLICY = json.dumps(
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Action": "sts:AssumeRole",
+            }
+        ],
+    }
+)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def sts_roles(aws_config, client_config):
+    """Create the role fixtures required by AWS-compatible STS behavior."""
+    iam = boto3.client("iam", config=client_config, **aws_config)
+    for role_name in ROLE_NAMES:
+        iam.create_role(
+            RoleName=role_name,
+            AssumeRolePolicyDocument=TRUST_POLICY,
+        )
+    yield
+    for role_name in ROLE_NAMES:
+        iam.delete_role(RoleName=role_name)
 
 
 class TestSTSIdentity:
