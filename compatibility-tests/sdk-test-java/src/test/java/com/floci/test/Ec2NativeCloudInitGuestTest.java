@@ -201,7 +201,7 @@ class Ec2NativeCloudInitGuestTest {
                                 Filter.builder().name("state").values("available").build())
                         .build())
                 .images()
-                .getFirst()
+                .get(0)
                 .imageId();
     }
 

@@ -151,7 +151,7 @@ class AutoScalingTest {
                 .build());
         var suspended = autoScaling.describeAutoScalingGroups(DescribeAutoScalingGroupsRequest.builder()
                 .autoScalingGroupNames(autoScalingGroupName)
-                .build()).autoScalingGroups().getFirst().suspendedProcesses();
+                .build()).autoScalingGroups().get(0).suspendedProcesses();
         assertThat(suspended).extracting(process -> process.processName())
                 .containsExactly("Launch", "Terminate");
         assertThat(suspended).allSatisfy(process ->
@@ -163,7 +163,7 @@ class AutoScalingTest {
                 .build());
         var resumed = autoScaling.describeAutoScalingGroups(DescribeAutoScalingGroupsRequest.builder()
                 .autoScalingGroupNames(autoScalingGroupName)
-                .build()).autoScalingGroups().getFirst().suspendedProcesses();
+                .build()).autoScalingGroups().get(0).suspendedProcesses();
         assertThat(resumed).extracting(process -> process.processName()).containsExactly("Terminate");
     }
 
@@ -335,7 +335,7 @@ class AutoScalingTest {
 
             var currentGroup = autoScaling.describeAutoScalingGroups(DescribeAutoScalingGroupsRequest.builder()
                     .autoScalingGroupNames(autoScalingGroupName)
-                    .build()).autoScalingGroups().getFirst();
+                    .build()).autoScalingGroups().get(0);
 
             assertThat(started.instanceRefreshId()).isNotBlank();
             assertThat(described.instanceRefreshId()).isEqualTo(started.instanceRefreshId());
@@ -346,7 +346,7 @@ class AutoScalingTest {
             assertThat(described.preferences().minHealthyPercentage()).isEqualTo(100);
             assertThat(described.preferences().maxHealthyPercentage()).isEqualTo(100);
             assertThat(currentGroup.instances()).hasSize(1);
-            assertThat(currentGroup.instances().getFirst().instanceId()).isNotEqualTo(originalInstanceId);
+            assertThat(currentGroup.instances().get(0).instanceId()).isNotEqualTo(originalInstanceId);
             assertThat(currentGroup.launchTemplate().version()).isEqualTo("2");
         } finally {
             if (groupCreated) {
@@ -543,8 +543,8 @@ class AutoScalingTest {
                     .autoScalingGroupNames(autoScalingGroupName)
                     .build());
             if (!response.autoScalingGroups().isEmpty()
-                    && !response.autoScalingGroups().getFirst().instances().isEmpty()) {
-                return response.autoScalingGroups().getFirst().instances().getFirst().instanceId();
+                    && !response.autoScalingGroups().get(0).instances().isEmpty()) {
+                return response.autoScalingGroups().get(0).instances().get(0).instanceId();
             }
             sleepForReconcile();
         }
@@ -558,7 +558,7 @@ class AutoScalingTest {
             var refresh = autoScaling.describeInstanceRefreshes(DescribeInstanceRefreshesRequest.builder()
                     .autoScalingGroupName(autoScalingGroupName)
                     .instanceRefreshIds(instanceRefreshId)
-                    .build()).instanceRefreshes().getFirst();
+                    .build()).instanceRefreshes().get(0);
             if (!"Pending".equals(refresh.statusAsString()) && !"InProgress".equals(refresh.statusAsString())) {
                 return refresh;
             }

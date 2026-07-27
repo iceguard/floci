@@ -377,7 +377,7 @@ class Ec2Tests {
                             .launchTemplateId(launchTemplateId)
                             .versions("2")
                             .build())
-                    .launchTemplateVersions().getFirst().launchTemplateData().userData()).isEmpty();
+                    .launchTemplateVersions().get(0).launchTemplateData().userData()).isEmpty();
         } finally {
             ec2.deleteLaunchTemplate(DeleteLaunchTemplateRequest.builder()
                     .launchTemplateId(launchTemplateId)
@@ -397,7 +397,7 @@ class Ec2Tests {
                 .minCount(1)
                 .maxCount(1)
                 .userData(encodedUserData)
-                .build()).instances().getFirst().instanceId();
+                .build()).instances().get(0).instanceId();
 
         try {
             DescribeInstanceAttributeResponse described = ec2.describeInstanceAttribute(
