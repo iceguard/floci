@@ -55,20 +55,33 @@ class Ec2NetworkInterfacePaginationTest {
         keyName = TestFixtures.uniqueName("pagination-key");
         ec2.createKeyPair(CreateKeyPairRequest.builder().keyName(keyName).build());
 
-        // --- Launch 6 instances to get 6 ENIs ---
+        // --- Launch 5 instances, stop one to release capacity, then launch the sixth ---
         RunInstancesResponse runResp = ec2.runInstances(RunInstancesRequest.builder()
                 .imageId("ami-0abcdef1234567890")
                 .instanceType(InstanceType.T2_MICRO)
-                .minCount(6)
-                .maxCount(6)
+                .minCount(5)
+                .maxCount(5)
                 .keyName(keyName)
                 .subnetId(subnetId)
                 .securityGroupIds(List.of(sgId))
                 .build());
 
-        for (Instance inst : runResp.instances()) {
-            instanceIds.add(inst.instanceId());
+        for (Instance instance : runResp.instances()) {
+            instanceIds.add(instance.instanceId());
         }
+        ec2.stopInstances(StopInstancesRequest.builder()
+                .instanceIds(instanceIds.get(0))
+                .build());
+        RunInstancesResponse finalInstance = ec2.runInstances(RunInstancesRequest.builder()
+                .imageId("ami-0abcdef1234567890")
+                .instanceType(InstanceType.T2_MICRO)
+                .minCount(1)
+                .maxCount(1)
+                .keyName(keyName)
+                .subnetId(subnetId)
+                .securityGroupIds(List.of(sgId))
+                .build());
+        instanceIds.add(finalInstance.instances().get(0).instanceId());
         assertThat(instanceIds).hasSize(6);
     }
 
@@ -79,7 +92,8 @@ class Ec2NetworkInterfacePaginationTest {
             if (!instanceIds.isEmpty()) {
                 try {
                     ec2.terminateInstances(TerminateInstancesRequest.builder()
-                            .instanceIds(instanceIds).build());
+                            .instanceIds(instanceIds)
+                            .build());
                 } catch (Exception ignored) {}
             }
             // Delete subnet

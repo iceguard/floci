@@ -423,7 +423,7 @@ class AutoScalingTest {
     void reconcilerRestoresMissingTargetWithEffectivePort() throws InterruptedException {
         String launchTemplateName = TestFixtures.uniqueName("sdk-target-reconciliation-lt");
         String autoScalingGroupName = TestFixtures.uniqueName("sdk-target-reconciliation-asg");
-        String targetGroupName = TestFixtures.uniqueName("sdk-target-reconciliation-tg");
+        String targetGroupName = TestFixtures.uniqueName("sdk-reconcile-tg");
         String instanceId = null;
         String targetGroupArn = null;
         boolean autoScalingGroupCreated = false;
